@@ -120,7 +120,9 @@ export function loadProviders(file: string): ProviderConfig[] {
 /** Parse the versioned envelope, dropping malformed providers. */
 export function parseProviderStore(raw: string): ProviderStore {
   try {
-    const parsed: unknown = JSON.parse(raw)
+    // Windows editors and PowerShell 5 `-Encoding utf8` prepend a BOM, which
+    // JSON.parse rejects; an otherwise valid store must not read as empty.
+    const parsed: unknown = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return emptyProviderStore()
     }

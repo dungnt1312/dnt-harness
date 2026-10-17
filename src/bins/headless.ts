@@ -59,7 +59,7 @@ import { createProcessSessionEventBridge } from '../harness/processes/session-ev
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
-import { promises as fs } from 'node:fs'
+import { existsSync, promises as fs, readFileSync, statSync } from 'node:fs'
 import { MemoryService } from '../harness/memory/service.ts'
 import { memoryRoots, memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { ModesService, DEFAULT_MODE_ID } from '../harness/modes/service.ts'
@@ -102,17 +102,28 @@ function parseArgs(argv: readonly string[]): CliOptions {
   let provider: string | undefined
   let model: string | undefined
   let thinking: string | undefined
+  // The value after a flag, consumed so it is never read as a flag itself. A
+  // following `--flag` is not a value: `--model --yolo` reports a missing
+  // model instead of sending the model `--yolo` and also enabling yolo.
+  const value = (i: number): string | undefined => {
+    const next = argv[i + 1]
+    return next === undefined || next.startsWith('--') ? undefined : next
+  }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    if (arg === '--yolo') yolo = true
-    else if (arg === '--root') root = argv[i + 1] ?? root
-    else if (arg === '--data-dir') dataDir = argv[i + 1] ?? dataDir
+    if (arg === '--yolo') { yolo = true; continue }
+    const next = value(i)
+    if (arg === '--root') root = next ?? root
+    else if (arg === '--data-dir') dataDir = next ?? dataDir
     else if (arg === '--message') message = argv[i + 1]
-    else if (arg === '--config') config = argv[i + 1] ?? config
+    else if (arg === '--config') config = next ?? config
     // A selection flag with no value is reported, not silently dropped.
-    else if (arg === '--provider') provider = argv[i + 1] ?? ''
-    else if (arg === '--model') model = argv[i + 1] ?? ''
-    else if (arg === '--thinking') thinking = argv[i + 1] ?? ''
+    else if (arg === '--provider') provider = next ?? ''
+    else if (arg === '--model') model = next ?? ''
+    else if (arg === '--thinking') thinking = next ?? ''
+    else continue
+    // `--message` takes the next argument verbatim, even one starting `--`.
+    if (arg === '--message' ? argv[i + 1] !== undefined : next !== undefined) i++
   }
   return { yolo, root, dataDir, message, config, provider, model, thinking }
 }
@@ -180,9 +191,23 @@ async function main(): Promise<void> {
   // Providers come from the same store the web host edits, plus the legacy env
   // key — never from an implicit mock. Loaded before any resource is taken so
   // a bad flag exits without holding the data home.
-  const store = loadProviderStore(config)
+  let store: ReturnType<typeof loadProviderStore>
+  try {
+    store = loadProviderStore(config)
+  } catch (error) {
+    process.stderr.write(`dnt-harness: cannot read provider config '${config}': ${(error as Error).message}\n`)
+    process.exitCode = 1
+    return
+  }
+  if (store.providers.length === 0 && existsSync(config) && statSync(config).isFile() && readFileSync(config, 'utf8').trim() !== '') {
+    // A file that exists but yields nothing is unreadable, not empty: say so
+    // instead of the generic "no provider configured".
+    process.stderr.write(`dnt-harness: provider config '${config}' could not be parsed (expected the version 2 store); treating it as empty.\n`)
+  }
   const enabled = store.providers.filter((entry) => entry.enabled)
-  const legacyKey = apiKey !== undefined && enabled.some((entry) => entry.id === 'deepseek') ? undefined : apiKey
+  // The env key is sugar for a store with no DeepSeek entry at all: a
+  // `deepseek` entry, even a disabled one, is the operator's decision.
+  const legacyKey = apiKey !== undefined && store.providers.some((entry) => entry.id === 'deepseek') ? undefined : apiKey
   if (enabled.length === 0 && legacyKey === undefined) {
     process.stderr.write(`no provider configured (${config}) and no DEEPSEEK_API_KEY; model calls fail until one is registered.\n`)
   }
@@ -221,13 +246,25 @@ async function main(): Promise<void> {
     process.exitCode = 1
     return
   }
-  if (selectedModel !== undefined) {
-    // A bare model still needs a provider; prefer the one that advertises it.
-    selectedProvider = selectedProvider ?? [...candidates].find(([, entry]) => entry.models.includes(selectedModel!))?.[0]
-  }
   const defaultProvider = storedDefaults.provider !== null && storedDefaults.provider !== undefined && candidates.has(storedDefaults.provider) ? storedDefaults.provider : undefined
+  if (selectedModel !== undefined && selectedProvider === undefined) {
+    // A bare model still needs a provider: the default one when it advertises
+    // the model, else the first that does.
+    const advertises = (id: string): boolean => candidates.get(id)?.models.includes(selectedModel!) === true
+    selectedProvider = defaultProvider !== undefined && advertises(defaultProvider)
+      ? defaultProvider
+      : [...candidates.keys()].find(advertises)
+  }
   selectedProvider = selectedProvider ?? defaultProvider ?? (legacyKey !== undefined ? 'deepseek' : undefined)
   selectedModel = selectedModel ?? (defaultProvider !== undefined && defaultProvider === selectedProvider ? storedDefaults.model ?? undefined : candidates.get(selectedProvider ?? '')?.models[0])
+  // Same rule as the web host: a provider that advertises models only serves
+  // those, so an unknown or mistyped model fails here, not upstream.
+  const advertised = selectedProvider === undefined ? [] : candidates.get(selectedProvider)?.models ?? []
+  if (selectedModel !== undefined && advertised.length > 0 && !advertised.includes(selectedModel)) {
+    process.stderr.write(`dnt-harness: unknown model '${selectedModel}' for provider '${selectedProvider}'; available: ${advertised.join(', ')}.\n`)
+    process.exitCode = 1
+    return
+  }
   let selectedThinking = storedDefaults.thinkingLevel ?? (selectedProvider !== undefined && selectedModel !== undefined ? candidates.get(selectedProvider)?.modelSettings?.[selectedModel]?.thinkingLevel : undefined)
   if (flagThinking !== undefined) {
     if (!isThinkingLevel(flagThinking)) {
@@ -250,7 +287,7 @@ async function main(): Promise<void> {
   if (selectedProvider === undefined) {
     process.stderr.write(`no provider selected: pass --provider or configure ${config}.\n`)
   } else if (selectedModel === undefined) {
-    process.stderr.write(`no model selected for provider '${selectedProvider}': pass --model; requests fall back to its first model.\n`)
+    process.stderr.write(`no model selected for provider '${selectedProvider}', which advertises none: pass --model.\n`)
   }
   // One writer per data home: a web host (or another CLI) on the same
   // directory would append independent sequence numbers to shared logs.
@@ -356,6 +393,10 @@ async function main(): Promise<void> {
     if (emitter === session) render(event)
   })
 
+  // The operator's context override wins over the catalog, as in the web host.
+  const contextOverride = selectedProvider !== undefined && selectedModel !== undefined ? candidates.get(selectedProvider)?.modelSettings?.[selectedModel]?.contextTokens : undefined
+  const budget = resolveModelBudget(selectedModel === undefined ? {} : { model: selectedModel, ...(contextOverride !== undefined ? { contextTokens: contextOverride } : {}) })
+
   const agent = kernel.ctx.agents.create(session, scope)
   kernel.ctx.on('agent/context', async (projected, next) => {
     const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
@@ -374,7 +415,7 @@ async function main(): Promise<void> {
     const assembled = buildContext({
       events: session.events, mode, modeRevision: 0,
       model: selectedModel, providerName: selectedProvider,
-      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(selectedModel === undefined ? {} : { model: selectedModel }),
+      schemas, activeSkills: [], pinnedMemory, budget,
       ...(environment !== undefined ? { environment } : {}),
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(calibration !== undefined ? { calibration } : {}),

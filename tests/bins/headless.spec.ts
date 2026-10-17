@@ -215,9 +215,11 @@ describe('headless CLI', () => {
         expect(bodies[0]?.['model']).toBe('deepseek-v4.1-flash-free')
         // The level must reach the wire, not stop at the settings layer.
         expect(bodies[0]?.['reasoning_effort']).toBe('high')
-        // One stable affinity for the conversation.
-        expect(headers[0]?.['x-session-affinity']).toBeTypeOf('string')
         const events = await sessionEvents(dataDir)
+        // One stable affinity for the conversation: its own session id.
+        const sessionId = events.find((event) => typeof event['sessionId'] === 'string')?.['sessionId'] as string | undefined
+        expect(headers[0]?.['x-session-affinity']).toBeTypeOf('string')
+        if (sessionId !== undefined) expect(headers[0]?.['x-session-affinity']).toBe(sessionId)
         expect(events.find((event) => event.type === 'assistant/message')?.controls).toEqual({ model: 'deepseek-v4.1-flash-free', provider: 'fake' })
       } finally {
         await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
@@ -294,7 +296,47 @@ describe('headless CLI', () => {
       const missing = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--model'])
       expect(missing.code).toBe(1)
       expect(missing.stderr).toContain('--model needs a value')
+
+      // A following flag is not a value: no model `--yolo`, no silent yolo.
+      const swallowed = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--model', '--yolo'])
+      expect(swallowed.code).toBe(1)
+      expect(swallowed.stderr).toContain('--model needs a value')
+
+      // Like the web host, a model the provider does not advertise is refused.
+      const unknownModel = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--provider', 'fake', '--model', 'nope'])
+      expect(unknownModel.code).toBe(1)
+      expect(unknownModel.stderr).toContain("unknown model 'nope' for provider 'fake'; available: m")
       expect((await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl'))).toHaveLength(0)
+    }, 30_000)
+
+    it('a disabled deepseek entry is the operator decision: the env key does not bring it back', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-disabled-deepseek-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const config = path.join(dataDir, 'providers.json')
+      // Written with a UTF-8 BOM, as Windows editors do: still a valid store.
+      await writeFile(config, '\uFEFF' + JSON.stringify({
+        version: 2,
+        defaults: { provider: null, model: null, thinkingLevel: null },
+        providers: [
+          { id: 'fake', name: 'fake', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '', models: ['m'], enabled: true },
+          { id: 'deepseek', name: 'deepseek', baseUrl: 'http://127.0.0.1:1', apiKey: 'k', models: ['deepseek-flash'], enabled: false },
+        ],
+        aliases: [],
+        aliasGeneration: 0,
+      }))
+      const result = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--provider', 'deepseek'], { DEEPSEEK_API_KEY: 'sk-env' })
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain("provider 'deepseek' is not configured or not enabled (available: fake)")
+      expect(result.stderr).not.toContain('could not be parsed')
+    }, 30_000)
+
+    it('names an unreadable provider config instead of reporting none configured', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-corrupt-store-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const config = path.join(dataDir, 'providers.json')
+      await writeFile(config, '{ not json')
+      const result = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi'])
+      expect(result.stderr).toContain(`provider config '${config}' could not be parsed`)
     }, 30_000)
 
     it('legacy DEEPSEEK_API_KEY alone selects deepseek-flash, so --thinking works with no store', async () => {

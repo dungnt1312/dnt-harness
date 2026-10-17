@@ -19,13 +19,24 @@ export function gitShellPath(file: string): string {
   return `'${file.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`
 }
 
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function killProbeTree(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (child.pid === undefined) return
   if (process.platform === 'win32') {
     await new Promise<void>((resolve, reject) => {
       execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5000 }, (error) => {
-        if (error !== null) reject(error)
-        else resolve()
+        // Exit 128: part of the tree had already exited. That is the goal,
+        // not a failure, as long as the root itself is gone.
+        if (error === null || (error as { code?: unknown }).code === 128 && !isAlive(child.pid!)) resolve()
+        else reject(error)
       })
     })
   } else {
