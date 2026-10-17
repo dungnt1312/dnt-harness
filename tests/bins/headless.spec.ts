@@ -340,6 +340,38 @@ describe('headless CLI', () => {
       expect(result.stderr).toContain(`provider config '${config}' could not be parsed`)
     }, 30_000)
 
+    it('PH1-A: per-model context 32768 / output 4096 drive the manifest budget and the wire cap (phase-04 shared resolver)', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-effective-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const bodies: Record<string, unknown>[] = []
+      const provider = createServer(async (req, res) => {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        bodies.push(JSON.parse(raw) as Record<string, unknown>)
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
+      })
+      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+      const address = provider.address() as { port: number }
+      const config = path.join(dataDir, 'providers.json')
+      await writeFile(config, JSON.stringify({
+        version: 2,
+        defaults: { provider: 'fake', model: 'custom-model', thinkingLevel: null },
+        providers: [{ id: 'fake', name: 'fake', baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: '', models: ['custom-model'], enabled: true, modelSettings: { 'custom-model': { contextTokens: 32_768, maxOutputTokens: 4_096 } } }],
+        aliases: [],
+        aliasGeneration: 0,
+      }))
+      try {
+        const result = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'hi'])
+        expect(result.code).toBe(0)
+        expect(bodies[0]?.['max_tokens']).toBe(4_096)
+        const manifest = (await sessionEvents(dataDir)).find((event) => event.type === 'context/manifest')?.manifest
+        expect(manifest.budget).toMatchObject({ contextLimitTokens: 32_768, windowSource: 'override' })
+      } finally {
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+      }
+    }, 30_000)
+
     it('legacy DEEPSEEK_API_KEY alone selects deepseek-flash, so --thinking works with no store', async () => {
       dataDir = await mkdtemp(path.join(tmpdir(), 'cli-legacy-'))
       const root = fileURLToPath(new URL('../../', import.meta.url))

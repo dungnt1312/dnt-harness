@@ -283,7 +283,10 @@ export interface ContextBreakdown {
 
 export interface AssembledContext {
   readonly messages: readonly ModelMessage[]
-  /** Remaining window after calibrated input and safety margin; adapters may lower it. */
+  /**
+   * Remaining window after calibrated input and safety margin: an upper bound
+   * for an existing output cap, never a cap of its own. May be below 1 (no room).
+   */
   readonly maxOutputTokens: number
   readonly tools?: readonly ToolSchema[]
   readonly manifest: ContextManifest
@@ -999,8 +1002,11 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     messages,
     // Measured against the squeezed window: after the provider refused a
     // request for size, a smaller prompt must not be paired with a larger
-    // output cap, or input plus cap still overflows the real window.
-    maxOutputTokens: Math.max(1, Math.floor(squeezeBudget(input.budget, input.squeeze).contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens)),
+    // output cap, or input plus cap still overflows the real window. It only
+    // BOUNDS a cap the adapter already has (never invents one) and is never
+    // floored: a value below 1 means no room, which the adapter refuses
+    // before the network so the bounded squeeze can recover.
+    maxOutputTokens: Math.floor(squeezeBudget(input.budget, input.squeeze).contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens),
     ...(schemas.length > 0 ? { tools: schemas } : {}),
     manifest: {
       ...manifest,

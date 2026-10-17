@@ -54,6 +54,8 @@ import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecy
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { DEEPSEEK_MODELS } from '../harness/llm/deepseek.ts'
 import { expressibleThinkingLevel, isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { advertisedModelError, effectiveBudget } from '../harness/llm/effective-model.ts'
+import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
@@ -932,6 +934,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return state
   }
 
+  // Keys route-identity credential fingerprints (HMAC, per-install secret next
+  // to providers.json, shared with the CLI). Never logged.
+  const credentialHasher = loadCredentialHasher(path.dirname(configFile)).hash
   const instantiate = (entry: ProviderConfig): LlmProvider =>
     new OpenAiCompletionsProvider({
       name: entry.id,
@@ -939,6 +944,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       baseUrl: entry.baseUrl,
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
+      credentialHasher,
     })
 
   const injectionNames = (): readonly string[] =>
@@ -989,18 +995,15 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const validateProviderModel = (providerId: string, model?: string): { provider: string; model: string | undefined } => {
     const id = providerId
     if (id === '' || !usableIds().includes(id)) throw new Error(`no usable provider '${providerId}'`)
-    const available = kernel.ctx.llm.providerModels(id)
-    if (model !== undefined && available.length > 0 && !available.includes(model)) {
-      throw new Error(`unknown model '${model}' for provider '${id}'; available: ${available.join(', ')}`)
-    }
+    // Same rule and message as the CLI, from the shared resolver.
+    const unknown = advertisedModelError(id, kernel.ctx.llm.providerModels(id), model)
+    if (unknown !== undefined) throw new Error(unknown)
     return { provider: id, model }
   }
 
   /** The budget of a pair: the operator's override (verified), else the catalog's documented window. */
-  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget => {
-    const configured = provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
-    return resolveModelBudget({ model, ...(configured !== undefined ? { contextTokens: configured } : {}) })
-  }
+  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget =>
+    effectiveBudget(model, provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model])
 
   /**
    * The model behind the Git panel's Generate Commit Message button: the

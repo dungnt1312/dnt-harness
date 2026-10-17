@@ -937,6 +937,15 @@ root stops waiting:
   silence is reported as `provider transport interrupted after Ns without
   output (likely a gateway idle cutoff)`: a proxy in front of the provider
   dropped the connection while the model wrote one large buffered tool call.
+- *The endpoint rejects the output cap.* For a model with no operator or
+  catalog limit the adapter sends a 32 000-token guess. If the endpoint rejects
+  it, the adapter resends once with the limit it names (known formats only,
+  ≤ 256 000) or with no cap, counting the resend as a physical attempt, and
+  remembers the result in memory for that route until the key, endpoint or
+  model changes. A rejected operator/catalog cap fails the turn with an
+  actionable message (`lower maxOutputTokens`), never a squeeze or a replay —
+  also when a relay wraps it in a 502. A genuine `input + completion > window`
+  error stays a context overflow even in `max_tokens` wording and squeezes.
 - *Hit the output-token limit.* The OpenAI adapter sends `max_tokens` from the
   model catalog (`maxOutputTokens`, overridable per model in a provider's
   `modelSettings`), so the gateway's own default does not cap the reply. A

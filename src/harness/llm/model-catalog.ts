@@ -312,28 +312,56 @@ export function getModelInfo(modelId: string | null | undefined): ModelInfo | nu
  * segment. Checked 2026-10 against vendor docs.
  */
 const OUTPUT_LIMIT_PATTERNS: readonly ModelPattern<number>[] = [
-  // The first gpt-4o snapshot predates the 16K output limit.
-  { pattern: /^gpt-4o-2024-05-13$/, value: 4_096 },
   { pattern: /^(?:chatgpt-)?gpt-4o(?:-mini)?(?:[-:].*)?$/, value: 16_384 },
   { pattern: /^gpt-4\.1(?:-(?:mini|nano))?(?:[-:].*)?$/, value: 32_768 },
+  // GPT-4 Turbo and its dated snapshots: 4,096 output tokens.
+  { pattern: /^gpt-4-turbo(?:-(?:preview|\d{4}-\d{2}-\d{2}))?$/, value: 4_096 },
   // V4 family (deepseek-flash, deepseek-v4-*, gateway "-free" aliases): 384K.
   { pattern: /^deepseek-(?:flash|v4)(?:[-.:].*)?$/, value: 393_216 },
 ]
 
 /**
- * The documented maximum output for a model id: the capability catalog, else
- * the output-only table above. `undefined` means unknown.
+ * Exact snapshots whose documented output limit differs from their family's.
+ * Checked before any family pattern, so a dated SKU never inherits the alias's
+ * larger limit. Only SKUs still advertised by common gateways.
  */
-export function resolveOutputLimit(modelId: string | null | undefined): number | undefined {
-  const catalog = getModelInfo(modelId)?.maxOutputTokens
-  if (catalog !== undefined) return catalog
+const OUTPUT_LIMIT_EXACT: Readonly<Record<string, number>> = {
+  // The first gpt-4o snapshot predates the 16K output limit.
+  'gpt-4o-2024-05-13': 4_096,
+  'gpt-4-turbo': 4_096,
+  'gpt-4-turbo-2024-04-09': 4_096,
+  'gpt-4-turbo-preview': 4_096,
+  'gpt-4-0125-preview': 4_096,
+  'gpt-4-1106-preview': 4_096,
+  'gpt-4': 8_192,
+  'gpt-4-0613': 8_192,
+  'gpt-3.5-turbo': 4_096,
+  'gpt-3.5-turbo-0125': 4_096,
+}
+
+/**
+ * The documented maximum output for a model id and where it came from:
+ * `catalog` for an exact id (capability catalog or the snapshot table above),
+ * `family` for a pattern match. `undefined` means unknown.
+ */
+export function resolveOutputLimitSource(modelId: string | null | undefined): { readonly tokens: number; readonly source: 'catalog' | 'family' } | undefined {
   if (modelId === null || modelId === undefined) return undefined
-  const id = modelId.trim().toLowerCase()
-  for (const candidate of [id, bareModelId(id)]) {
+  const id = normalizeModelId(modelId)
+  const bare = bareModelId(id)
+  const exact = MODEL_CATALOG[id]?.maxOutputTokens ?? OUTPUT_LIMIT_EXACT[id] ?? OUTPUT_LIMIT_EXACT[bare]
+  if (exact !== undefined) return { tokens: exact, source: 'catalog' }
+  const family = getModelInfo(modelId)?.maxOutputTokens
+  if (family !== undefined) return { tokens: family, source: 'family' }
+  for (const candidate of [id, bare]) {
     const match = OUTPUT_LIMIT_PATTERNS.find((entry) => entry.pattern.test(candidate))
-    if (match !== undefined) return match.value
+    if (match !== undefined) return { tokens: match.value, source: 'family' }
   }
   return undefined
+}
+
+/** The documented maximum output for a model id; `undefined` means unknown. */
+export function resolveOutputLimit(modelId: string | null | undefined): number | undefined {
+  return resolveOutputLimitSource(modelId)?.tokens
 }
 
 /** The documented reasoning capability for an exact model ID. */

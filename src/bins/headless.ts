@@ -38,8 +38,6 @@ import {
   attachApproval,
   bashTool,
   bashOutputTool,
-  expressibleThinkingLevel,
-  isThinkingLevel,
   killShellTool,
   fileSessions,
   fsTools,
@@ -68,7 +66,8 @@ import { latestCalibration } from '../harness/context/calibration.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import { randomUUID } from 'node:crypto'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
-import { resolveModelBudget } from '../harness/context/budget.ts'
+import { credentialGeneration, resolveEffectiveModel, type EffectiveProvider } from '../harness/llm/effective-model.ts'
+import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
@@ -225,10 +224,15 @@ async function main(): Promise<void> {
   // to advertise first. Only providers that will actually be registered are
   // candidates: an enabled store entry, or the legacy env provider.
   const storedDefaults = repairDefaults(store.defaults, store.providers)
-  const candidates = new Map<string, { readonly models: readonly string[]; readonly modelSettings?: (typeof enabled)[number]['modelSettings'] }>(
-    enabled.map((entry) => [entry.id, entry]),
+  const legacyBaseUrl = process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'
+  // Keys route-identity credential fingerprints; shared with the web host via the store's directory.
+  const credentialHasher = loadCredentialHasher(path.dirname(config)).hash
+  // Resolver input per candidate: the key itself stays here, only its opaque
+  // generation travels into the resolved facts.
+  const candidates = new Map<string, EffectiveProvider>(
+    enabled.map((entry) => [entry.id, { id: entry.id, baseUrl: entry.baseUrl, models: entry.models, ...(entry.modelSettings !== undefined ? { modelSettings: entry.modelSettings } : {}), credentialGeneration: credentialGeneration(entry.apiKey, credentialHasher) }]),
   )
-  if (legacyKey !== undefined) candidates.set('deepseek', { models: DEEPSEEK_MODELS })
+  if (legacyKey !== undefined) candidates.set('deepseek', { id: 'deepseek', baseUrl: legacyBaseUrl, models: DEEPSEEK_MODELS, credentialGeneration: credentialGeneration(legacyKey, credentialHasher) })
   let selectedProvider = flagProvider
   let selectedModel = flagModel
   if (selectedProvider === undefined && selectedModel !== undefined) {
@@ -257,33 +261,23 @@ async function main(): Promise<void> {
   }
   selectedProvider = selectedProvider ?? defaultProvider ?? (legacyKey !== undefined ? 'deepseek' : undefined)
   selectedModel = selectedModel ?? (defaultProvider !== undefined && defaultProvider === selectedProvider ? storedDefaults.model ?? undefined : candidates.get(selectedProvider ?? '')?.models[0])
-  // Same rule as the web host: a provider that advertises models only serves
-  // those, so an unknown or mistyped model fails here, not upstream.
-  const advertised = selectedProvider === undefined ? [] : candidates.get(selectedProvider)?.models ?? []
-  if (selectedModel !== undefined && advertised.length > 0 && !advertised.includes(selectedModel)) {
-    process.stderr.write(`dnt-harness: unknown model '${selectedModel}' for provider '${selectedProvider}'; available: ${advertised.join(', ')}.\n`)
+  // Every fact that follows from the pair comes from the shared resolver, as in
+  // the web host: advertised-model validation (an unknown or mistyped model
+  // fails here, not upstream), the expressible thinking level (a flag is
+  // strict, a stored level is a preference), and the context budget with the
+  // operator's per-model override.
+  const resolved = resolveEffectiveModel({
+    ...(selectedProvider !== undefined && candidates.has(selectedProvider) ? { provider: candidates.get(selectedProvider)! } : {}),
+    ...(selectedModel !== undefined ? { model: selectedModel } : {}),
+    thinking: flagThinking !== undefined ? { level: flagThinking, strict: true } : { level: storedDefaults.thinkingLevel },
+  })
+  if (!resolved.ok) {
+    const message = resolved.error.code === 'invalid_thinking' ? `--thinking must be one of ${THINKING_LEVELS.join(', ')}` : resolved.error.message
+    process.stderr.write(`dnt-harness: ${message}.\n`)
     process.exitCode = 1
     return
   }
-  let selectedThinking = storedDefaults.thinkingLevel ?? (selectedProvider !== undefined && selectedModel !== undefined ? candidates.get(selectedProvider)?.modelSettings?.[selectedModel]?.thinkingLevel : undefined)
-  if (flagThinking !== undefined) {
-    if (!isThinkingLevel(flagThinking)) {
-      process.stderr.write(`dnt-harness: --thinking must be one of ${THINKING_LEVELS.join(', ')}.\n`)
-      process.exitCode = 1
-      return
-    }
-    const accepted = expressibleThinkingLevel(selectedModel, flagThinking)
-    if (accepted === undefined) {
-      process.stderr.write(`dnt-harness: model '${selectedModel ?? '(none)'}' cannot express thinking level '${flagThinking}'.\n`)
-      process.exitCode = 1
-      return
-    }
-    selectedThinking = accepted
-  } else if (selectedThinking !== undefined) {
-    // A stored level is a preference, not a contract: an unsupported one is
-    // simply not carried, exactly as the web host resolves it.
-    selectedThinking = expressibleThinkingLevel(selectedModel, selectedThinking)
-  }
+  const selectedThinking = resolved.value.thinking
   if (selectedProvider === undefined) {
     process.stderr.write(`no provider selected: pass --provider or configure ${config}.\n`)
   } else if (selectedModel === undefined) {
@@ -380,10 +374,11 @@ async function main(): Promise<void> {
       baseUrl: entry.baseUrl,
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
+      credentialHasher,
     }))
   }
   if (legacyKey !== undefined) {
-    kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+    kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, legacyBaseUrl, { credentialHasher }))
   }
 
   const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
@@ -394,8 +389,7 @@ async function main(): Promise<void> {
   })
 
   // The operator's context override wins over the catalog, as in the web host.
-  const contextOverride = selectedProvider !== undefined && selectedModel !== undefined ? candidates.get(selectedProvider)?.modelSettings?.[selectedModel]?.contextTokens : undefined
-  const budget = resolveModelBudget(selectedModel === undefined ? {} : { model: selectedModel, ...(contextOverride !== undefined ? { contextTokens: contextOverride } : {}) })
+  const budget = resolved.value.budget
 
   const agent = kernel.ctx.agents.create(session, scope)
   kernel.ctx.on('agent/context', async (projected, next) => {

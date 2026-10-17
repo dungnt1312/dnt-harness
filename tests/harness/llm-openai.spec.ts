@@ -76,12 +76,14 @@ describe('openai completions adapter: thinking + wire shape', () => {
     expect(captured.map(c => c.body['max_tokens'])).toEqual([32_000, 32_000, 12_000, 32_000, 5_000])
     expect(captured.every(c => !('outputCeilingTokens' in c.body))).toBe(true)
   })
-  it('bounds the cap like opencode: never below 1,024 from the window, never above 256,000', () => {
-    // A near-full window still leaves a usable reply; an over-tight estimate
-    // then surfaces as an overflow (which squeezes) instead of a 1-token answer.
-    expect(outputTokenCap('some-unknown-model', undefined, undefined, 1)).toBe(1_024)
-    expect(outputTokenCap('some-unknown-model', undefined, undefined, 500)).toBe(1_024)
-    // An explicit request cap below the floor is still honored.
+  it('bounds the cap by the window without a floor, and never above 256,000', () => {
+    // Intended change (plans/261017-runtime-provider-hardening phase-04, spec
+    // §8 PH2-D): the window ceiling is an upper bound and the former 1,024
+    // floor that raised the cap above the remaining room is gone. A
+    // non-positive room is refused before the network (see below).
+    expect(outputTokenCap('some-unknown-model', undefined, undefined, 1)).toBe(1)
+    expect(outputTokenCap('some-unknown-model', undefined, undefined, 500)).toBe(500)
+    // An explicit request cap is still honored under the room.
     expect(outputTokenCap('some-unknown-model', undefined, 256, 500)).toBe(256)
     // Operator and catalog caps above 256k are clamped.
     expect(outputTokenCap('m', { m: 1_000_000 })).toBe(256_000)
@@ -538,6 +540,221 @@ describe('openai completions adapter: retry before the stream starts', () => {
     const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'], maxOutputTokens: { m: 4_096 } })
     await expect(collect(p)).rejects.toThrow(/supports at most 2048/)
     expect(operator).toHaveBeenCalledTimes(1)
+  })
+
+  // ── Phase 04 (plans/261017-runtime-provider-hardening): bounded relearning ──
+
+  /** One logged physical attempt already consumed, as `runAttempt` does. */
+  function ownedRequest(maxAttempts = 4): LogicalRequest {
+    const owner = new LogicalRequest({ maxAttempts })
+    owner.consume()
+    return owner
+  }
+
+  async function collectWith(p: OpenAiCompletionsProvider, request: Parameters<OpenAiCompletionsProvider['stream']>[0], owner?: LogicalRequest): Promise<string> {
+    let text = ''
+    try {
+      for await (const event of p.stream(request, owner !== undefined ? { requestOwner: owner } : undefined)) if (event.type === 'delta') text += event.delta
+    } finally { owner?.dispose() }
+    return text
+  }
+
+  const atMost = (limit: number, sent = 32_000): Response => capError(`max_tokens is too large: ${sent}. This model supports at most ${limit} completion tokens, whereas you provided ${sent}.`)
+  const vllmWindow = (sent = 32_000): Response => capError(`'max_tokens' or 'max_completion_tokens' is too large: ${sent}. This model's maximum context length is 32768 tokens and your request has 6000 input tokens (${sent} > 32768 - 6000).`)
+
+  it('the corrective resend is charged to the logical request, and none happens without budget', async () => {
+    const fake = scripted([() => atMost(4_096), () => sse('ok')])
+    const owner = ownedRequest()
+    expect(await collectWith(fast(), { messages: [] }, owner)).toBe('ok')
+    // The first physical attempt plus the corrective resend.
+    expect(owner.attempts).toBe(2)
+    expect(bodiesOf(fake).map((body) => body['max_tokens'])).toEqual([32_000, 4_096])
+
+    // Attempt budget spent: the rejection surfaces instead of a free resend…
+    const exhausted = scripted([() => atMost(4_096), () => sse('never')])
+    const p = fast()
+    const spent = ownedRequest(1)
+    const error = await collectWith(p, { messages: [] }, spent).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    expect(exhausted).toHaveBeenCalledTimes(1)
+    expect(error?.classification).toBe('output_cap_rejected')
+    expect(error?.transient).toBe(false)
+    expect(spent.attempts).toBe(1)
+    // …but (review M2) the limit is still learned, and the message blames the
+    // guess, not an operator setting that does not exist.
+    expect(error?.message).toContain('fallback output-cap guess (32000) rejected')
+    expect(error?.message).not.toContain('lower maxOutputTokens')
+    expect(p.outputCapDiagnostics()).toMatchObject({ cap: 4_096, learned: true })
+    const next = scripted([() => sse('ok')])
+    await collectWith(p, { messages: [] })
+    expect(bodiesOf(next)[0]!['max_tokens']).toBe(4_096)
+  })
+
+  it('review H1: a limit is read only from the output-token field, never a neighbouring one, and tiny limits are not learned', async () => {
+    // Mixed multi-field error: the number belongs to temperature.
+    const mixed = 'max_tokens is too large: 32000; temperature must be at most 2'
+    expect(outputLimitFromError(mixed, 32_000)).toBeUndefined()
+    expect(outputLimitFromError('Invalid request: top_p must be less than or equal to 1. Expected a value <= 1, but got 5.', 32_000)).toBeUndefined()
+    const fakeMixed = scripted([() => capError(mixed), () => sse('ok')])
+    await collect(fast())
+    const [, resend] = bodiesOf(fakeMixed)
+    // Cap wording without a readable field limit: resend with no cap, never 2.
+    expect('max_tokens' in resend!).toBe(false)
+    // A neighbouring field's constraint alone is not a cap rejection at all.
+    const neighbour = scripted([() => capError('temperature must be at most 2')])
+    await expect(collect(fast())).rejects.toThrow()
+    expect(neighbour).toHaveBeenCalledTimes(1)
+    // Anchored forms still read; the field must own the clause.
+    expect(outputLimitFromError('`max_tokens` must be less than or equal to `8192`', 32_000)).toBe(8_192)
+    expect(outputLimitFromError("Invalid 'max_completion_tokens': integer above maximum value. Expected a value <= 16384, but got 32000 instead.", 32_000)).toBe(16_384)
+    // Tiny limit (< 256): treated as unreadable -> no cap, not learned as a cripple.
+    expect(outputLimitFromError('This model supports at most 2 completion tokens', 32_000)).toBeUndefined()
+    expect(outputLimitFromError('This model supports at most 255 completion tokens', 32_000)).toBeUndefined()
+    expect(outputLimitFromError('This model supports at most 256 completion tokens', 32_000)).toBe(256)
+    const tiny = scripted([() => capError('max_tokens is too large: 32000. This model supports at most 16 completion tokens.'), () => sse('ok')])
+    const p = fast()
+    await collect(p)
+    expect('max_tokens' in bodiesOf(tiny)[1]!).toBe(false)
+    expect(p.outputCapDiagnostics().cap).toBe('omitted')
+  })
+
+  it('review low: diagnostics peek without refreshing LRU recency', async () => {
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['first'] })
+    for (let i = 0; i <= 16; i++) {
+      scripted([() => atMost(2_048), () => sse('ok')])
+      await collectWith(p, { model: i === 0 ? 'first' : `m-${i}`, messages: [] })
+      // Reading 'first' repeatedly must not keep it alive.
+      if (i < 16) expect(p.outputCapDiagnostics('first').learned).toBe(true)
+    }
+    expect(p.outputCapDiagnostics('first').learned).toBe(false)
+  })
+
+  it('accepts only bounded, plausible limits from the error text', async () => {
+    // Above the product budget (256,000): not trusted; falls back to no cap.
+    const huge = scripted([() => capError('max_tokens is too large: 32000. This model supports at most 999999 completion tokens.'), () => sse('ok')])
+    await collect(fast())
+    expect('max_tokens' in bodiesOf(huge)[1]!).toBe(false)
+    // A "limit" at or above what was sent cannot explain the rejection.
+    expect(outputLimitFromError('This model supports at most 64000 completion tokens', 32_000)).toBeUndefined()
+    expect(outputLimitFromError('This model supports at most 64000 completion tokens', 128_000)).toBe(64_000)
+    expect(outputLimitFromError('This model supports at most 0 completion tokens')).toBeUndefined()
+    // Arbitrary numbers in unknown text are never read as limits.
+    expect(outputLimitFromError('request 4242 failed with 8192 tokens somewhere')).toBeUndefined()
+  })
+
+  it('learned caps are bounded per instance, keyed by route, and exposed in diagnostics without secrets', async () => {
+    const key = 'sk-live-DIAGNOSTICSKEY12345'
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: key, baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m0'] })
+    expect(p.outputCapDiagnostics('m0')).toEqual({ model: 'm0', source: 'fallback', cap: 32_000, learned: false })
+    scripted([() => atMost(4_096), () => sse('ok')])
+    await collectWith(p, { model: 'm0', messages: [] })
+    expect(p.outputCapDiagnostics('m0')).toEqual({ model: 'm0', source: 'fallback', cap: 4_096, learned: true })
+    scripted([() => vllmWindow(), () => sse('ok')])
+    await collectWith(p, { model: 'vllm-model', messages: [] })
+    expect(p.outputCapDiagnostics('vllm-model')).toEqual({ model: 'vllm-model', source: 'fallback', cap: 'omitted', learned: true })
+    expect(JSON.stringify([p.outputCapDiagnostics('m0'), p.routeIdentity('m0')])).not.toContain('DIAGNOSTICSKEY')
+    // An operator or catalog cap is reported as such and never learned over.
+    expect(p.outputCapDiagnostics('gpt-4o')).toEqual({ model: 'gpt-4o', source: 'family', cap: 16_384, learned: false })
+
+    // A relay inventing a new model per request cannot grow the memory: the
+    // oldest route is evicted (16 routes per instance).
+    for (let i = 1; i <= 16; i++) {
+      scripted([() => atMost(2_048), () => sse('ok')])
+      await collectWith(p, { model: `spam-${i}`, messages: [] })
+    }
+    expect(p.outputCapDiagnostics('m0').learned).toBe(false)
+    expect(p.outputCapDiagnostics('spam-16')).toMatchObject({ cap: 2_048, learned: true })
+  })
+
+  it('credential rotation resets the learned cap and the route identity', async () => {
+    const first = new OpenAiCompletionsProvider({ name: 'gw', apiKey: 'sk-account-ONE11111111', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'] })
+    scripted([() => atMost(4_096), () => sse('ok')])
+    await collectWith(first, { messages: [] })
+    expect(first.outputCapDiagnostics().cap).toBe(4_096)
+    // Hosts re-instantiate the provider when its key changes (web
+    // syncRegistrations, CLI per run): the new account starts from the guess.
+    const rotated = new OpenAiCompletionsProvider({ name: 'gw', apiKey: 'sk-account-TWO22222222', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'] })
+    const fake = scripted([() => sse('ok')])
+    await collectWith(rotated, { messages: [] })
+    expect(bodiesOf(fake)[0]!['max_tokens']).toBe(32_000)
+    expect(rotated.routeIdentity().credential).not.toBe(first.routeIdentity().credential)
+    expect({ ...rotated.routeIdentity(), credential: '' }).toEqual({ ...first.routeIdentity(), credential: '' })
+  })
+
+  it('an unknown Claude alias with thinking: budget below the guess, dropped with the cap, recomputed below a learned cap', async () => {
+    const claude = (): OpenAiCompletionsProvider => new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['claude-gateway-x'] })
+    // vLLM-style rejection: no limit can be read, so no cap and no budget thinking.
+    const dropped = scripted([() => vllmWindow(), () => sse('ok')])
+    await collectWith(claude(), { messages: [], thinkingLevel: 'high' })
+    const [guess, resend] = bodiesOf(dropped)
+    expect([guess!['max_tokens'], guess!['thinking']]).toEqual([32_000, { type: 'enabled', budget_tokens: 16_000 }])
+    expect('max_tokens' in resend!).toBe(false)
+    expect('thinking' in resend!).toBe(false)
+    // A readable limit: the budget is recomputed below the final cap.
+    const relearned = scripted([() => atMost(8_192), () => sse('ok')])
+    await collectWith(claude(), { messages: [], thinkingLevel: 'max' })
+    expect(bodiesOf(relearned).map((body) => [body['max_tokens'], body['thinking']])).toEqual([
+      [32_000, { type: 'enabled', budget_tokens: 31_999 }],
+      [8_192, { type: 'enabled', budget_tokens: 8_191 }],
+    ])
+  })
+
+  it('a learned "no cap" that meets a gateway requiring one is forgotten, not repeated', async () => {
+    const p = fast()
+    scripted([() => vllmWindow(), () => sse('ok')])
+    await collect(p)
+    expect(p.outputCapDiagnostics().cap).toBe('omitted')
+    const missing = scripted([() => capError('max_tokens is required')])
+    const error = await collect(p).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    expect(missing).toHaveBeenCalledTimes(1)
+    expect('max_tokens' in bodiesOf(missing)[0]!).toBe(false)
+    expect(error?.classification).toBe('missing_required_cap')
+    expect(error?.message).toContain('requires an output cap')
+    expect(error?.transient).toBe(false)
+    // The next request starts from the documented fallback again.
+    const next = scripted([() => sse('ok')])
+    await collect(p)
+    expect(bodiesOf(next)[0]!['max_tokens']).toBe(32_000)
+  })
+
+  it('a small window ceiling bounds the cap; an exhausted one is refused before the network', async () => {
+    const fake = scripted([() => sse('ok')])
+    await collectWith(fast(), { messages: [], outputCeilingTokens: 700 })
+    expect(bodiesOf(fake)[0]!['max_tokens']).toBe(700)
+    const none = scripted([() => sse('never')])
+    for (const ceiling of [0, -12]) {
+      const error = await collectWith(fast(), { messages: [], outputCeilingTokens: ceiling }).then(() => undefined, (caught: unknown) => caught as ProviderError)
+      expect(error?.contextExceeded).toBe(true)
+    }
+    expect(none).not.toHaveBeenCalled()
+  })
+
+  it('PH3-B: a pure output-cap rejection of an authoritative cap is one request, terminal, actionable and redacted', async () => {
+    const key = 'sk-live-REDACTME00000000'
+    const fake = scripted([() => capError(`max_tokens is too large: 32000. This model supports at most 4096 completion tokens, whereas you provided 32000. key ${key}`)])
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: key, baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'], maxOutputTokens: { m: 32_000 } })
+    const error = await collectWith(p, { messages: [] }).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    expect(fake).toHaveBeenCalledTimes(1)
+    expect(error).toMatchObject({ reason: 'unknown', classification: 'output_cap_rejected', transient: false, contextExceeded: false })
+    expect(error?.message).toContain("lower maxOutputTokens for 'm'")
+    expect(error?.message).not.toContain('REDACTME')
+  })
+
+  it('a 502-wrapped pure cap rejection is not transient and is not replayed', async () => {
+    const fake = scripted([() => new Response(JSON.stringify({ error: { message: 'upstream: This model supports at most 4096 completion tokens, whereas you provided 16384.' } }), { status: 502 })])
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['gpt-4o'] })
+    const error = await collectWith(p, { messages: [] }).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    expect(fake).toHaveBeenCalledTimes(1)
+    expect(error).toMatchObject({ classification: 'output_cap_rejected', transient: false })
+    expect(error?.reason).not.toBe('server_error')
+  })
+
+  it('shared-window overflow with an authoritative cap stays recoverable even in max_tokens wording', async () => {
+    const fake = scripted([() => vllmWindow(3_000)])
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'], maxOutputTokens: { m: 3_000 } })
+    const error = await collectWith(p, { messages: [] }).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    expect(fake).toHaveBeenCalledTimes(1)
+    expect(error?.contextExceeded).toBe(true)
+    expect(error?.classification).toBe('context_exceeded')
   })
 
   it('redacts credentials an auth error echoes back before they reach the durable message', async () => {

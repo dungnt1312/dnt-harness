@@ -163,10 +163,23 @@ inherited parent-context → drop memory → drop oldest completed turns
 The 4 096-token output reserve is a minimum assembly headroom, not permission
 to send the catalog output maximum regardless of input size. Assembly exposes
 `maxOutputTokens = window − calibrated input − margin`; web and headless hosts
-pass that per-request ceiling (`outputCeilingTokens`) to the adapter, which
-takes the smaller of it and the catalog/operator/request output cap; with no
-known cap it sends no `max_tokens`. A Claude thinking budget is clamped below
-the resulting `max_tokens`, or dropped when it cannot reach 1 024.
+pass that per-request ceiling (`outputCeilingTokens`) to the adapter. It is an
+upper bound only: it lowers an existing cap, never invents one, and is never
+floored (a cap may be smaller than 1 024 when the room is). A ceiling below 1
+means no room is left: the adapter refuses before the network as a context
+overflow, so the bounded squeeze re-assembles or the turn fails.
+
+The cap itself comes from `src/harness/llm/effective-model.ts`: operator
+`maxOutputTokens` → exact catalog snapshot → family rule → a 32 000-token
+fallback. Only the fallback is a guess: when an endpoint rejects it, the
+adapter reads the limit from a known error format (a safe integer ≤ 256 000,
+never the remaining window), resends once — charged to the logical request's
+attempt budget — and remembers it in memory for that route (endpoint, model,
+profile, credential generation; at most 16 routes per provider instance). When
+no limit can be read it resends with no cap. An operator or catalog cap that is
+rejected is a terminal, actionable error and is never relearned or squeezed. A
+Claude thinking budget is computed against the final cap (clamped below it, or
+dropped when it cannot reach 1 024 or when no cap is sent).
 
 The window itself resolves once, in `resolveContextWindow` (catalog → family →
 fallback) with the source recorded as `budget.windowSource`; an operator

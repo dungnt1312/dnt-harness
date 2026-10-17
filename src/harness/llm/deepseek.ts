@@ -4,7 +4,7 @@
  * {@link OpenAiCompletionsProvider} against api.deepseek.com.
  */
 export { OpenAiCompletionsProvider, type OpenAiCompletionsOptions } from './openai.ts'
-import { OpenAiCompletionsProvider } from './openai.ts'
+import { OpenAiCompletionsProvider, type OpenAiCompletionsOptions } from './openai.ts'
 
 /**
  * Models the hosted DeepSeek API serves, default first. `deepseek-chat` and
@@ -15,12 +15,13 @@ import { OpenAiCompletionsProvider } from './openai.ts'
 export const DEEPSEEK_MODELS: readonly string[] = ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-v4-flash']
 
 export class DeepSeekProvider extends OpenAiCompletionsProvider {
-  constructor(apiKey: string, baseUrl = 'https://api.deepseek.com') {
+  constructor(apiKey: string, baseUrl = 'https://api.deepseek.com', options?: Pick<OpenAiCompletionsOptions, 'credentialHasher'>) {
     super({
       name: 'deepseek',
       apiKey,
       baseUrl,
       models: DEEPSEEK_MODELS,
+      ...(options?.credentialHasher !== undefined ? { credentialHasher: options.credentialHasher } : {}),
     })
   }
 }

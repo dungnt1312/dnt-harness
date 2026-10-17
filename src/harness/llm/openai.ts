@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto'
-import { applyThinkingOverride, resolveOutputLimit } from './model-catalog.ts'
 import { classifyTransport } from './request-lifecycle.ts'
 import { cancelReader, encodedBytes, normalizeFinishReason, protocolError, readBoundedError, readSse, validateCompletion, validateToolBatch, WIRE_LIMITS } from './completion.ts'
-import type { ModelCompletion, ModelFinishReason } from './types.ts'
+import {
+  applyThinking, credentialGeneration, detectMaxTokensField, detectSupportsPromptCacheKey, detectSupportsStore,
+  outputCeiling, outputPolicy, outputTokenCap, routeIdentity, routeKey,
+  type CredentialHasher, type MaxTokensField, type OutputCapSource, type RouteIdentity,
+} from './effective-model.ts'
+import type { ModelCompletion, ModelFinishReason, ProviderErrorReason } from './types.ts'
 import { messageText, ProviderError } from './types.ts'
 import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
 
@@ -115,77 +119,16 @@ export interface OpenAiCompletionsOptions {
   readonly supportsPromptCacheKey?: boolean
   /** Whether this endpoint understands `store`. Only then is `store: false` sent. */
   readonly supportsStore?: boolean
+  /**
+   * Keyed hasher for the route identity's credential fingerprint, injected by
+   * the host (persisted per-install secret). Unset: a process-local secret.
+   */
+  readonly credentialHasher?: CredentialHasher
 }
 
-/**
- * OpenAI itself, recognized by host only. A provider merely *named* "openai"
- * is often a relay (LiteLLM, Azure, vLLM, llama.cpp) that would reject `store`
- * or ignore `max_completion_tokens`, so the name never opts an endpoint in.
- */
-const isOpenAiNative = (baseUrl: string): boolean => {
-  try {
-    return new URL(baseUrl).hostname.toLowerCase() === 'api.openai.com'
-  } catch {
-    return false
-  }
-}
-
-/**
- * Providers documented to take the legacy `max_tokens` field even though
- * their endpoint is not OpenAI's; mirrors opencode's `openai-chat` list.
- */
-const LEGACY_MAX_TOKENS_PROVIDERS: ReadonlySet<string> = new Set([
-  'deepseek', 'moonshotai', 'togetherai', 'together', 'zai', 'zai-coding-plan',
-  'zhipuai', 'zhipuai-coding-plan', 'nvidia', 'cerebras', 'chutes',
-  'cloudflare-ai-gateway', 'cloudflare-workers-ai',
-])
-const LEGACY_MAX_TOKENS_HOSTS: readonly string[] = [
-  'deepseek.com', 'api.moonshot.', 'api.together.', 'api.z.ai', 'open.bigmodel.cn',
-  'integrate.api.nvidia.com', 'cerebras.ai', 'llm.chutes.ai',
-  'gateway.ai.cloudflare.com', 'api.cloudflare.com',
-]
-
-/**
- * Which body field carries the output cap. OpenAI-native endpoints take
- * `max_completion_tokens` — the field their newer models require — while the
- * documented compatible families above keep `max_tokens`. An endpoint that
- * cannot be recognized keeps `max_tokens` too: an arbitrarily named gateway is
- * far more likely to be a compatible relay than OpenAI itself, so shipping
- * SR-0 must not change what existing deployments receive.
- */
-export function detectMaxTokensField(name: string, baseUrl: string): 'max_tokens' | 'max_completion_tokens' {
-  if (LEGACY_MAX_TOKENS_PROVIDERS.has(name.toLowerCase())) return 'max_tokens'
-  const url = baseUrl.toLowerCase()
-  if (LEGACY_MAX_TOKENS_HOSTS.some((host) => url.includes(host))) return 'max_tokens'
-  return isOpenAiNative(baseUrl) ? 'max_completion_tokens' : 'max_tokens'
-}
-
-/** Only OpenAI-native endpoints are known to accept an explicit `store`. */
-export function detectSupportsStore(_name: string, baseUrl: string): boolean {
-  return isOpenAiNative(baseUrl)
-}
-
-/**
- * Hosts documented to accept `prompt_cache_key` on Chat Completions (the set
- * opencode enables). DeepSeek caches by prefix on its own and is left out, as
- * opencode does. Azure is left to the explicit flag: older `api-version`s
- * reject unknown body fields. Exact host or a subdomain, never a substring.
- */
-const PROMPT_CACHE_KEY_HOSTS: readonly string[] = [
-  'api.openai.com', 'openrouter.ai', 'api.fireworks.ai',
-  'api.cerebras.ai', 'api.deepinfra.com', 'api.moonshot.ai', 'api.moonshot.cn',
-]
-
-/** Whether the endpoint is known to accept `prompt_cache_key`. */
-export function detectSupportsPromptCacheKey(baseUrl: string): boolean {
-  let host: string
-  try {
-    host = new URL(baseUrl).hostname.toLowerCase()
-  } catch {
-    return false
-  }
-  return PROMPT_CACHE_KEY_HOSTS.some((known) => host === known || host.endsWith(`.${known}`))
-}
+// Wire-compatibility detection and the output-cap policy live in the shared
+// resolver; re-exported here for existing importers.
+export { detectMaxTokensField, detectSupportsPromptCacheKey, detectSupportsStore, outputTokenCap } from './effective-model.ts'
 
 /** `prompt_cache_key` is documented at 64 characters. */
 const OPENAI_PROMPT_CACHE_KEY_MAX = 64
@@ -197,36 +140,6 @@ const OPENAI_PROMPT_CACHE_KEY_MAX = 64
  */
 export function promptCacheKey(affinity: string): string {
   return affinity.length <= OPENAI_PROMPT_CACHE_KEY_MAX ? affinity : createHash('sha256').update(affinity).digest('hex')
-}
-
-/** Sent when neither the operator nor the catalog knows the model's output limit. */
-const OUTPUT_TOKEN_FALLBACK = 32_000
-/** Upper bound on any cap: a larger request only risks a rejection. */
-const OUTPUT_TOKEN_MAX = 256_000
-/**
- * The window ceiling never squeezes the cap below this: a near-full window
- * still leaves room for a usable reply, and an over-tight estimate surfaces as
- * a context overflow (which compacts) instead of a uselessly short answer.
- */
-const OUTPUT_TOKEN_MIN = 1_024
-
-/**
- * The output-token cap sent as `max_tokens`: an operator override, else the
- * catalog's documented maximum, else a 32,000-token fallback (the same
- * numbers opencode uses). The fallback avoids gateway defaults that can cut
- * long replies off with finish `length`.
- */
-export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number, learned?: number): number {
-  const override = overrides?.[model]
-  const known = Math.min(
-    override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : resolveOutputLimit(model) ?? learned ?? OUTPUT_TOKEN_FALLBACK,
-    OUTPUT_TOKEN_MAX,
-  )
-  // A request may only lower the catalog, operator or fallback cap.
-  const cap = requested !== undefined && Number.isSafeInteger(requested) && requested > 0
-    ? Math.min(known, requested)
-    : known
-  return ceiling !== undefined && Number.isSafeInteger(ceiling) && ceiling > 0 ? Math.min(cap, Math.max(OUTPUT_TOKEN_MIN, ceiling)) : cap
 }
 
 const DEFAULT_MAX_RETRIES = 3
@@ -308,17 +221,62 @@ export class OpenAiCompletionsProvider implements LlmProvider {
   /** Used only when a request names no model; never an operator preference. */
   private readonly fallbackModel: string
   /**
-   * Output caps this endpoint taught us by rejecting the 32k fallback, per
-   * model. `null` means "send no cap at all" (the limit could not be read).
+   * Output caps this endpoint taught us by rejecting the 32k fallback, keyed
+   * by route identity (endpoint, wire model, profile, credential generation),
+   * so a new key or endpoint never inherits them. Memory only and bounded.
    * Only the fallback is ever learned over: an operator or catalog cap that
    * is rejected stays a visible error.
    */
-  private readonly learnedCaps = new Map<string, number | null>()
+  private readonly learnedCaps = new LearnedCaps()
+  private readonly credential: string
 
   constructor(private readonly options: OpenAiCompletionsOptions) {
     this.name = options.name
     this.models = options.models ?? []
     this.fallbackModel = options.models?.[0] ?? 'default'
+    this.credential = credentialGeneration(options.apiKey, options.credentialHasher)
+  }
+
+  /**
+   * Charge the one corrective cap resend to the request's attempt budget. Under
+   * harness ownership it is a physical attempt of the logical request (so it
+   * shrinks the squeeze/retry budget like any other); standalone it uses one of
+   * this call's own attempts. No budget left = no resend; the error surfaces.
+   */
+  private async reserveCorrectiveResend(options: StreamOptions | undefined, attempt: number, maxAttempts: number, status: number): Promise<boolean> {
+    const owner = options?.requestOwner
+    if (owner === undefined) return attempt < maxAttempts
+    if (owner.signal.aborted || owner.attempts >= owner.policy.maxAttempts) return false
+    // The owner (runAttempt) closes the rejected physical attempt and opens a
+    // new logged one, so attempt numbering in the log matches the charge.
+    if (options?.correctiveAttempt !== undefined) {
+      await options.correctiveAttempt({ status })
+      return true
+    }
+    owner.consume()
+    return true
+  }
+
+  private get maxTokensField(): MaxTokensField {
+    return this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
+  }
+
+  /** The versioned route identity a request for `model` travels on. Never contains the key. */
+  routeIdentity(model?: string): RouteIdentity {
+    return routeIdentity({ baseUrl: this.options.baseUrl, model: model ?? this.fallbackModel, maxTokensField: this.maxTokensField, credentialGeneration: this.credential })
+  }
+
+  /**
+   * Secret-free output-cap facts for diagnostics: the policy source, and for a
+   * guessed cap what this endpoint taught us (`omitted` = no cap is sent).
+   */
+  outputCapDiagnostics(model?: string): { readonly model: string; readonly source: OutputCapSource; readonly cap: number | 'omitted'; readonly learned: boolean } {
+    const id = model ?? this.fallbackModel
+    const policy = outputPolicy(id, this.options.maxOutputTokens?.[id])
+    // Peek: a diagnostics read must not refresh the entry's LRU position.
+    const learned = policy.guessed ? this.learnedCaps.peek(routeKey(this.routeIdentity(id))) : undefined
+    const limit = learned?.limit
+    return { model: id, source: policy.source, cap: limit === undefined ? policy.cap : limit === null ? 'omitted' : limit, learned: limit !== undefined }
   }
 
   async *stream(request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
@@ -331,7 +289,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     const affinity = request.sessionAffinity
     // Every knob below resolves once, before the body is written: no magic
     // values scattered through the assembly, and `compatibility ?? detect`.
-    const maxTokensField = this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
+    const maxTokensField = this.maxTokensField
     const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
     const supportsPromptCacheKey = this.options.supportsPromptCacheKey ?? detectSupportsPromptCacheKey(this.options.baseUrl)
     const body: Record<string, unknown> = {
@@ -353,24 +311,28 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     if (supportsPromptCacheKey && affinity !== undefined && affinity !== '') {
       body['prompt_cache_key'] = promptCacheKey(affinity)
     }
-    const operatorCap = this.options.maxOutputTokens?.[model]
+    // No room left for any reply: refuse before the network, as an overflow, so
+    // the owner's bounded squeeze re-assembles smaller (or the turn fails).
+    if (outputCeiling(request.outputCeilingTokens) === 'exhausted') {
+      throw new ProviderError('provider request: no output room left in the context window', { reason: 'context_exceeded', phase: 'connect', classification: 'context_exceeded' })
+    }
     // The cap is a guess only when nobody documented one: the operator's
     // override and the catalog are authoritative, the fallback is not.
-    const guessed = !(operatorCap !== undefined && Number.isSafeInteger(operatorCap) && operatorCap > 0) && resolveOutputLimit(model) === undefined
-    const capped = (learned: number | null | undefined): string => {
+    const guessed = outputPolicy(model, this.options.maxOutputTokens?.[model]).guessed
+    const routeId = routeKey(this.routeIdentity(model))
+    const capped = (learned: number | null | undefined): { readonly payload: string; readonly cap: number | undefined } => {
       const wire = { ...body }
-      if (learned === null) {
-        // The limit could not be read: behave as before the fallback existed.
-        applyThinkingOverride(wire, model, request.thinkingLevel, undefined)
-        return JSON.stringify(wire)
-      }
       const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens, learned)
-      wire[maxTokensField] = maxTokens
-      applyThinkingOverride(wire, model, request.thinkingLevel, maxTokens)
-      return JSON.stringify(wire)
+      // Undefined cap means neither field is sent, never `null`/`undefined`.
+      if (maxTokens !== undefined) wire[maxTokensField] = maxTokens
+      // Thinking is computed against the FINAL cap, and Claude budget thinking
+      // is dropped when no cap is sent at all.
+      applyThinking(wire, model, request.thinkingLevel, maxTokens)
+      return { payload: JSON.stringify(wire), cap: maxTokens }
     }
-    let payload = capped(guessed ? this.learnedCaps.get(model) : undefined)
-    // One corrective resend per request, and only for a guessed cap.
+    let built = capped(guessed ? this.learnedCaps.get(routeId)?.limit : undefined)
+    let payload = built.payload
+    // One corrective resend per stream call, and only for a guessed cap.
     let capRelearned = !guessed
     const signal = options?.signal
     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
@@ -407,24 +369,47 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       if (response.ok) break
       let cleanupSettled = true
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
-      if (!capRelearned && cleanupSettled && response.status >= 400 && response.status < 500 && OUTPUT_CAP_REJECTED.test(detail)) {
+      const classification = classifyRequestError(response.status, detail)
+      let guessRejected = false
+      if (!capRelearned && cleanupSettled && built.cap !== undefined && capRejectionStatus(response.status) && OUTPUT_CAP_REJECTED.test(detail)) {
         // The endpoint refused the 32k guess and usually names its limit:
-        // resend once with that limit (or no cap), and remember it for this
-        // model so later requests start right. Nothing was streamed yet.
+        // remember it (or "no cap") for this route so later requests start
+        // right — even when this request has no attempt left to resend.
         capRelearned = true
-        const limit = outputLimitFromError(detail)
-        this.learnedCaps.set(model, limit ?? null)
-        payload = capped(limit ?? null)
-        attempt -= 1
-        continue
+        guessRejected = true
+        const limit = outputLimitFromError(detail, built.cap)
+        this.learnedCaps.set(routeId, limit ?? null)
+        if (await this.reserveCorrectiveResend(options, attempt, maxAttempts, response.status)) {
+          // Resend once with the corrected cap. Nothing was streamed yet. The
+          // resend is a physical attempt like any other: charged and logged.
+          built = capped(limit ?? null)
+          payload = built.payload
+          continue
+        }
       }
-      const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
-      const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
-      const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
+      if (classification === 'missing_required_cap' && guessed && built.cap === undefined) {
+        // A learned "send no cap" met an endpoint that requires one: forget it,
+        // so the next request starts from the documented fallback again.
+        this.learnedCaps.delete(routeId)
+      }
+      const quota = classification === 'quota'
+      const reason: ProviderErrorReason = PUBLIC_REASON[classification]
+      // Deterministic request rejections are never replayed, even when a relay
+      // wrapped them in a transient-looking 502.
+      const retryable = !DETERMINISTIC_CLASSES.has(classification) && !quota && retryableStatus(response.status, detail)
       if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
         const retryAfter = retryAfterMs(response.headers.get('retry-after'))
         const excerpt = httpErrorExcerpt(detail, this.options.apiKey)
-        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
+        const label = guessRejected
+          // Nobody configured this cap: say so, and that the next request uses
+          // what was just learned, instead of blaming an operator setting.
+          ? `fallback output-cap guess (${built.cap}) rejected for '${model}'; the corrected cap applies to the next request (or set maxOutputTokens)`
+          : classification === 'output_cap_rejected'
+          ? `output cap rejected (${built.cap === undefined ? 'no cap sent' : `sent ${built.cap}`}; lower maxOutputTokens for '${model}')`
+          : classification === 'missing_required_cap'
+            ? `endpoint requires an output cap (set maxOutputTokens for '${model}')`
+            : reason
+        const error = new ProviderError(`provider HTTP ${response.status}: ${label}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, classification, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
         error.transportSettled = cleanupSettled
         throw error
       }
@@ -460,12 +445,15 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         if (parsed.error !== undefined) {
           const text = redactSecrets(gatewayErrorText(parsed.error), this.options.apiKey).slice(0, WIRE_LIMITS.errorChars)
           const quota = /quota|billing|credit|balance/i.test(text)
-          const contextExceeded = isContextExceeded(400, text)
+          const classification = classifyRequestError(400, text)
+          const contextExceeded = classification === 'context_exceeded' || classification === 'payload_too_large'
           // Default-retryable, but permanent diagnostics always win over a
-          // transient gateway code. Context errors require squeezing, not replay.
-          const transient = !contextExceeded && !quota && !PERMANENT_GATEWAY_TEXT.test(text)
+          // transient gateway code. Context errors require squeezing, not
+          // replay; a cap rejection is terminal for this payload.
+          const deterministic = DETERMINISTIC_CLASSES.has(classification)
+          const transient = !deterministic && !quota && !PERMANENT_GATEWAY_TEXT.test(text)
           const detail = text.slice(0, 300)
-          throw new ProviderError(`provider gateway failure${detail === '' ? '' : `: ${detail}`}`, { reason: contextExceeded ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
+          throw new ProviderError(`provider gateway failure${detail === '' ? '' : `: ${detail}`}`, { reason: contextExceeded ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient, ...(deterministic ? { classification } : {}) })
         }
         const usage = parseUsage(parsed.usage)
         if (usage !== undefined) yield { type: 'usage', usage }
@@ -582,6 +570,130 @@ export class OpenAiCompletionsProvider implements LlmProvider {
   }
 }
 
+/**
+ * Output caps one provider instance learned, keyed by route identity. Memory
+ * only, a small LRU: a relay that answers with a new model id per request
+ * cannot grow it without bound, and the route key carries the credential
+ * generation, so a rotated key starts clean.
+ */
+class LearnedCaps {
+  private readonly entries = new Map<string, { readonly limit: number | null }>()
+  constructor(private readonly capacity = LEARNED_CAP_ROUTES) {}
+  get(key: string): { readonly limit: number | null } | undefined {
+    const entry = this.entries.get(key)
+    if (entry === undefined) return undefined
+    this.entries.delete(key)
+    this.entries.set(key, entry)
+    return entry
+  }
+  /** Read without touching recency. */
+  peek(key: string): { readonly limit: number | null } | undefined {
+    return this.entries.get(key)
+  }
+  set(key: string, limit: number | null): void {
+    this.entries.delete(key)
+    this.entries.set(key, { limit })
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next().value
+      if (oldest === undefined) break
+      this.entries.delete(oldest)
+    }
+  }
+  delete(key: string): void { this.entries.delete(key) }
+}
+
+/** Routes one provider instance remembers a learned cap for. */
+const LEARNED_CAP_ROUTES = 16
+
+/**
+ * What an HTTP or gateway error says about the request, from bounded known
+ * formats only. Internal: public `reason`s are mapped in {@link PUBLIC_REASON}.
+ */
+export type RequestErrorClass =
+  | 'context_exceeded'
+  | 'payload_too_large'
+  | 'output_cap_rejected'
+  | 'missing_required_cap'
+  | 'quota'
+  | 'auth'
+  | 'rate_limit'
+  | 'server_error'
+  | 'request'
+
+/**
+ * No new public reason: output-cap and missing-cap rejections keep `unknown`
+ * (terminal, not `output_limit`, which is the local output-byte bound), and a
+ * payload too large keeps `context_exceeded` because a smaller assembly is its
+ * cure. The finer class rides on `ProviderError.classification`.
+ */
+const PUBLIC_REASON: Readonly<Record<RequestErrorClass, ProviderErrorReason>> = {
+  context_exceeded: 'context_exceeded',
+  payload_too_large: 'context_exceeded',
+  output_cap_rejected: 'unknown',
+  missing_required_cap: 'unknown',
+  quota: 'quota',
+  auth: 'auth_configuration',
+  rate_limit: 'rate_limit',
+  server_error: 'server_error',
+  request: 'unknown',
+}
+
+/** Classes a second identical payload cannot fix, whatever the status says. */
+const DETERMINISTIC_CLASSES: ReadonlySet<RequestErrorClass> = new Set(['context_exceeded', 'payload_too_large', 'output_cap_rejected', 'missing_required_cap'])
+
+/**
+ * An independent statement of the model's maximum OUTPUT (not this request's
+ * remaining room): OpenAI, Anthropic, Groq, DashScope, Gemini, Cohere forms.
+ * `max_tokens is too large` alone is deliberately not here: vLLM uses it for
+ * input + cap > window.
+ */
+const OUTPUT_CAP_INDEPENDENT = /supports at most \d+ completion tokens|max_tokens: \d+ > \d+, which is the maximum allowed|'max_(?:completion_)?tokens'[^.;]{0,80}above maximum value|`?max_(?:completion_)?tokens`?[^.;,]{0,40}?must be (?:less than or equal to|smaller than|less than|at most) `?\d+|range of max_tokens should be \[\d+,\s*\d+\]|max_output_tokens[^.;]{0,80}(?:range|exceed)/i
+
+/** Genuine shared-window arithmetic: input + completion > window, in known forms. */
+const SHARED_WINDOW_EVIDENCE = /maximum context length is \d+ tokens[^]{0,300}?(?:\(\d+ > \d+ - \d+\)|\d+ in the messages, \d+ in the completion|requested \d+ tokens)/i
+
+/** The endpoint requires an output cap and none was sent (bounded forms). */
+const MISSING_REQUIRED_CAP = /`?max_(?:completion_)?tokens`?(?: field)? (?:is required|is a required (?:field|parameter|property))|missing (?:the )?required (?:field|parameter|property)[^.]{0,20}`?max_(?:completion_)?tokens|`?max_(?:completion_)?tokens`?:? (?:field required|must be (?:provided|specified|set))/i
+
+const PAYLOAD_TOO_LARGE = /payload too large|request entity too large|request too large|body (?:is )?too large/i
+const QUOTA = /insufficient_quota|quota|billing|credit|balance/i
+
+/** Statuses at which a request-shaped rejection (cap, missing cap) may arrive. */
+function capRejectionStatus(status: number): boolean {
+  return (status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 429) || RELAY_STATUSES.has(status)
+}
+
+/**
+ * Classify an HTTP (or gateway) error. Order matters:
+ * 1. an independent output maximum wins — trimming history cannot fix it, even
+ *    when the same text also reports a window overflow;
+ * 2. a missing required cap;
+ * 3. shared-window / payload evidence (status-gated: auth, quota and origin
+ *    500 are never turned into an overflow; relays need explicit evidence);
+ * 4. quota, auth, rate limit, server error, other request error.
+ */
+export function classifyRequestError(status: number, detail: string): RequestErrorClass {
+  const text = detail.slice(0, WIRE_LIMITS.errorChars)
+  if (capRejectionStatus(status) && OUTPUT_CAP_INDEPENDENT.test(text)) return 'output_cap_rejected'
+  if (capRejectionStatus(status) && MISSING_REQUIRED_CAP.test(text)) return 'missing_required_cap'
+  const requestStatus = status === 400 || status === 413 || status === 422
+  if (requestStatus || RELAY_STATUSES.has(status)) {
+    const shared = SHARED_WINDOW_EVIDENCE.test(text)
+    // Cap wording without window arithmetic (`max_tokens is too large: N`) is
+    // neither an overflow nor provably output-only: a plain request error.
+    const capWordingOnly = OUTPUT_CAP_REJECTED.test(text) && !shared
+    if (!capWordingOnly) {
+      if (requestStatus && (status === 413 || PAYLOAD_TOO_LARGE.test(text)) && !shared) return 'payload_too_large'
+      if (shared || (requestStatus ? CONTEXT_EXCEEDED.test(text) : EXPLICIT_CONTEXT_EXCEEDED.test(text))) return 'context_exceeded'
+    }
+  }
+  if (QUOTA.test(text)) return 'quota'
+  if (status === 401 || status === 403) return 'auth'
+  if (status === 429) return 'rate_limit'
+  if (status >= 500) return 'server_error'
+  return 'request'
+}
+
 const CONTEXT_EXCEEDED = /context[_ -]?(length|window)|maximum context|too (long|large|many tokens)|exceeds? (the )?(model'?s? )?(maximum|max|limit|context)|reduce the (length|size)|prompt is too long|input (is )?too long|tokens? (limit|exceeded)/i
 
 /** Explicit model-window diagnostics survive relays that rewrite the HTTP status. */
@@ -596,49 +708,61 @@ const RELAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
  * cannot fix that, so it is never a context overflow: the adapter relearns a
  * guessed cap, and an authoritative one surfaces for the operator to lower.
  */
-const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completion_tokens'?)? is too large|supports at most \d+ completion tokens|'max_(?:completion_)?tokens'[^.]*above maximum value|`?max_(?:completion_)?tokens`? must be (?:less|smaller|at most)|max_tokens: \d+ > \d+, which is the maximum allowed|range of max_tokens should be|max_output_tokens[^.]*(?:range|exceed)/i
+const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completion_tokens'?)? is too large|supports at most \d+ completion tokens|'max_(?:completion_)?tokens'[^.;]{0,80}above maximum value|`?max_(?:completion_)?tokens`?[^.;,]{0,40}?must be (?:less|smaller|at most)|max_tokens: \d+ > \d+, which is the maximum allowed|range of max_tokens should be|max_output_tokens[^.;]{0,80}(?:range|exceed)/i
+
+/** Largest output limit ever accepted from an error text (the product output budget). */
+const LEARNED_CAP_MAX = 256_000
+/**
+ * Smallest output limit ever accepted from an error text. A smaller "limit" is
+ * far likelier a misread neighbouring field than a model's real maximum, and
+ * learning it would cripple every later reply on the route: send no cap instead.
+ */
+const LEARNED_CAP_MIN = 256
 
 /**
- * The model's maximum output when an endpoint's rejection names it.
- * `undefined` when no number can be read, and for vLLM's window form
- * (`N > X - M`): that number is only this request's remaining room, and vLLM
- * fills the remaining window by itself when no cap is sent.
+ * The model's maximum output when an endpoint's rejection names it, from
+ * known formats only. `undefined` when no number can be read, for vLLM's
+ * window form (`N > X - M`: that is this request's remaining room, never a
+ * model limit — vLLM fills the window by itself when no cap is sent), for
+ * anything but a safe integer in 1..256,000, and for a "limit" at or above
+ * what was sent (`sent`), which cannot explain the rejection.
  */
-export function outputLimitFromError(detail: string): number | undefined {
-  if (/maximum context length is \d+ tokens/i.test(detail)) return undefined
+export function outputLimitFromError(detail: string, sent?: number): number | undefined {
+  const text = detail.slice(0, WIRE_LIMITS.errorChars)
+  // Every number is anchored to the output-token field in the same clause, so
+  // a neighbouring field (`temperature must be at most 2`) is never read as a
+  // cap. vLLM's window form (`N > X - M`) matches none of these on purpose.
   const patterns = [
-    /supports at most (\d+) completion tokens/i,
-    /max_tokens: \d+ > (\d+)/i,
-    /must be (?:less than or equal to|at most|<=) `?(\d+)/i,
-    /expected a value <= (\d+)/i,
-    /should be \[\d+,\s*(\d+)\]/i,
-    /range[^0-9]*\d+[^0-9]+(\d+)\s*\(exclusive\)/i,
+    /supports at most (\d{1,7}) completion tokens/i,
+    /max_tokens: \d{1,9} > (\d{1,7}), which is the maximum allowed/i,
+    /`?max_(?:completion_)?tokens`?[^.;,]{0,40}?must be (?:less than or equal to|at most|<=) `?(\d{1,7})`?/i,
+    /'max_(?:completion_)?tokens': integer above maximum value\. Expected a value <= (\d{1,7})/i,
+    /range of max_tokens should be \[\d{1,7},\s*(\d{1,7})\]/i,
+    /max_output_tokens[^.;]{0,80}range[^0-9;]{0,40}\d{1,7}[^0-9;]{1,10}(\d{1,7})\s*\(exclusive\)/i,
   ]
   for (const pattern of patterns) {
-    const match = pattern.exec(detail)
+    const match = pattern.exec(text)
     if (match === null) continue
     let value = Number(match[1])
     if (/\(exclusive\)/i.test(match[0])) value -= 1
-    if (Number.isSafeInteger(value) && value > 0) return value
+    if (!Number.isSafeInteger(value) || value < LEARNED_CAP_MIN || value > LEARNED_CAP_MAX) return undefined
+    if (sent !== undefined && value >= sent) return undefined
+    return value
   }
   return undefined
 }
 
 /**
- * Whether an HTTP error says the request did not fit the model's window.
- * Request errors (400/413/422) match the broad wording; a relay's gateway
- * status matches only explicit window diagnostics. Auth failures and origin
- * 500s never count: the request may fit, and squeezing would hide the fault.
- * A rejected output cap never counts either: squeezing would only throw away
- * history and resend the same cap.
+ * Whether an HTTP error says the request did not fit (shared window or
+ * payload size), so a smaller assembly is the cure. Request errors
+ * (400/413/422) match the broad wording; a relay's gateway status matches
+ * only explicit window diagnostics. Auth failures, quota and origin 500s
+ * never count. An independent output-cap rejection never counts either:
+ * squeezing would only throw away history and resend the same cap.
  */
 export function isContextExceeded(status: number, detail: string): boolean {
-  // vLLM reports input + cap > window with its cap wording: that IS an
-  // overflow once the cap is no longer a guess (the adapter has already
-  // dropped a guessed cap), so the squeeze must still run.
-  if (OUTPUT_CAP_REJECTED.test(detail) && !/maximum context length is \d+ tokens/i.test(detail)) return false
-  if (status === 400 || status === 413 || status === 422) return CONTEXT_EXCEEDED.test(detail)
-  return RELAY_STATUSES.has(status) && EXPLICIT_CONTEXT_EXCEEDED.test(detail)
+  const classification = classifyRequestError(status, detail)
+  return classification === 'context_exceeded' || classification === 'payload_too_large'
 }
 
 /** A relay's error payload: OpenAI object shape, bare string, or anything else. */

@@ -204,7 +204,20 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
       timer = setTimeout(() => controller.abort(failure(reason, true)), ms); timer.unref?.()
     }
     arm(owner.policy.firstProgressMs, 'first_progress_timeout')
-    iterator = provider.stream(request, { signal: controller.signal, requestOwner: owner, onTransportSettled })[Symbol.asyncIterator]()
+    // A corrective resend inside the adapter is its own physical attempt: the
+    // rejected one ends (its error body was read, nothing streamed) and a new
+    // numbered attempt begins, under the same admission ticket and timers.
+    const correctiveAttempt = async (): Promise<void> => {
+      if (!fact || committed) throw failure('unknown')
+      settled = true
+      await notify('end', 'unknown')
+      const attempt = owner.consume()
+      settled = false
+      ended = false
+      fact = { ...fact, attemptId: randomUUID(), attempt, state: 'start', startedAt: Date.now() }
+      await notify('start')
+    }
+    iterator = provider.stream(request, { signal: controller.signal, requestOwner: owner, onTransportSettled, correctiveAttempt })[Symbol.asyncIterator]()
     for (;;) {
       pending = Promise.resolve(iterator.next())
       const result = await raceSignal(pending, controller.signal)
