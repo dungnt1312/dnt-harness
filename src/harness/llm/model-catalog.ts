@@ -304,6 +304,38 @@ export function getModelInfo(modelId: string | null | undefined): ModelInfo | nu
   }
 }
 
+/**
+ * Documented output limits for families the capability catalog leaves out
+ * (it records vision/window only where verified). Only the output cap is
+ * claimed here, so these entries never change what the UI shows. Bare-id
+ * anchored: gateway prefixes (`openai/gpt-4o`) resolve through the last
+ * segment. Checked 2026-10 against vendor docs.
+ */
+const OUTPUT_LIMIT_PATTERNS: readonly ModelPattern<number>[] = [
+  { pattern: /^(?:chatgpt-)?gpt-4o(?:-mini)?(?:[-:].*)?$/, value: 16_384 },
+  { pattern: /^gpt-4\.1(?:-(?:mini|nano))?(?:[-:].*)?$/, value: 32_768 },
+  // V4 family (deepseek-flash, deepseek-v4-*, gateway "-free" aliases): 384K.
+  { pattern: /^deepseek-(?:flash|v4)(?:[-.:].*)?$/, value: 393_216 },
+  // Retired aliases still routed by some relays to V3-era backends: 8K.
+  { pattern: /^deepseek-(?:chat|reasoner)$/, value: 8_192 },
+]
+
+/**
+ * The documented maximum output for a model id: the capability catalog, else
+ * the output-only table above. `undefined` means unknown.
+ */
+export function resolveOutputLimit(modelId: string | null | undefined): number | undefined {
+  const catalog = getModelInfo(modelId)?.maxOutputTokens
+  if (catalog !== undefined) return catalog
+  if (modelId === null || modelId === undefined) return undefined
+  const id = modelId.trim().toLowerCase()
+  for (const candidate of [id, bareModelId(id)]) {
+    const match = OUTPUT_LIMIT_PATTERNS.find((entry) => entry.pattern.test(candidate))
+    if (match !== undefined) return match.value
+  }
+  return undefined
+}
+
 /** The documented reasoning capability for an exact model ID. */
 export function getReasoningCapability(modelId: string | null | undefined): ReasoningCapability | null {
   return resolveCatalogValue(modelId, REASONING_MODELS, REASONING_MODEL_PATTERNS, REASONING_FALLBACK_PATTERNS) ?? null

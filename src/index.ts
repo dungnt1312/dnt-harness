@@ -115,6 +115,7 @@ export {
   expressibleThinkingLevel,
   formatContextLimit,
   getModelInfo,
+  resolveOutputLimit,
   getReasoningCapability,
   isThinkingLevel,
   knownModelLimit,

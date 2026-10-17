@@ -49,6 +49,21 @@ describe('context-exceeded recovery', () => {
     expect(isContextExceeded(500, 'prompt is too long')).toBe(false)
   })
 
+  it('never reads a rejected output cap as an overflow: squeezing history cannot fix it', () => {
+    for (const detail of [
+      'max_tokens is too large: 32000. This model supports at most 16384 completion tokens, whereas you provided 32000.',
+      "'max_tokens' or 'max_completion_tokens' is too large: 32000. This model's maximum context length is 8192 tokens and your request has 120 input tokens (32000 > 8192 - 120).",
+      'max_tokens: 32000 > 8192, which is the maximum allowed number of output tokens for claude-x',
+      'max_tokens must be less than or equal to 4096',
+      "Invalid 'max_completion_tokens': integer above maximum value. Expected a value <= 16384, but got 32000 instead.",
+    ]) {
+      expect(isContextExceeded(400, detail), detail).toBe(false)
+      expect(isContextExceeded(502, detail), detail).toBe(false)
+    }
+    // A genuine overflow that merely mentions max_tokens still counts.
+    expect(isContextExceeded(400, "This model's maximum context length is 128000 tokens. However, you requested 140000 tokens (130000 in the messages, 10000 in the completion).")).toBe(true)
+  })
+
   it('every squeeze level shrinks the budget, and the last level is final', () => {
     const sizes = Array.from({ length: MAX_SQUEEZE_LEVEL + 1 }, (_unused, level) => squeezeBudget(DEFAULT_BUDGET, level).contextLimitTokens)
     expect(sizes[0]).toBe(DEFAULT_BUDGET.contextLimitTokens)

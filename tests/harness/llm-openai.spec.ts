@@ -5,7 +5,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
-import { detectMaxTokensField, detectSupportsStore, toolCallIdReissueCount } from '../../src/harness/llm/openai.ts'
+import { detectMaxTokensField, detectSupportsStore, outputTokenCap, toolCallIdReissueCount } from '../../src/harness/llm/openai.ts'
+import { getModelInfo } from '../../src/harness/llm/model-catalog.ts'
 import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
 import { buildContext, wrapUntrusted } from '../../src/harness/context/builder.ts'
 import { resolveModelBudget } from '../../src/harness/context/budget.ts'
@@ -67,13 +68,35 @@ describe('openai completions adapter: thinking + wire shape', () => {
   })
   it('falls back to 32,000 output tokens and clamps it to the remaining window', async () => {
     const captured = stubFetch()
-    await run({ model: 'deepseek-chat', messages: [], outputCeilingTokens: 120_000 })
+    await run({ model: 'some-other-model', messages: [], outputCeilingTokens: 120_000 })
     await run({ model: 'some-unknown-model', messages: [], outputCeilingTokens: 200_000 })
     await run({ model: 'some-unknown-model', messages: [], outputCeilingTokens: 12_000 })
     await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 64_000 })
     await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000, outputCeilingTokens: 5_000 }) // an explicit request cap is still clamped
     expect(captured.map(c => c.body['max_tokens'])).toEqual([32_000, 32_000, 12_000, 32_000, 5_000])
     expect(captured.every(c => !('outputCeilingTokens' in c.body))).toBe(true)
+  })
+  it('bounds the cap like opencode: never below 1,024 from the window, never above 256,000', () => {
+    // A near-full window still leaves a usable reply; an over-tight estimate
+    // then surfaces as an overflow (which squeezes) instead of a 1-token answer.
+    expect(outputTokenCap('some-unknown-model', undefined, undefined, 1)).toBe(1_024)
+    expect(outputTokenCap('some-unknown-model', undefined, undefined, 500)).toBe(1_024)
+    // An explicit request cap below the floor is still honored.
+    expect(outputTokenCap('some-unknown-model', undefined, 256, 500)).toBe(256)
+    // Operator and catalog caps above 256k are clamped.
+    expect(outputTokenCap('m', { m: 1_000_000 })).toBe(256_000)
+    expect(outputTokenCap('deepseek-flash')).toBe(256_000)
+  })
+  it('uses documented output limits for common families instead of the 32k fallback', () => {
+    expect(outputTokenCap('gpt-4o')).toBe(16_384)
+    expect(outputTokenCap('openai/gpt-4o-mini-2024-07-18')).toBe(16_384)
+    expect(outputTokenCap('gpt-4.1-mini')).toBe(32_768)
+    expect(outputTokenCap('deepseek-chat')).toBe(8_192)
+    expect(outputTokenCap('deepseek-v4.1-flash-free', undefined, undefined, 120_000)).toBe(120_000)
+    // The operator override still wins over the documented value.
+    expect(outputTokenCap('gpt-4o', { 'gpt-4o': 4_096 })).toBe(4_096)
+    // The table claims only the output limit: the UI's catalog view is unchanged.
+    expect(getModelInfo('gpt-4o')?.maxOutputTokens).toBeUndefined()
   })
   it('keeps the Claude thinking budget below a window-clamped max_tokens, or drops thinking when it cannot fit', async () => {
     const captured = stubFetch()
@@ -457,6 +480,18 @@ describe('openai completions adapter: retry before the stream starts', () => {
     scripted([() => new Response(JSON.stringify({ error: { message: 'z'.repeat(9_000) } }), { status: 400 })])
     const big = await collect(fast()).catch((caught: unknown) => caught as Error)
     expect((big as Error).message).not.toContain('z'.repeat(100))
+  })
+
+  it('surfaces a rejected output cap as a plain request error, never a context overflow', async () => {
+    const detail = 'max_tokens is too large: 32000. This model supports at most 16384 completion tokens, whereas you provided 32000.'
+    scripted([() => new Response(JSON.stringify({ error: { message: detail, type: 'invalid_request_error' } }), { status: 400 })])
+    const error = await collect(fast()).then(() => undefined, (caught: unknown) => caught as ProviderError)
+    if (error === undefined) throw new Error('expected the request to fail')
+    expect(error).toBeInstanceOf(ProviderError)
+    expect(error.contextExceeded).toBe(false)
+    expect(error.reason).toBe('unknown')
+    expect(error.transient).toBe(false)
+    expect(error.message).toContain('supports at most 16384')
   })
 
   it('redacts credentials an auth error echoes back before they reach the durable message', async () => {

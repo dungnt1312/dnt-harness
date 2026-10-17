@@ -1,4 +1,4 @@
-import { applyThinkingOverride, getModelInfo } from './model-catalog.ts'
+import { applyThinkingOverride, resolveOutputLimit } from './model-catalog.ts'
 import { classifyTransport } from './request-lifecycle.ts'
 import { cancelReader, encodedBytes, normalizeFinishReason, protocolError, readBoundedError, readSse, validateCompletion, validateToolBatch, WIRE_LIMITS } from './completion.ts'
 import type { ModelCompletion, ModelFinishReason } from './types.ts'
@@ -223,19 +223,34 @@ export function applyProviderOptions(body: Record<string, unknown>, options: Rea
   }
 }
 
+/** Sent when neither the operator nor the catalog knows the model's output limit. */
+const OUTPUT_TOKEN_FALLBACK = 32_000
+/** Upper bound on any cap: a larger request only risks a rejection. */
+const OUTPUT_TOKEN_MAX = 256_000
+/**
+ * The window ceiling never squeezes the cap below this: a near-full window
+ * still leaves room for a usable reply, and an over-tight estimate surfaces as
+ * a context overflow (which compacts) instead of a uselessly short answer.
+ */
+const OUTPUT_TOKEN_MIN = 1_024
+
 /**
  * The output-token cap sent as `max_tokens`: an operator override, else the
- * catalog's documented maximum, else a 32,000-token fallback. The fallback
- * avoids gateway defaults that can cut long replies off with finish `length`.
+ * catalog's documented maximum, else a 32,000-token fallback (the same
+ * numbers opencode uses). The fallback avoids gateway defaults that can cut
+ * long replies off with finish `length`.
  */
-export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number): number | undefined {
+export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number): number {
   const override = overrides?.[model]
-  const known = override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : getModelInfo(model)?.maxOutputTokens ?? 32_000
+  const known = Math.min(
+    override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : resolveOutputLimit(model) ?? OUTPUT_TOKEN_FALLBACK,
+    OUTPUT_TOKEN_MAX,
+  )
   // A request may only lower the catalog, operator or fallback cap.
   const cap = requested !== undefined && Number.isSafeInteger(requested) && requested > 0
     ? Math.min(known, requested)
     : known
-  return cap !== undefined && ceiling !== undefined && Number.isSafeInteger(ceiling) && ceiling > 0 ? Math.min(cap, ceiling) : cap
+  return ceiling !== undefined && Number.isSafeInteger(ceiling) && ceiling > 0 ? Math.min(cap, Math.max(OUTPUT_TOKEN_MIN, ceiling)) : cap
 }
 
 const DEFAULT_MAX_RETRIES = 3
@@ -600,12 +615,22 @@ const EXPLICIT_CONTEXT_EXCEEDED = /context[_ -]?(length|window)|maximum context|
 const RELAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
 
 /**
+ * The endpoint rejected the requested output cap itself (OpenAI, vLLM,
+ * Anthropic, Cohere wordings). Shrinking the prompt cannot fix that, so it is
+ * never a context overflow; the operator lowers the model's output cap.
+ */
+const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completion_tokens'?)? is too large|supports at most \d+ completion tokens|'max_(?:completion_)?tokens'[^.]*above maximum value|max_tokens must be (?:less|smaller|at most)|max_tokens: \d+ > \d+, which is the maximum allowed/i
+
+/**
  * Whether an HTTP error says the request did not fit the model's window.
  * Request errors (400/413/422) match the broad wording; a relay's gateway
  * status matches only explicit window diagnostics. Auth failures and origin
  * 500s never count: the request may fit, and squeezing would hide the fault.
+ * A rejected output cap never counts either: squeezing would only throw away
+ * history and resend the same cap.
  */
 export function isContextExceeded(status: number, detail: string): boolean {
+  if (OUTPUT_CAP_REJECTED.test(detail)) return false
   if (status === 400 || status === 413 || status === 422) return CONTEXT_EXCEEDED.test(detail)
   return RELAY_STATUSES.has(status) && EXPLICIT_CONTEXT_EXCEEDED.test(detail)
 }
