@@ -27,3 +27,6 @@ shots/
 
 # playwright MCP browser output (screenshots/snapshots from ad-hoc sessions)
 .playwright-mcp/
+
+# Cygwin/MSYS crash dumps
+*.stackdump
