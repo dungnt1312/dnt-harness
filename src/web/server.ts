@@ -58,7 +58,8 @@ import { advertisedModelError, effectiveBudget } from '../harness/llm/effective-
 import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
-import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import type { LlmProvider, ModelMessage, ModelRequest, ReasoningPayload, ReasoningReplay, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import { handoffAnswerReasoning } from '../harness/llm/reasoning.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -945,6 +946,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
       credentialHasher,
+      ...(entry.reasoning !== undefined ? { reasoning: entry.reasoning } : {}),
     })
 
   const injectionNames = (): readonly string[] =>
@@ -1506,7 +1508,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         if (entry === undefined) return 'no-fit'
         const events = entry.session.committedEvents
         const standing = recoverCanonicalCheckpoint(events)
-        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens }
+        // Reasoning the session's route would replay counts too (phase 05).
+        const route = resolveEffectiveModel(entry.session, entry.workspaceId)
+        const reasoningReplay = kernel.ctx.llm.reasoningReplay(route.provider ?? undefined, route.model ?? undefined)
+        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens, ...(reasoningReplay !== undefined ? { reasoningReplay } : {}) }
         const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
         const now = estimateConversationTokens({ ...shared, compaction: { summary: prepared.summary, coversSeq: prepared.cutoff } })
         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
@@ -1714,6 +1719,19 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * effects; anything that does not fit — a dropped uncovered turn, an unsafe loss, a budget
    * error — yields undefined and the host folds.
    */
+  /**
+   * The final answer of a compaction handoff (captured snapshot, reconstructed
+   * snapshot, cache-aware summary): its reasoning rides along only where the
+   * request's route would replay it at that position (`handoffAnswerReasoning`:
+   * route source, completeness, window — `tool-loop` drops it, since the summary
+   * instruction is a new user message — and tools present). One rule, three paths.
+   */
+  const handoffAnswer = (request: { readonly messages: readonly ModelMessage[]; readonly tools?: readonly unknown[]; readonly providerName?: string; readonly model?: string }, answer: { readonly content: string; readonly reasoning?: ReasoningPayload }): ModelMessage => {
+    const message: ModelMessage = { role: 'assistant', content: answer.content, ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}) }
+    const reasoning = handoffAnswerReasoning(request.messages, message, kernel.ctx.llm.reasoningReplay(request.providerName, request.model), (request.tools?.length ?? 0) > 0)
+    return reasoning !== undefined ? { role: 'assistant', content: answer.content, reasoning } : { role: 'assistant', content: answer.content }
+  }
+
   const reconstructFromLog = async (entry: SessionEntry): Promise<EffectiveCompactionSnapshot | undefined> => {
     try {
       const sessionId = entry.session.id
@@ -1738,7 +1756,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         turnId: found.turnId,
         request: withoutAnswer,
         projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
-        finalAnswer: { role: 'assistant', content: found.answer.content },
+        // Phase 05: the same handoff rule as capture (window, route, tools), applied to the log record.
+        finalAnswer: handoffAnswer(withoutAnswer, found.answer),
         identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
         // The prefix's newest provider measurement calibrated this assembly; the fit check reuses it.
         ...(assembled.manifest.budget.measured?.ratio !== undefined ? { estimateRatio: assembled.manifest.budget.measured.ratio } : {}),
@@ -1879,7 +1898,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         // demonstrate room for both the summary instruction and its output.
         const cachePrefixFits = previous !== undefined && JSON.stringify({ messages: previous.messages, tools: previous.tools }).length <= 200_000
         const cached = pair !== undefined && finalAnswer !== undefined && cachePrefixFits && previous?.providerName === pair.providerName && previous.model === pair.model
-          ? createCacheAwareCompactionSummarizer(compactionStream, previous, finalAnswer, { signal })
+          // Phase 05: the same handoff rule as the snapshot paths.
+          ? createCacheAwareCompactionSummarizer(compactionStream, previous, handoffAnswer(previous, finalAnswer), { signal })
           : undefined
         const summarizer = cached === undefined ? fallback : async (input: Parameters<typeof fallback>[0]) => {
           try { return await cached() } catch (error) {
@@ -1950,7 +1970,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         events,
         turnId,
         pending,
-        finalAnswer: { role: 'assistant', content: answer.content },
+        // Phase 05: one shared rule for every handoff path (see handoffAnswer).
+        finalAnswer: handoffAnswer(pending.request, answer),
         identity: compactionIdentity(entry, requestPrefixHash({ messages: pending.request.messages, ...(pending.request.tools !== undefined ? { tools: pending.request.tools } : {}) })),
         store: snapshotStore,
       })
@@ -3902,6 +3923,11 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         : {}),
       ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
+      // Phase 05: only reasoning the target route recorded is kept and counted.
+      ...((): { reasoningReplay?: ReasoningReplay } => {
+        const replay = kernel.ctx.llm.reasoningReplay(effective.provider ?? undefined, effective.model ?? undefined)
+        return replay !== undefined ? { reasoningReplay: replay } : {}
+      })(),
       ...(scope?.childOf === undefined && scope?.role !== undefined
         ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
         : {}),
@@ -10194,14 +10220,14 @@ function compactionRequestOf(request: ModelRequest): ModelRequest {
  * exactly that turn's last model request. Anything else (a failed or
  * cancelled later turn, a different turn, no text answer) returns undefined.
  */
-function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): string | undefined {
+function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): { readonly content: string; readonly reasoning?: ReasoningPayload } | undefined {
   const end = events.findLast((event) => event.type === 'turn/end')
   if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
   const start = events.findLast((event) => event.type === 'turn/start' && event.turnId === prefix.turnId)
   if (start === undefined) return undefined
   const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
   if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
-  return answer.content
+  return { content: answer.content, ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}) }
 }
 
 /**
@@ -10523,6 +10549,22 @@ function withoutRestorationText(event: Extract<SessionEvent, { type: 'compaction
 }
 
 /**
+ * The client frame of a durable event. Phase 05 audit: an assistant message's
+ * stored `reasoning` is a provider-bound replay payload, not UI data; the UI
+ * already shows thinking from `assistant/chunk` events (unchanged), so the
+ * SSE stream never multiplies that disclosure with a second copy.
+ */
+export function clientEvent(event: SessionEvent): SessionEvent {
+  if (event.type === 'compaction/restoration') return withoutRestorationText(event)
+  if (event.type === 'assistant/message' && event.reasoning !== undefined) {
+    const { reasoning: _reasoning, ...rest } = event
+    void _reasoning
+    return rest
+  }
+  return event
+}
+
+/**
  * The replay profile a fresh SSE client needs: `context/body` payloads (fetched
  * on demand by hash) are dropped, content chunks of steps that later carry a
  * durable `assistant/message` are dropped, and reasoning chunks fold to one
@@ -10548,8 +10590,8 @@ function compactReplayEvents(events: readonly SessionEvent[], heldCompactionSeq 
   for (const event of events) {
     if (heldCompactionSeq > 0 && event.seq >= heldCompactionSeq) break
     if (event.type === 'context/body') continue
-    if (event.type === 'compaction/restoration') {
-      compacted.push(withoutRestorationText(event))
+    if (event.type === 'compaction/restoration' || event.type === 'assistant/message') {
+      compacted.push(clientEvent(event))
       continue
     }
     if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
@@ -10773,7 +10815,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     }
     return 0
   }
-  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event })
+  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: clientEvent(event) })
   const heldSeq = findHeldCompaction()
   // The replay below stops before the held success, so the success and the
   // tail already appended behind it seed the queue: they ship on commit.

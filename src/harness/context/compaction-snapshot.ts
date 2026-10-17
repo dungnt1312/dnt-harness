@@ -12,6 +12,18 @@ export { canonicalJson, sourceDigest }
  */
 
 export const SNAPSHOT_SCHEMA_VERSION = 1
+/**
+ * Phase 05: a snapshot whose request or final answer carries replayed
+ * reasoning is v2. Everything else stays v1, byte-for-byte what older hosts
+ * wrote, so pre-upgrade sidecars keep validating (dual-read) and no session is
+ * re-summarized just because the binary changed.
+ */
+export const SNAPSHOT_SCHEMA_REASONING = 2
+
+/** The schema a snapshot with these messages must carry. */
+export function snapshotSchemaFor(messages: readonly ModelMessage[], finalAnswer: ModelMessage): 1 | 2 {
+  return finalAnswer.reasoning !== undefined || messages.some((message) => message.reasoning !== undefined) ? SNAPSHOT_SCHEMA_REASONING : SNAPSHOT_SCHEMA_VERSION
+}
 
 /** Request fields that shape the provider wire prefix; nothing host-only is ever kept. */
 export interface SnapshotRequest {
@@ -36,7 +48,8 @@ export interface SnapshotIdentity {
 export interface EffectiveCompactionSnapshot {
   /** Host-generated random UUID; also the sidecar file name. */
   readonly id: string
-  readonly v: 1
+  /** 1, or 2 exactly when reasoning rides in `request.messages`/`finalAnswer`. */
+  readonly v: 1 | 2
   readonly policyVersion: 1
   readonly sessionId: string
   readonly cutoff: number
@@ -75,10 +88,15 @@ function onlyKeys(value: object, allowed: ReadonlySet<string>): boolean {
 export function validateSnapshot(snapshot: EffectiveCompactionSnapshot, events: readonly SessionEvent[]): Eligibility {
   const candidate = snapshot as unknown as Record<string, unknown> | null
   if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) return refuse('unsupported-schema')
-  if (candidate['v'] !== SNAPSHOT_SCHEMA_VERSION || candidate['policyVersion'] !== 1) return refuse('unsupported-schema')
+  if ((candidate['v'] !== SNAPSHOT_SCHEMA_VERSION && candidate['v'] !== SNAPSHOT_SCHEMA_REASONING) || candidate['policyVersion'] !== 1) return refuse('unsupported-schema')
   if (!onlyKeys(candidate, TOP_LEVEL_KEYS)) return refuse('unsupported-schema')
   const request = candidate['request'] as Record<string, unknown> | null
   if (request === null || typeof request !== 'object' || !onlyKeys(request, REQUEST_KEYS) || !Array.isArray(request['messages'])) return refuse('unsupported-schema')
+  // The version must say exactly what the snapshot carries: a v1 sidecar with
+  // reasoning (or a v2 without) is not something any host wrote.
+  const finalAnswer = candidate['finalAnswer'] as ModelMessage | null
+  if (finalAnswer === null || typeof finalAnswer !== 'object') return refuse('unsupported-schema')
+  if (snapshotSchemaFor(request['messages'] as ModelMessage[], finalAnswer) !== candidate['v']) return refuse('unsupported-schema')
   if (typeof snapshot.id !== 'string' || typeof snapshot.sessionId !== 'string' || !Number.isSafeInteger(snapshot.cutoff)) return refuse('unsupported-schema')
   if (snapshot.estimateRatio !== undefined && !(Number.isFinite(snapshot.estimateRatio) && snapshot.estimateRatio >= 1)) return refuse('unsupported-schema')
   if (snapshot.sourceDigest !== sourceDigest(events, snapshot.cutoff)) {

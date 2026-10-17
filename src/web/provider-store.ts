@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
 import { isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { normalizeReasoningProfile, type ReasoningProfile } from '../harness/llm/reasoning.ts'
 
 /** Per-model operator overrides stored on one provider entry. */
 export interface ModelSettings {
@@ -33,6 +34,25 @@ export interface ProviderConfig {
   readonly models: readonly string[]
   readonly enabled: boolean
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
+  /**
+   * Explicit reasoning replay profile (phase 05), normalized here at the store
+   * boundary: a typed `{ field?, required, replayWindow? }`, never arbitrary
+   * body passthrough. Absent: detected from the endpoint (native DeepSeek only).
+   * An invalid stored profile is dropped (the entry keeps working generically).
+   */
+  readonly reasoning?: ReasoningProfile
+}
+
+/** Normalize a stored/REST reasoning override; undefined when absent or invalid. */
+export function parseReasoningOverride(raw: unknown, providerId = '?'): ReasoningProfile | undefined {
+  if (raw === undefined || raw === null) return undefined
+  try {
+    return normalizeReasoningProfile(raw)
+  } catch (error) {
+    // The validation message names keys/fields only, never values from the entry.
+    console.warn(`provider-store: ignoring invalid reasoning profile for provider '${providerId}': ${error instanceof Error ? error.message : 'invalid'}`)
+    return undefined
+  }
 }
 
 export interface ModelDefaults {
@@ -214,7 +234,8 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
         if (Object.keys(value).length > 0) modelSettings[model] = { ...modelSettings[model], ...value }
       }
     }
-    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}) })
+    const reasoning = parseReasoningOverride(candidate['reasoning'], id)
+    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...(reasoning !== undefined ? { reasoning } : {}) })
   }
   return out
 }

@@ -340,6 +340,46 @@ describe('headless CLI', () => {
       expect(result.stderr).toContain(`provider config '${config}' could not be parsed`)
     }, 30_000)
 
+    it('PH4-A: real CLI + strict reasoning profile from providers.json: request 2 replays the streamed reasoning (phase-05)', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-reasoning-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const bodies: { messages: { role: string; reasoning_content?: unknown; tool_calls?: { id: string }[] }[] }[] = []
+      const provider = createServer(async (req, res) => {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        bodies.push(JSON.parse(raw))
+        const first = bodies.length === 1
+        const frames = first
+          ? [{ choices: [{ index: 0, delta: { reasoning_content: 'CLI-THOUGHT' } }] }, { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'glob-1', type: 'function', function: { name: 'Glob', arguments: JSON.stringify({ pattern: 'package.json' }) } }] }, finish_reason: 'tool_calls' }] }]
+          : [{ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] }]
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(`${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('')}data: [DONE]\n\n`)
+      })
+      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+      const address = provider.address() as { port: number }
+      const config = path.join(dataDir, 'providers.json')
+      await writeFile(config, JSON.stringify({
+        version: 2,
+        defaults: { provider: 'fake', model: 'm', thinkingLevel: null },
+        // A local relay is not api.deepseek.com: only the explicit typed profile makes it strict.
+        providers: [{ id: 'fake', name: 'fake', baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: 'k', models: ['m'], enabled: true, reasoning: { required: true } }],
+        aliases: [],
+        aliasGeneration: 0,
+      }))
+      try {
+        const result = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'hi'])
+        expect(result.code).toBe(0)
+        expect(bodies).toHaveLength(2)
+        const replayed = bodies[1]!.messages.find((message) => message.role === 'assistant')
+        expect(replayed?.reasoning_content).toBe('CLI-THOUGHT')
+        expect(replayed?.tool_calls?.map((call) => call.id)).toEqual(['glob-1'])
+        // The stored record is not printed a second time (only the streamed chunk is).
+        expect(result.stdout.split('CLI-THOUGHT').length - 1).toBe(1)
+      } finally {
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+      }
+    }, 30_000)
+
     it('PH1-A: per-model context 32768 / output 4096 drive the manifest budget and the wire cap (phase-04 shared resolver)', async () => {
       dataDir = await mkdtemp(path.join(tmpdir(), 'cli-effective-'))
       const root = fileURLToPath(new URL('../../', import.meta.url))

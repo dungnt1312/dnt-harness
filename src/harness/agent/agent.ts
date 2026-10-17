@@ -7,6 +7,8 @@ import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from
 import { canonicalCall } from '../tools/names.ts'
 import { LogicalRequest } from '../llm/request-lifecycle.ts'
 import { encodedBytes, protocolError, validateCompletion, validateToolBatch, WIRE_LIMITS } from '../llm/completion.ts'
+import { capturedReasoning, StreamRedactor } from '../llm/reasoning.ts'
+import type { ReasoningPayload } from '../llm/types.ts'
 import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
 import { agentScope, type AgentScope } from './scope.ts'
@@ -662,6 +664,14 @@ export class Agent {
     // request as too large would be sent the identical request forever.
     let full = ''
     let calls: readonly ToolCall[] = []
+    // Thinking text of the CURRENT attempt only (phase 05): reset with
+    // `full`/`calls`, so an abandoned or retried attempt never leaks into the
+    // answer that finally succeeds. Published only on a valid completion whose
+    // adapter named the route the reasoning must be replayed to.
+    let thinking = ''
+    let reasoningSource: string | undefined
+    let thinkingRedacted = false
+    let thinkingRedactor = new StreamRedactor()
     // The reply ended at the model's output-token limit (finish `length`).
     let truncated = false
     let request: ModelRequest = { messages: [] }
@@ -703,6 +713,11 @@ export class Agent {
       owner.assertLive(); assertLive()
       full = ''
       calls = []
+      thinking = ''
+      reasoningSource = undefined
+      thinkingRedacted = false
+      // Per attempt: an abandoned attempt's held tail is dropped, never persisted.
+      thinkingRedactor = new StreamRedactor()
       truncated = false
 
       const attemptController = new AbortController()
@@ -747,6 +762,16 @@ export class Agent {
               }
               validateToolBatch(calls)
               completed = true
+              // The redactor's held tail is released only now, on a valid completion.
+              const held = thinkingRedactor.flush()
+              if (held !== '') {
+                thinking += held
+                this.session.append({ type: 'assistant/chunk', stepId, delta: held, thinking: true })
+              }
+              // The adapter names a source only when it proved the reasoning it
+              // parsed is the whole reasoning; otherwise nothing is recorded.
+              if (typeof event.reasoningSource === 'string' && event.reasoningSource !== '') reasoningSource = event.reasoningSource
+              if (event.reasoningRedacted === true) thinkingRedacted = true
               if (calls.length > 0) emitted = true
               continue
             }
@@ -761,14 +786,19 @@ export class Agent {
               if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'provider output exceeds limit')
               // Thinking deltas are logged for UI fidelity but never join the
               // assembled assistant message — the model's answer is content only.
-              if (event.thinking !== true) full += event.delta
               emitted = true
-              this.session.append({
-                type: 'assistant/chunk',
-                stepId,
-                delta: event.delta,
-                ...(event.thinking === true ? { thinking: true } : {}),
-              })
+              if (event.thinking !== true) {
+                full += event.delta
+                this.session.append({ type: 'assistant/chunk', stepId, delta: event.delta })
+              } else {
+                // Thinking is masked for secret shapes BEFORE it reaches the
+                // durable log (any provider, not just the built-in adapter); a
+                // secret split across deltas is held until its run ends. The
+                // record below is assembled from exactly these persisted pieces.
+                const safe = thinkingRedactor.push(event.delta)
+                thinking += safe
+                if (safe !== '') this.session.append({ type: 'assistant/chunk', stepId, delta: safe, thinking: true })
+              }
             } else if (event.type === 'toolCalls') {
               if (calls.length > 0) throw protocolError('invalid_tool_input', 'multiple tool batches')
               validateToolBatch(event.calls)
@@ -850,6 +880,13 @@ export class Agent {
         stepId,
         content: full,
         ...(calls.length > 0 ? { toolCalls: calls } : {}),
+        // A `length` cutoff proves nothing about the reasoning being whole:
+        // it is kept as `complete: false` and never replayed as complete.
+        ...((): { reasoning?: ReasoningPayload } => {
+          if (reasoningSource === undefined) return {}
+          const record = capturedReasoning(thinking, !truncated, reasoningSource, { redacted: thinkingRedacted || thinkingRedactor.changed })
+          return record !== undefined ? { reasoning: record } : {}
+        })(),
         ...(request.model !== undefined || provider !== undefined
           ? { controls: { ...(request.model !== undefined ? { model: request.model } : {}), ...(provider !== undefined ? { provider } : {}) } }
           : {}),

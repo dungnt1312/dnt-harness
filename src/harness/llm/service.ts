@@ -1,6 +1,6 @@
 import { Service, type Context } from '../../kernel/index.ts'
 import { AttemptAdmission, LogicalRequest, runAttempt, type AttemptObserver, type PhysicalAdmission } from './request-lifecycle.ts'
-import { ProviderError, type LlmProvider, type ModelRequest, type StreamEvent, type StreamOptions } from './types.ts'
+import { ProviderError, type LlmProvider, type ModelRequest, type ReasoningReplay, type StreamEvent, type StreamOptions } from './types.ts'
 
 declare module 'dnt-harness' {
   interface Context {
@@ -159,6 +159,15 @@ export class LlmService extends Service {
       })(chained as Promise<AsyncIterable<StreamEvent>>)
     } }
     return this.admitted(dispatch, request, options)
+  }
+
+  /**
+   * Reasoning replay facts of a registered provider for `model` (phase 05), or
+   * undefined for a generic route, an unknown provider or no model.
+   */
+  reasoningReplay(providerName: string | undefined, model: string | undefined): ReasoningReplay | undefined {
+    if (providerName === undefined || model === undefined) return undefined
+    return this.providers.get(providerName)?.reasoningReplay?.(model)
   }
 
   /** The registered provider's model list, resolved by id (no global pointer). */

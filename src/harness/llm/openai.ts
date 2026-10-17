@@ -6,9 +6,10 @@ import {
   outputCeiling, outputPolicy, outputTokenCap, routeIdentity, routeKey,
   type CredentialHasher, type MaxTokensField, type OutputCapSource, type RouteIdentity,
 } from './effective-model.ts'
-import type { ModelCompletion, ModelFinishReason, ProviderErrorReason } from './types.ts'
+import type { ModelCompletion, ModelFinishReason, ProviderErrorReason, ReasoningReplay } from './types.ts'
 import { messageText, ProviderError } from './types.ts'
 import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
+import { planReasoningReplay, REASONING_LIKE_KEYS, REASONING_REPLAY_REJECTED, REASONING_RESET_HINT, reasoningSourceKey, redactSecrets, resolveReasoningProfile, StreamRedactor, type ReasoningProfile } from './reasoning.ts'
 
 interface StreamChoice {
   finish_reason?: unknown
@@ -41,6 +42,14 @@ interface WireMessage {
   content: WireContent
   tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
   tool_call_id?: string
+  /** The profile's reasoning field (validated, never a reserved key). */
+  [reasoningField: string]: unknown
+}
+
+/** Which assistant messages carry reasoning on the wire, and under which field. */
+interface WireReasoning {
+  readonly field: string
+  readonly eligible: ReadonlySet<number>
 }
 
 /**
@@ -64,12 +73,18 @@ function toWireContent(content: ModelMessage['content']): WireContent {
  * `toolCallId`. The inverse mapping happens on streamed `tool_calls` below,
  * so the internal vocabulary stays provider-neutral.
  */
-function toWireMessages(messages: readonly ModelMessage[]): WireMessage[] {
-  return messages.map((message) => {
+function toWireMessages(messages: readonly ModelMessage[], reasoning?: WireReasoning): WireMessage[] {
+  return messages.map((message, index) => {
+    // Reasoning rides only where the route's profile requires it and only for
+    // records the replay plan proved eligible (same route, complete, in window).
+    const thought = reasoning !== undefined && reasoning.eligible.has(index) && message.reasoning !== undefined
+      ? { [reasoning.field]: message.reasoning.text }
+      : {}
     if (message.role === 'assistant' && message.toolCalls !== undefined) {
       return {
         role: 'assistant',
         content: toWireContent(message.content),
+        ...thought,
         tool_calls: message.toolCalls.map((call) => ({
           id: call.id,
           type: 'function' as const,
@@ -77,6 +92,7 @@ function toWireMessages(messages: readonly ModelMessage[]): WireMessage[] {
         })),
       }
     }
+    if (message.role === 'assistant') return { role: 'assistant', content: toWireContent(message.content), ...thought }
     if (message.role === 'tool') {
       return {
         role: 'tool',
@@ -124,6 +140,13 @@ export interface OpenAiCompletionsOptions {
    * the host (persisted per-install secret). Unset: a process-local secret.
    */
   readonly credentialHasher?: CredentialHasher
+  /**
+   * Explicit reasoning replay profile (already normalized at the provider-store
+   * boundary). Unset: the native DeepSeek endpoint (`api.deepseek.com`) gets the
+   * strict DeepSeek profile, every other endpoint none. A model id merely
+   * containing `deepseek` never enables it.
+   */
+  readonly reasoning?: ReasoningProfile
 }
 
 // Wire-compatibility detection and the output-cap policy live in the shared
@@ -266,6 +289,17 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     return routeIdentity({ baseUrl: this.options.baseUrl, model: model ?? this.fallbackModel, maxTokensField: this.maxTokensField, credentialGeneration: this.credential })
   }
 
+  /** The reasoning profile this endpoint requires, or undefined (generic: none). */
+  private get reasoningProfile(): ReasoningProfile | undefined {
+    return resolveReasoningProfile(this.options.reasoning, this.options.baseUrl)
+  }
+
+  reasoningReplay(model?: string): ReasoningReplay | undefined {
+    const profile = this.reasoningProfile
+    if (profile === undefined) return undefined
+    return { source: reasoningSourceKey(routeKey(this.routeIdentity(model ?? this.fallbackModel))), window: profile.replayWindow }
+  }
+
   /**
    * Secret-free output-cap facts for diagnostics: the policy source, and for a
    * guessed cap what this endpoint taught us (`omitted` = no cap is sent).
@@ -292,9 +326,25 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     const maxTokensField = this.maxTokensField
     const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
     const supportsPromptCacheKey = this.options.supportsPromptCacheKey ?? detectSupportsPromptCacheKey(this.options.baseUrl)
+    // Reasoning replay (phase 05): only a route whose profile requires it, and
+    // only with `tools` — DeepSeek documents that a request without tools
+    // ignores the field. The strict gate runs BEFORE the network: a tool-loop
+    // assistant message without complete reasoning of this exact route (another
+    // model/endpoint/credential, a cut-off reply, a pre-upgrade log) is an
+    // actionable error, never an empty string standing in for lost data.
+    const profile = this.reasoningProfile
+    const source = profile !== undefined ? reasoningSourceKey(routeKey(this.routeIdentity(model))) : undefined
+    let wireReasoning: WireReasoning | undefined
+    if (profile !== undefined && source !== undefined && hasTools) {
+      const plan = planReasoningReplay(request.messages, source, profile.replayWindow)
+      if (plan.missing > 0) {
+        throw new ProviderError(`reasoning replay unavailable: ${plan.missing} assistant message(s) of the current tool loop lack complete reasoning recorded on this route ('${model}' via ${this.name}); ${REASONING_RESET_HINT}`, { reason: 'unknown', phase: 'connect', classification: 'reasoning_replay_missing' })
+      }
+      wireReasoning = { field: profile.field, eligible: plan.eligible }
+    }
     const body: Record<string, unknown> = {
       model,
-      messages: toWireMessages(request.messages),
+      messages: toWireMessages(request.messages, wireReasoning),
       ...(hasTools
         ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
         : {}),
@@ -408,8 +458,11 @@ export class OpenAiCompletionsProvider implements LlmProvider {
           ? `output cap rejected (${built.cap === undefined ? 'no cap sent' : `sent ${built.cap}`}; lower maxOutputTokens for '${model}')`
           : classification === 'missing_required_cap'
             ? `endpoint requires an output cap (set maxOutputTokens for '${model}')`
-            : reason
-        const error = new ProviderError(`provider HTTP ${response.status}: ${label}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, classification, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
+            : REASONING_REPLAY_REJECTED.test(detail)
+              ? `endpoint requires reasoning replay this history cannot provide; ${REASONING_RESET_HINT}`
+              : reason
+        const typed = classification === 'request' && REASONING_REPLAY_REJECTED.test(detail) ? 'reasoning_replay_rejected' as const : classification
+        const error = new ProviderError(`provider HTTP ${response.status}: ${label}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, classification: typed, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
         error.transportSettled = cleanupSettled
         throw error
       }
@@ -421,6 +474,11 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     }
 
     const calls: AccumulatedCall[] = []
+    // Thinking keys this stream reads: always `reasoning_content`, plus the
+    // profile's field when it names another one.
+    const thinkingKeys = profile !== undefined && profile.field !== 'reasoning_content' ? [profile.field, 'reasoning_content'] : ['reasoning_content']
+    const thinkingRedactor = new StreamRedactor(this.options.apiKey)
+    let reasoningProven = true
     const reader = response.body.getReader()
     let finishReason: ModelFinishReason | undefined
     let boundary: 'done' | 'eof' = 'eof'
@@ -468,9 +526,24 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         }
         const delta = choice?.delta
         const content = delta?.content
-        if ((content !== undefined && content !== null && typeof content !== 'string') || (delta?.reasoning_content !== undefined && delta.reasoning_content !== null && typeof delta.reasoning_content !== 'string') || (delta?.tool_calls !== undefined && delta.tool_calls !== null && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
-        if (alreadyFinished && (delta?.content || delta?.reasoning_content || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
-        outputBytes += encodedBytes(delta?.content ?? '') + encodedBytes(delta?.reasoning_content ?? '')
+        const record = delta as Record<string, unknown> | undefined
+        // Thinking may arrive under `reasoning_content` (DeepSeek) and, for a
+        // profiled route, under the profile's own field (`delta.reasoning` on
+        // some relays). Both are validated like content.
+        const thinkingValues = thinkingKeys.map((key) => record?.[key])
+        if ((content !== undefined && content !== null && typeof content !== 'string') || thinkingValues.some((value) => value !== undefined && value !== null && typeof value !== 'string') || (delta?.tool_calls !== undefined && delta.tool_calls !== null && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
+        const thoughts = thinkingValues.filter((value): value is string => typeof value === 'string' && value !== '')
+        if (alreadyFinished && (delta?.content || thoughts.length > 0 || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
+        // One piece per delta: relays that mirror the same text under two keys
+        // are read once; two DIFFERENT texts cannot be ordered faithfully.
+        const thinking = thoughts[0]
+        if (thoughts.some((value) => value !== thinking)) reasoningProven = false
+        // A strict route must PROVE its record is whole: thinking under a
+        // reasoning-like key it does not parse means the record would be
+        // missing text, so no record is published at all (the gate then asks
+        // for a reset) — never an empty string standing in for lost reasoning.
+        if (profile !== undefined && record !== undefined && REASONING_LIKE_KEYS.some((key) => !thinkingKeys.includes(key) && record[key] !== undefined && record[key] !== null && record[key] !== '')) reasoningProven = false
+        outputBytes += encodedBytes(delta?.content ?? '') + encodedBytes(thinking ?? '')
         if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'model output exceeds limit')
         // Reasoning-capable models emit thinking separately from content:
         // the thinking text never joins the answered content and is marked
@@ -478,9 +551,11 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         if (typeof content === 'string' && content !== '') {
           yield { type: 'delta', delta: content }
         }
-        const thinking = delta?.reasoning_content
-        if (typeof thinking === 'string' && thinking !== '') {
-          yield { type: 'delta', delta: thinking, thinking: true }
+        if (thinking !== undefined) {
+          // Secret shapes and this route's own key are masked before the text
+          // reaches a durable chunk; a split secret is held until it ends.
+          const safe = thinkingRedactor.push(thinking)
+          if (safe !== '') yield { type: 'delta', delta: safe, thinking: true }
         }
         if (delta?.tool_calls != null && delta.tool_calls.length > 0) {
           for (const fragment of delta.tool_calls) {
@@ -531,7 +606,13 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         }
       }
       if (finishReason === undefined || (boundary === 'eof' && this.options.completionPolicy !== 'finish-eof')) throw protocolError('incomplete_completion', `${this.name}: stream ended without completion proof`)
-      const completion: ModelCompletion = { type: 'completion', finishReason, transport: boundary, policy: boundary === 'done' ? 'strict' : 'finish-eof', transportSettled: true }
+      const heldThinking = thinkingRedactor.flush()
+      if (heldThinking !== '') yield { type: 'delta', delta: heldThinking, thinking: true }
+      const completion: ModelCompletion = {
+        type: 'completion', finishReason, transport: boundary, policy: boundary === 'done' ? 'strict' : 'finish-eof', transportSettled: true,
+        ...(source !== undefined && reasoningProven ? { reasoningSource: source } : {}),
+        ...(thinkingRedactor.changed ? { reasoningRedacted: true as const } : {}),
+      }
       // A `length` finish reaches the agent loop, which recovers in-turn. Tool
       // calls of a cut-off reply are incomplete by definition (their JSON may
       // even parse) and are never handed out for execution.
@@ -803,15 +884,6 @@ function httpErrorExcerpt(detail: string, apiKey: string): string {
   const flat = redactSecrets(text, apiKey).replace(/\s+/g, ' ').trim()
   if (flat === '') return ''
   return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
-}
-
-/** Token-shaped substrings: `sk-…`, `pk_…`, `key-…`, and `Bearer <token>`. */
-const SECRET_SHAPES = /\b(?:sk|pk|rk|key|api[-_]?key)[-_][A-Za-z0-9_-]{8,}|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi
-
-function redactSecrets(text: string, apiKey: string): string {
-  let out = text
-  if (apiKey.length >= 4) out = out.split(apiKey).join('[redacted]')
-  return out.replace(SECRET_SHAPES, '[redacted]')
 }
 
 /** The `usage` object of a completions chunk; cache fields vary by server. */

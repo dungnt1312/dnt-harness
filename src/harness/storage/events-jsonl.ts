@@ -16,6 +16,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { SessionEvent } from '../session/events.ts'
 import { isValidContextId, isValidTokenUsage } from '../context/context-metrics.ts'
+import { isReasoningPayload } from '../llm/reasoning.ts'
 
 /** Bump when the line format breaks compatibility; readers refuse other versions. */
 export const EVENT_SCHEMA_VERSION = 1
@@ -75,6 +76,10 @@ function validateRecord(parsed: unknown, filePath: string, lineNumber: number): 
   if (record['type'] === 'context/manifest' && record['manifest'] !== null && typeof record['manifest'] === 'object') {
     const contextId = (record['manifest'] as Record<string, unknown>)['contextId']
     if (contextId !== undefined && !isValidContextId(contextId)) throw new SessionLogError('schema', `line ${lineNumber} has an invalid context identity`, filePath, lineNumber)
+  }
+  // Optional since phase 05: legacy assistant messages carry none and stay valid.
+  if (record['type'] === 'assistant/message' && record['reasoning'] !== undefined && !isReasoningPayload(record['reasoning'])) {
+    throw new SessionLogError('schema', `line ${lineNumber} has an invalid reasoning record`, filePath, lineNumber)
   }
   if (record['type'] === 'compaction/end' && !validCompactionMetrics(record)) {
     throw new SessionLogError('schema', `line ${lineNumber} has invalid compaction metrics`, filePath, lineNumber)

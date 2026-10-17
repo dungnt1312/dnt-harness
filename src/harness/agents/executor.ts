@@ -1575,6 +1575,7 @@ function digestMessage(events: readonly SessionEvent[], includeToolTurns: boolea
     const event = events[i]
     if (event?.type !== 'assistant/message') continue
     if (!includeToolTurns && event.toolCalls !== undefined && event.toolCalls.length > 0) continue
+    // `content` only: a child's stored `reasoning` never joins its report (phase 05).
     const content = event.content.trim()
     if (content === '') continue
     report = content

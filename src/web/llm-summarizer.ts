@@ -4,7 +4,7 @@
  * Insufficient bounds and provider failures refuse compaction, never truncate.
  */
 import { COMPACT_SUMMARY_PROMPT, type Summarizer } from '../harness/context/compaction.ts'
-import type { ModelRequest, StreamEvent, StreamOptions } from '../harness/llm/types.ts'
+import { messageText, type ModelMessage, type ModelRequest, type StreamEvent, type StreamOptions } from '../harness/llm/types.ts'
 import { validateCompletion } from '../harness/llm/completion.ts'
 import { DRAFT_TOO_LONG, MAX_DRAFT_CHARS, collectDraft, condenseDraft, neutralizeEnvelope } from './compaction-condense.ts'
 
@@ -57,9 +57,12 @@ export class CacheAwareCompactionFallback extends Error {
 export function createCacheAwareCompactionSummarizer(
   stream: StreamFn,
   previous: ModelRequest,
-  finalAnswer: string,
+  finalAnswer: string | ModelMessage,
   streamOptions?: StreamOptions,
 ): () => Promise<string> {
+  // A message form keeps the answer's recorded reasoning (phase 05): a strict
+  // route then replays it like every other assistant turn of the prefix.
+  const answer: ModelMessage = typeof finalAnswer === 'string' ? { role: 'assistant', content: finalAnswer } : finalAnswer
   return async () => {
     // COMPACT_SUMMARY_PROMPT names a <conversation> envelope and <earlier-summary>;
     // here the source is the request itself, so map those terms explicitly.
@@ -75,7 +78,7 @@ export function createCacheAwareCompactionSummarizer(
       ...(previous.thinkingLevel !== undefined ? { thinkingLevel: previous.thinkingLevel } : {}),
       messages: [
         ...previous.messages,
-        ...(finalAnswer.trim() !== '' ? [{ role: 'assistant' as const, content: finalAnswer }] : []),
+        ...(messageText(answer.content).trim() !== '' ? [answer] : []),
         { role: 'user', content: instruction },
       ],
       ...(previous.tools !== undefined ? { tools: previous.tools } : {}),

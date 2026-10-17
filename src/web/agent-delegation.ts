@@ -43,6 +43,7 @@ export function projectInheritedMessages(events: readonly SessionEvent[], maxCha
     let line: string | undefined
     if (event?.type === 'user/message' && event.origin !== 'context' && event.origin !== 'command' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
     else if (event?.type === 'assistant/message' && (event.toolCalls === undefined || event.toolCalls.length === 0) && event.content.trim() !== '') {
+      // `content` only: stored reasoning is never inherited by a child (phase 05).
       line = `Assistant: ${event.content.trim()}`
     }
     if (line === undefined) continue

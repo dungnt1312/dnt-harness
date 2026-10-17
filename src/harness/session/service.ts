@@ -476,6 +476,7 @@ export class SessionsService extends Service {
           if (currentTurn === event.turnId) currentTurn = undefined
           break
         case 'assistant/message':
+          // Recovery reads declared calls only; `reasoning` has no execution meaning (phase 05).
           for (const call of event.toolCalls ?? []) {
             declared.set(callKey(event.stepId, call.id), { stepId: event.stepId, callId: call.id })
           }

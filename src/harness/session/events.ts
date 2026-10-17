@@ -2,7 +2,7 @@ import { assertNever } from '../../kernel/index.ts'
 import type { ExecutionId, StepId, TurnId } from '../../util/brand.ts'
 import { isImageMediaType, type AttachmentLookup, type AttachmentRef } from '../attachments/store.ts'
 import type { ContextManifest } from '../context/builder.ts'
-import type { ContentPart, ModelMessage, ToolCall } from '../llm/types.ts'
+import type { ContentPart, ModelMessage, ReasoningPayload, ToolCall } from '../llm/types.ts'
 import type { ModeDefinition } from '../modes/types.ts'
 
 /** Fields the session itself stamps onto every appended event. */
@@ -35,7 +35,10 @@ export type SessionEvent =
   | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' | 'hook'; readonly summary?: string } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
-  | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
+  // `reasoning` (phase 05): the attempt's thinking text, recorded only for a
+  // route whose profile requires reasoning replay. Absent on legacy logs and
+  // generic routes. Never part of `content`, child reports or delegation text.
+  | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls; readonly reasoning?: ReasoningPayload } & SessionEventStamp)
   | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly executionId?: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
   // A tool run by host prompt expansion before the first model step (Claude
   // command `!` shell). Separate event names keep model history free of an
@@ -448,15 +451,15 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
         messages.push({ role: 'user', content: userMessageContent(event.content, event.attachments, attachments) })
         break
       case 'assistant/message':
-        messages.push(
-          event.toolCalls === undefined
-            ? { role: 'assistant', content: event.content }
-            : {
-                role: 'assistant',
-                content: event.content,
-                toolCalls: event.toolCalls.map((call, index) => effectiveCalls.get(event.stepId)?.[index] ?? call),
-              },
-        )
+        // Reasoning rides along as recorded; which of it a request may keep is
+        // decided per target route by the context builder (`selectReasoning`)
+        // and again, authoritatively, by the adapter's replay plan.
+        messages.push({
+          role: 'assistant',
+          content: event.content,
+          ...(event.toolCalls !== undefined ? { toolCalls: event.toolCalls.map((call, index) => effectiveCalls.get(event.stepId)?.[index] ?? call) } : {}),
+          ...(event.reasoning !== undefined ? { reasoning: event.reasoning } : {}),
+        })
         break
       case 'tool/result':
         messages.push({ role: 'tool', content: event.output, toolCallId: event.callId })

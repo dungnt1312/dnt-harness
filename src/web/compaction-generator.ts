@@ -174,7 +174,8 @@ const charsToTokens = (chars: number): number => Math.ceil(chars / 3)
 
 function messageChars(message: ModelMessage): number {
   const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content)
-  return content.length + (message.toolCalls !== undefined ? JSON.stringify(message.toolCalls).length : 0)
+  // Replayed reasoning (snapshot v2) is sent, so it is sized like content (phase 05).
+  return content.length + (message.toolCalls !== undefined ? JSON.stringify(message.toolCalls).length : 0) + (message.reasoning?.text.length ?? 0)
 }
 
 /**
@@ -194,7 +195,7 @@ export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot, pa
     // the budget; a margin on top would refuse what the builder itself accepted. Its calibration
     // ratio (the provider's count over the estimate) still applies, as it did in the builder.
     const history = [...snapshot.request.messages, snapshot.finalAnswer]
-      .reduce((total, message) => total + estimateContentTokens(message.content) + (message.toolCalls !== undefined ? estimateTokens(JSON.stringify(message.toolCalls)) : 0), 0)
+      .reduce((total, message) => total + estimateContentTokens(message.content) + (message.toolCalls !== undefined ? estimateTokens(JSON.stringify(message.toolCalls)) : 0) + (message.reasoning !== undefined ? estimateTokens(message.reasoning.text) : 0), 0)
     return { tokens: calibrated(history + schemaCost(snapshot.request.tools ?? []) + estimateTokens(HANDOFF_INSTRUCTION), snapshot.estimateRatio ?? 1), basis: 'estimated' }
   }
   const prefix = snapshot.request.messages.reduce((total, message) => total + messageChars(message), 0) + JSON.stringify(snapshot.request.tools ?? []).length

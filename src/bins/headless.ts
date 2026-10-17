@@ -142,6 +142,8 @@ function render(event: SessionEvent): void {
       process.stdout.write(event.delta)
       break
     case 'assistant/message':
+      // Thinking already streamed as chunks; the stored `reasoning` record is
+      // never printed again (phase 05 consumer matrix).
       process.stdout.write('\n')
       break
     case 'tool/call':
@@ -375,6 +377,7 @@ async function main(): Promise<void> {
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
       credentialHasher,
+      ...(entry.reasoning !== undefined ? { reasoning: entry.reasoning } : {}),
     }))
   }
   if (legacyKey !== undefined) {
@@ -413,6 +416,11 @@ async function main(): Promise<void> {
       ...(environment !== undefined ? { environment } : {}),
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(calibration !== undefined ? { calibration } : {}),
+      // Only reasoning the selected route recorded is kept and counted (phase 05).
+      ...((): { reasoningReplay?: NonNullable<ReturnType<typeof kernel.ctx.llm.reasoningReplay>> } => {
+        const replay = kernel.ctx.llm.reasoningReplay(selectedProvider, selectedModel)
+        return replay !== undefined ? { reasoningReplay: replay } : {}
+      })(),
       fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
     })
     // Calibration pairs a provider report with its manifest by contextId, so the request carries one and its manifest is logged.
