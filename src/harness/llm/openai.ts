@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { applyThinkingOverride, resolveOutputLimit } from './model-catalog.ts'
 import { classifyTransport } from './request-lifecycle.ts'
 import { cancelReader, encodedBytes, normalizeFinishReason, protocolError, readBoundedError, readSse, validateCompletion, validateToolBatch, WIRE_LIMITS } from './completion.ts'
@@ -107,28 +108,13 @@ export interface OpenAiCompletionsOptions {
    */
   readonly maxTokensField?: 'max_tokens' | 'max_completion_tokens'
   /**
-   * Whether this endpoint accepts `prompt_cache_key`. Off unless declared:
-   * strict relays reject unknown body fields. The affinity headers still flow
-   * whenever a request stamps `sessionAffinity`.
+   * Whether this endpoint accepts `prompt_cache_key`. Unset means detect it
+   * from the host (see {@link detectSupportsPromptCacheKey}); strict relays
+   * reject unknown body fields, so an unrecognized endpoint never gets it.
    */
   readonly supportsPromptCacheKey?: boolean
   /** Whether this endpoint understands `store`. Only then is `store: false` sent. */
   readonly supportsStore?: boolean
-  /** Whether the final stream chunk carries `usage` (default true). */
-  readonly supportsUsageInStreaming?: boolean
-  /**
-   * Wait for response headers before giving up on one physical attempt.
-   * Unset means no separate deadline: the existing stream timers apply.
-   */
-  readonly headerTimeoutMs?: number
-  /**
-   * Wire-contract expectations. `'expect'` reads a repeated tool-call index
-   * that arrives with a fresh id as a re-sent header (see the adapter's
-   * tool-call assembly); `'tolerate'` is the default.
-   */
-  readonly wire?: {
-    readonly toolCallIdReuse?: 'tolerate' | 'expect'
-  }
 }
 
 /**
@@ -179,48 +165,37 @@ export function detectSupportsStore(_name: string, baseUrl: string): boolean {
   return isOpenAiNative(baseUrl)
 }
 
+/**
+ * Hosts documented to accept `prompt_cache_key` on Chat Completions (the set
+ * opencode enables). DeepSeek caches by prefix on its own and is left out, as
+ * opencode does. Exact host or a subdomain of it, never a substring.
+ */
+const PROMPT_CACHE_KEY_HOSTS: readonly string[] = [
+  'api.openai.com', 'openrouter.ai', 'api.fireworks.ai', 'openai.azure.com',
+  'api.cerebras.ai', 'api.deepinfra.com', 'api.moonshot.ai', 'api.moonshot.cn',
+]
+
+/** Whether the endpoint is known to accept `prompt_cache_key`. */
+export function detectSupportsPromptCacheKey(baseUrl: string): boolean {
+  let host: string
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  return PROMPT_CACHE_KEY_HOSTS.some((known) => host === known || host.endsWith(`.${known}`))
+}
+
 /** `prompt_cache_key` is documented at 64 characters. */
 const OPENAI_PROMPT_CACHE_KEY_MAX = 64
 
 /**
- * Diagnostics: how many times a re-sent tool-call header (a fresh id at an
- * index that already carried this call's id) was tolerated instead of failing
- * the turn. Non-zero means the endpoint's wire contract is looser than the
- * standard one.
+ * The cache key for a session: the id itself when it fits, else a SHA-256 of
+ * it. A plain truncation would let two long ids sharing a prefix collide onto
+ * one cache shard.
  */
-let toolCallIdReissues = 0
-
-/** Read the process-wide count of tolerated tool-call id re-sends. */
-export function toolCallIdReissueCount(): number {
-  return toolCallIdReissues
-}
-
-/**
- * Lower the host-approved subset of `providerOptions` onto the body. Only
- * fields with a documented chat-completions meaning are serialized; anything
- * else is dropped rather than forwarded, because one unknown field makes a
- * strict gateway reject the whole request.
- */
-export function applyProviderOptions(body: Record<string, unknown>, options: Readonly<Record<string, unknown>> | undefined, hasTools: boolean): void {
-  if (options === undefined) return
-  // A tool choice without tools is meaningless; sending it would be rejected.
-  const choice = options['toolChoice']
-  if (hasTools) {
-    if (choice === 'auto' || choice === 'none' || choice === 'required') body['tool_choice'] = choice
-    else if (choice !== null && typeof choice === 'object' && !Array.isArray(choice) && typeof (choice as { name?: unknown }).name === 'string') {
-      body['tool_choice'] = { type: 'function', function: { name: (choice as { name: string }).name } }
-    }
-  }
-  const parallel = options['parallelToolCalls']
-  if (typeof parallel === 'boolean') body['parallel_tool_calls'] = parallel
-  const format = options['responseFormat']
-  if (format === 'text' || format === 'json_object') body['response_format'] = { type: format }
-  else if (format !== null && typeof format === 'object' && !Array.isArray(format)) body['response_format'] = format
-  const stop = options['stop']
-  if (Array.isArray(stop)) {
-    const sequences = stop.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
-    if (sequences.length > 0) body['stop'] = sequences
-  }
+export function promptCacheKey(affinity: string): string {
+  return affinity.length <= OPENAI_PROMPT_CACHE_KEY_MAX ? affinity : createHash('sha256').update(affinity).digest('hex')
 }
 
 /** Sent when neither the operator nor the catalog knows the model's output limit. */
@@ -350,6 +325,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     // values scattered through the assembly, and `compatibility ?? detect`.
     const maxTokensField = this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
     const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
+    const supportsPromptCacheKey = this.options.supportsPromptCacheKey ?? detectSupportsPromptCacheKey(this.options.baseUrl)
     const body: Record<string, unknown> = {
       model,
       messages: toWireMessages(request.messages),
@@ -359,54 +335,34 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       stream: true,
       // The final chunk then carries `usage` (real prompt/cached counts),
       // which the context meter shows instead of a raw estimate.
-      ...(this.options.supportsUsageInStreaming !== false ? { stream_options: { include_usage: true } } : {}),
+      stream_options: { include_usage: true },
       // Stateless by default where the flag exists; every other endpoint omits
       // the field entirely rather than risk rejecting an unknown one.
       ...(supportsStore ? { store: false } : {}),
     }
     const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens)
-    if (maxTokens !== undefined) body[maxTokensField] = maxTokens
+    body[maxTokensField] = maxTokens
     applyThinkingOverride(body, model, request.thinkingLevel, maxTokens)
-    applyProviderOptions(body, request.providerOptions, hasTools)
-    // Off unless the endpoint declares support: strict relays reject unknown
-    // body fields. The affinity headers below flow regardless.
-    if (this.options.supportsPromptCacheKey === true && affinity !== undefined && affinity !== '') {
-      body['prompt_cache_key'] = affinity.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX)
+    // Only where the endpoint is known or declared to accept it: strict relays
+    // reject unknown body fields. The affinity header below flows regardless.
+    if (supportsPromptCacheKey && affinity !== undefined && affinity !== '') {
+      body['prompt_cache_key'] = promptCacheKey(affinity)
     }
     const payload = JSON.stringify(body)
     const signal = options?.signal
     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
     const maxAttempts = options?.requestOwner ? 1 : Math.min(4, 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES))
     let response: Response
-    // The caller's abort is forwarded to the attempt controller for as long as
-    // that attempt's body may still be read, not just until headers arrive:
-    // the response body is bound to the attempt signal, so dropping the
-    // forwarder early would leave a cancelled run blocked in `read()`.
-    let detachAbort = (): void => {}
     // Retry only before the stream starts: nothing has been yielded, so a
     // second request cannot duplicate output. Rate limits and transient
     // gateway/server failures are retried with backoff; everything else
     // (auth, bad request, a mid-stream failure) surfaces at once.
     for (let attempt = 1; ; attempt++) {
       let wait: number | undefined
-      // A header deadline is opt-in: without one this loop behaves exactly as
-      // before. Each physical attempt gets its own timer and controller.
-      const headerTimeout = this.options.headerTimeoutMs
-      const attemptController = headerTimeout === undefined ? undefined : new AbortController()
-      const forwardAbort = (): void => attemptController?.abort(signal?.reason)
-      const headerTimer = attemptController === undefined || headerTimeout === undefined
-        ? undefined
-        : setTimeout(() => attemptController.abort(new ProviderError(`provider sent no response headers within ${headerTimeout}ms`, { reason: 'first_progress_timeout', phase: 'headers', transient: true })), headerTimeout)
-      if (attemptController !== undefined) {
-        if (signal?.aborted === true) attemptController.abort(signal.reason)
-        else signal?.addEventListener('abort', forwardAbort, { once: true })
-      }
-      detachAbort = () => signal?.removeEventListener('abort', forwardAbort)
-      const wireSignal = attemptController?.signal ?? signal
       try {
         response = await fetch(`${this.options.baseUrl}/chat/completions`, {
           method: 'POST',
-          ...(wireSignal !== undefined ? { signal: wireSignal } : {}),
+          ...(signal !== undefined ? { signal } : {}),
           headers: {
             'content-type': 'application/json',
             // Local gateways often accept no credential at all; sending an empty
@@ -420,21 +376,14 @@ export class OpenAiCompletionsProvider implements LlmProvider {
           body: payload,
         })
       } catch (error) {
-        const deadline = attemptController?.signal.reason instanceof ProviderError ? attemptController.signal.reason : undefined
-        const classified = signal?.aborted
-          ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' })
-          : deadline ?? classifyTransport(error, 'connect')
-        detachAbort()
+        const classified = signal?.aborted ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' }) : classifyTransport(error, 'connect')
         if (!classified.retryable || attempt >= maxAttempts) throw classified
         await sleep(backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS), signal)
         continue
-      } finally {
-        if (headerTimer !== undefined) clearTimeout(headerTimer)
       }
       if (response.ok) break
       let cleanupSettled = true
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
-      detachAbort()
       const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
       const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
       const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
@@ -449,7 +398,6 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       await sleep(Math.min(MAX_RETRY_DELAY_MS, wait ?? backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)), signal)
     }
     if (response.body === null) {
-      detachAbort()
       throw new ProviderError(`${this.name}: empty response body`, { transient: true })
     }
 
@@ -527,17 +475,12 @@ export class OpenAiCompletionsProvider implements LlmProvider {
               // gets one fails the batch at finish, where identity is checked.
               if (typeof id !== 'string') throw protocolError('invalid_tool_input', 'invalid tool ID')
               if (id.trim() !== '') {
-                if (slot.id && slot.id !== id) {
-                  // A gateway may re-send the tool-call header with a fresh id at
-                  // the same index. While no arguments accumulated the slot still
-                  // describes one call, so the last header wins. Once arguments
-                  // exist the two ids would merge different calls into one
-                  // executable batch: a hard failure, unless the endpoint is
-                  // declared to re-send headers (`wire.toolCallIdReuse: 'expect'`,
-                  // where the accumulated arguments and name are kept).
-                  if (slot.argsString !== '' && this.options.wire?.toolCallIdReuse !== 'expect') throw protocolError('invalid_tool_input', 'conflicting tool ID')
-                  toolCallIdReissues += 1
-                }
+                // A gateway may re-send the tool-call header with a fresh id at
+                // the same index. While no arguments accumulated the slot still
+                // describes one call, so the last header wins. Once arguments
+                // exist the two ids would merge different calls into one
+                // executable batch: a hard failure.
+                if (slot.id && slot.id !== id && slot.argsString !== '') throw protocolError('invalid_tool_input', 'conflicting tool ID')
                 slot.id = id
               }
             }
@@ -588,7 +531,6 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       if (settled) reader.releaseLock()
       throw failure
     } finally {
-      detachAbort()
       if (!settled) {
         const closing = !cleanupAttempted
         try {
