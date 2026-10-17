@@ -4764,6 +4764,15 @@ ${entry.description}`.toLowerCase().includes(query))
       //   + usage‖automations 1                                      = 10.5s
       //   HTTP close‖MCP disconnect 1 + kernel.stop 1                = 12.5s
       //   ownerLock.release + unbounded sync steps: 1s slack         = 13.5s
+      // Stop accepting BEFORE dropping connections: a keep-alive client (undici's
+      // pool) reconnects the instant its sockets die, and a socket accepted while
+      // teardown runs would keep server.close() pending until the bounded HTTP
+      // step below times out. close() first, then sweep; the HTTP step sweeps
+      // again for anything accepted in between.
+      const httpClosed = new Promise<void>((resolve, reject) => {
+        server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())
+      })
+      httpClosed.catch(() => {})
       const terminalsDone = (async () => {
         server.closeAllConnections()
         try {
@@ -4798,7 +4807,7 @@ ${entry.description}`.toLowerCase().includes(query))
         },
         async () => {
           const results = await Promise.allSettled([
-            boundedCleanup(() => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()))),
+            boundedCleanup(() => { server.closeAllConnections(); return httpClosed }),
             boundedCleanup(async () => {
               const disconnects = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
               const failed = disconnects.filter(result => result.status === 'rejected')
