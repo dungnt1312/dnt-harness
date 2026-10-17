@@ -61,6 +61,23 @@ Settings, or set `DEEPSEEK_API_KEY` in the environment before the first start.
 The package ships TypeScript source and runs it with Bun directly; the web
 client is prebuilt, so no build step is needed after installing.
 
+### Upgrading from 0.2.x (Node)
+
+0.3.0 runs on Bun instead of Node + tsx, so the launcher needs `bun` on PATH.
+`dnt-harness upgrade` from a 0.2.x install still uses npm and leaves a launcher
+that cannot start without Bun. Move over once, by hand:
+
+```sh
+# install Bun >= 1.3 first: https://bun.sh
+npm rm -g dnt-harness
+bun add -g dnt-harness
+dnt-harness restart      # only if it runs under pm2
+```
+
+Sessions and providers in `~/.dnt-harness/` are unchanged. A pm2 process that
+was started under 0.2.x should be re-registered with `dnt-harness start pm2`
+so pm2 launches it through Bun.
+
 ## Getting started (from source)
 
 ```sh
