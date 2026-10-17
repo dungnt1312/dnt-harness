@@ -183,7 +183,7 @@ describe('workspace thinking control', () => {
     expect(endpoint.bodies[1]?.['reasoning_effort']).toBe('max')
   }, 30_000)
 
-  it('a level the model documents now reaches the wire instead of falling back to the provider default', async () => {
+  it('a level the model accepts reaches the wire explicitly instead of being dropped', async () => {
     const endpoint = await startStubEndpoint()
     const { base } = await start()
     const wsId = await firstWorkspace(base)
@@ -194,10 +194,9 @@ describe('workspace thinking control', () => {
       models: ['deepseek-v4.1-flash-free'],
     })
     await put(base, `/api/workspaces/${wsId}/model`, { model: 'deepseek-v4.1-flash-free', provider: 'deepseek-gw' })
-    // `medium` is a real upstream tier. Before the catalog listed it, this PUT
-    // was rejected and a session already carrying `medium` silently sent no
-    // reasoning_effort at all — so the provider ran its own default, which for
-    // DeepSeek is the heaviest tier (more thinking than `max`).
+    // DeepSeek accepts `medium` (and maps it to `high`). Before the catalog
+    // listed it, this PUT was rejected and a session already carrying `medium`
+    // sent no reasoning_effort at all, leaving the endpoint's default in charge.
     expect((await put(base, `/api/workspaces/${wsId}/thinking`, { level: 'medium' })).status).toBe(200)
 
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }

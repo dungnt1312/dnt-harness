@@ -30,10 +30,11 @@ export interface ReasoningCapability {
 export type ThinkingLevel = 'off' | ReasoningLevel
 
 const EFFORT_5: readonly ReasoningLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
-// DeepSeek accepts the whole effort vocabulary, `minimal` included. Omitting a
-// level here is NOT harmless: an undeclared level is dropped from the wire and
-// the provider then runs its own default (for DeepSeek that is the heaviest
-// tier), so a user picking `medium` would silently get MORE thinking than `max`.
+// DeepSeek accepts the whole effort vocabulary on the wire, but has only three
+// real tiers: `minimal` maps to `low`, `medium`/`xhigh` map to `high`, and the
+// unset default is `high` (api-docs.deepseek.com/guides/thinking_mode). Every
+// level is declared so a stored `medium` is accepted and sent explicitly
+// rather than dropped and left to whatever default a relay applies.
 const EFFORT_6: readonly ReasoningLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const GEMINI_STANDARD: readonly ReasoningLevel[] = ['low', 'medium', 'high']
 

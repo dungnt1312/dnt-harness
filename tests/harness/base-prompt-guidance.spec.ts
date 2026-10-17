@@ -29,8 +29,8 @@ describe('default base prompt', () => {
     expect(DEFAULT_BASE_SYSTEM).toContain('Answer the question that was asked and stop there')
     expect(DEFAULT_BASE_SYSTEM).toContain('Stop researching once you can answer')
     expect(DEFAULT_BASE_SYSTEM).toMatch(/never retry it with a slightly different pattern/)
-    expect(DEFAULT_BASE_SYSTEM).toMatch(/Do not re-read or re-run something you already have/)
-    expect(DEFAULT_BASE_SYSTEM).not.toContain('verify with a tool when verification is cheap')
+    expect(DEFAULT_BASE_SYSTEM).toMatch(/do not re-read or re-run something you already have/)
+    expect(DEFAULT_BASE_SYSTEM).toContain('verify once with a tool when that is cheap')
   })
 
   it('selects tools by task, not semantic-search-first, and shares the principle with the child prompt', () => {

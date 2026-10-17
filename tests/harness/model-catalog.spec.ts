@@ -104,11 +104,10 @@ describe('reasoning capability', () => {
     expect(getReasoningCapability('grok-4.3')?.canDisable).toBe(true)
   })
 
-  it('deepseek declares the whole effort range so no pick degrades to the provider default', () => {
-    // The upstream honours minimal…max. A level missing from the list is
-    // dropped from the wire, and the provider then runs its own default —
-    // for DeepSeek the heaviest tier — so `medium` used to think MORE than
-    // `max` did. Keep every level declared.
+  it('deepseek declares the whole accepted effort vocabulary so a stored level is sent, not dropped', () => {
+    // The upstream accepts minimal…max and maps them onto low/high/max itself.
+    // A level missing from the list is dropped from the wire and the request
+    // then runs whatever default the endpoint (or a relay) applies.
     expect(getReasoningCapability('deepseek-v4.1-flash-free')?.levels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
     expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'medium')).toBe('medium')
     expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'minimal')).toBe('minimal')
