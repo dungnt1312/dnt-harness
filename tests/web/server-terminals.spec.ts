@@ -49,8 +49,12 @@ class FakePty implements PtyHandle {
   resize(cols: number, rows: number): void {
     this.resizes.push([cols, rows])
   }
+  /** Set to model a shell that ignores the hang-up, so teardown cannot be proven. */
+  stubborn = false
   kill(): void {
     this.killed = true
+    // A real PTY reports the exit shortly after a hang-up.
+    if (!this.stubborn) queueMicrotask(() => this.exit?.({ exitCode: 0 }))
   }
 }
 
@@ -403,6 +407,42 @@ describe('terminal HTTP surface', () => {
     expect(response.status).toBe(501)
     expect(((await response.json()) as { error: string }).error).toMatch(/node-pty/)
   })
+
+  it('answers DELETE only after teardown, and reports a failed teardown instead of success', async () => {
+    const baseUrl = await start()
+    const wid = await workspaceId(baseUrl)
+    const info = (await (
+      await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+    ).json()) as { id: string }
+    const pty = spawned[0]
+    if (pty === undefined) throw new Error('test setup: no pty')
+    pty.stubborn = true
+
+    // The fake ignores HUP and has no KILL path: after the escalation window
+    // the route must say so, not report `killed: true`.
+    const failed = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals/${info.id}`, { method: 'DELETE' })
+    expect(failed.status).toBe(500)
+    expect(await failed.json()).toMatchObject({ killed: false })
+
+    // The record is kept (input blocked) so the close can be retried.
+    const listed = (await (await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`)).json()) as { terminals: Array<{ id: string }> }
+    expect(listed.terminals.map((row) => row.id)).toEqual([info.id])
+    const input = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals/${info.id}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ data: b64('x') }),
+    })
+    expect(input.status).toBe(409)
+
+    pty.stubborn = false
+    const retried = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals/${info.id}`, { method: 'DELETE' })
+    expect(retried.status).toBe(200)
+    expect(await retried.json()).toEqual({ killed: true })
+  }, 15_000)
 
   it('kills every terminal when the host shuts down', async () => {
     const baseUrl = await start()

@@ -4754,28 +4754,60 @@ ${entry.description}`.toLowerCase().includes(query))
       mcpHostClosing = true
       const agentDrivers = kernel.ctx.agents
       let teardownSafe = true
+      // Worst-case budget, all inside bins/web.ts SHUTDOWN_DEADLINE_MS (13.5s,
+      // below PM2 kill_timeout 15s). Every step is bounded:
+      //   operator channel 0.5 + MCP connects 0.5 + agents 1 (+1 fence)
+      //   + hooks 1 + compactions 1 + candidates 1 + processes 1.5   = 7.5s
+      //   terminals: started first, run concurrently, capped at
+      //   TERMINAL_SHUTDOWN_BUDGET_MS (4s) — so +0s on the chain    = 7.5s
+      //   persistence reserved: checkpoints 1 + process events 1
+      //   + usage‖automations 1                                      = 10.5s
+      //   HTTP close‖MCP disconnect 1 + kernel.stop 1                = 12.5s
+      //   ownerLock.release + unbounded sync steps: 1s slack         = 13.5s
+      const terminalsDone = (async () => {
+        server.closeAllConnections()
+        try {
+          await terminals.disposeAll()
+        } catch (error) {
+          // Report survivors (PIDs/session ids) now: a later step or the host
+          // deadline must not be able to swallow this.
+          console.error('terminal teardown incomplete at shutdown:', error instanceof Error ? error.message : error)
+          throw error
+        }
+      })()
+      // Rejection is consumed by the awaiting step below, never left unhandled.
+      terminalsDone.catch(() => {})
       await runCleanup([
-        async () => { await retireOperatorChannel?.() },
+        async () => { await boundedCleanup(async () => { await retireOperatorChannel?.() }, 500) },
         async () => {
           for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
-          await Promise.allSettled([...mcpConnecting.values()])
+          await boundedCleanup(async () => { await Promise.allSettled([...mcpConnecting.values()]) }, 500)
         },
-        () => { server.closeAllConnections(); terminals.disposeAll() },
-        () => agentDrivers.stopAll(),
+        () => agentDrivers.stopAll({ timeoutMs: 1_000 }),
         async () => { await boundedCleanup(() => backgroundHooks.closeAll()) },
         async () => { await boundedCleanup(async () => { await Promise.allSettled([...compactions.values()].flatMap((reservation) => reservation.done === undefined ? [] : [reservation.done])) }) },
         async () => { await boundedCleanup(() => candidates?.close() ?? Promise.resolve()) },
-        () => processes.disposeAll(),
+        async () => { await boundedCleanup(() => processes.disposeAll(), 1_500) },
+        () => terminalsDone,
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
-        async () => { await boundedCleanup(() => usageLog.flush()) },
-        async () => { await boundedCleanup(() => automations.flush()) },
-        () => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())),
         async () => {
-          const results = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
+          const results = await Promise.allSettled([boundedCleanup(() => usageLog.flush()), boundedCleanup(() => automations.flush())])
+          const errors = results.filter(result => result.status === 'rejected')
+          if (errors.length) throw new AggregateError(errors, 'log flush failed')
+        },
+        async () => {
+          const results = await Promise.allSettled([
+            boundedCleanup(() => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()))),
+            boundedCleanup(async () => {
+              const disconnects = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
+              const failed = disconnects.filter(result => result.status === 'rejected')
+              if (failed.length) throw new AggregateError(failed, 'MCP teardown failed')
+            }),
+          ])
           mcpClients.clear()
           const errors = results.filter(result => result.status === 'rejected')
-          if (errors.length) throw new AggregateError(errors, 'MCP teardown failed')
+          if (errors.length) throw new AggregateError(errors, 'HTTP/MCP teardown failed')
         },
         () => {
           const errors: unknown[] = []
@@ -7878,14 +7910,20 @@ async function handleApi(
           return
         }
         if (req.method === 'DELETE') {
-          deps.terminals.kill(id)
+          // Answers only once the shell is physically gone; a teardown that
+          // could not be proven is an explicit failure the client can retry.
+          await deps.terminals.kill(id)
           send(200, { killed: true })
           return
         }
         send(405, { error: 'method not allowed' })
       } catch (error) {
         if (!(error instanceof TerminalError)) throw error
-        const status = error.code === 'unavailable' ? 501 : error.code === 'not-found' ? 404 : 400
+        if (error.code === 'teardown-failed') {
+          send(500, { killed: false, error: error.message })
+          return
+        }
+        const status = error.code === 'unavailable' ? 501 : error.code === 'not-found' ? 404 : error.code === 'closing' ? 409 : 400
         send(status, { error: error.message })
       }
       return

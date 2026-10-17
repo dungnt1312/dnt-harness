@@ -46,6 +46,8 @@ class FakePty implements PtyHandle {
   }
   kill(): void {
     this.killed = true
+    // A real PTY reports the exit shortly after a hang-up.
+    queueMicrotask(() => this.exit?.({ exitCode: 0 }))
   }
   /** Push output as the real PTY would. */
   emit(chunk: string): void {
@@ -69,7 +71,7 @@ function fakeSpawner(): { spawner: PtySpawner; spawned: FakePty[] } {
 
 function service(overrides: Parameters<typeof createTerminalService>[0] = {}) {
   const { spawner, spawned } = fakeSpawner()
-  return { spawned, terminals: createTerminalService({ spawner, ...overrides }) }
+  return { spawned, terminals: createTerminalService({ spawner, inspector: null, ...overrides }) }
 }
 
 /** Let the 16 ms coalescing timer fire. */
@@ -92,7 +94,7 @@ describe('terminal service', () => {
     // The client's view of the terminal must follow the PTY, not drift from it.
     expect(terminals.get(info.id)).toMatchObject({ cols: 120, rows: 40 })
 
-    terminals.kill(info.id)
+    await terminals.kill(info.id)
     expect(spawned[0]?.killed).toBe(true)
     expect(terminals.list(WS)).toEqual([])
   })
@@ -182,6 +184,7 @@ describe('terminal service', () => {
     const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
 
     spawned[0]?.exit?.({ exitCode: 3 })
+    await flushed()
 
     expect(events.at(-1)).toEqual({ kind: 'exit', terminalId: info.id, exitCode: 3, reason: 'exit' })
     expect(terminals.list(WS)).toEqual([])
@@ -194,7 +197,7 @@ describe('terminal service', () => {
     terminals.subscribe(WS, (event) => events.push(event))
     const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
 
-    terminals.kill(info.id)
+    await terminals.kill(info.id)
     // node-pty can still deliver buffered output after the kill returns.
     spawned[0]?.emit('late output')
     await flushed()
@@ -245,7 +248,7 @@ describe('terminal service', () => {
     await terminals.create({ workspaceId: WS, cwd: process.cwd() })
     await terminals.create({ workspaceId: OTHER, cwd: process.cwd() })
 
-    terminals.disposeAll()
+    await terminals.disposeAll()
 
     expect(spawned.every((pty) => pty.killed)).toBe(true)
     expect(terminals.list(WS)).toEqual([])
@@ -256,7 +259,7 @@ describe('terminal service', () => {
     const { terminals } = service()
     expect(() => terminals.write('terminal-nope', 'x')).toThrow(/unknown terminal/)
     expect(() => terminals.resize('terminal-nope', 80, 24)).toThrow(TerminalError)
-    expect(() => terminals.kill('terminal-nope')).toThrow(TerminalError)
+    await expect(terminals.kill('terminal-nope')).rejects.toThrow(TerminalError)
   })
 
   it('rejects a shell this host cannot launch', async () => {
@@ -278,7 +281,7 @@ describe('terminal service', () => {
     await expect(terminals.create({ workspaceId: WS, cwd: process.cwd() })).rejects.toThrow(
       /could not start .*: posix_spawnp failed\./,
     )
-    terminals.disposeAll()
+    await terminals.disposeAll()
   })
 
   it('reports unavailability instead of throwing on boot when node-pty is missing', async () => {
@@ -293,18 +296,23 @@ describe('terminal service', () => {
         code: 'unavailable',
       })
     }
-    terminals.disposeAll()
+    await terminals.disposeAll()
   })
 
   it('adapts Bun.spawn({ terminal }) to the PTY handle contract', async () => {
-    const calls: { cmd: string[]; writes: string[]; resizes: number[][]; killed: boolean } = { cmd: [], writes: [], resizes: [], killed: false }
+    const calls: { cmd: string[]; writes: string[]; resizes: number[][]; signals: unknown[]; closed: number } = { cmd: [], writes: [], resizes: [], signals: [], closed: 0 }
     let emit: (chunk: Uint8Array) => void = () => {}
     let finish: () => void = () => {}
     const proc = {
+      pid: 4242,
       exitCode: null as number | null,
       exited: new Promise<number | null>((resolve) => { finish = () => resolve(proc.exitCode) }),
-      terminal: { write: (d: string) => calls.writes.push(d), resize: (c: number, r: number) => calls.resizes.push([c, r]) },
-      kill: () => { calls.killed = true },
+      terminal: {
+        write: (d: string) => { calls.writes.push(d) },
+        resize: (c: number, r: number) => { calls.resizes.push([c, r]) },
+        close: () => { calls.closed += 1 },
+      },
+      kill: (signal?: number | string) => { calls.signals.push(signal) },
     }
     const runtime: BunPtyRuntime = {
       spawn(cmd, options) {
@@ -324,13 +332,34 @@ describe('terminal service', () => {
     emit(bytes.slice(1))
     pty.write('ls\n')
     pty.resize(100, 30)
+    pty.closeTerminal?.()
     pty.kill()
+    pty.signal?.('SIGKILL')
     proc.exitCode = 7
     finish()
     await proc.exited
     await Promise.resolve()
-    expect(calls).toEqual({ cmd: ['/bin/zsh', '-l'], writes: ['ls\n'], resizes: [[100, 30]], killed: true })
+    // kill() is an explicit hang-up, never Bun's default SIGTERM (an interactive bash ignores TERM).
+    expect(calls).toEqual({ cmd: ['/bin/zsh', '-l'], writes: ['ls\n'], resizes: [[100, 30]], signals: ['SIGHUP', 'SIGKILL'], closed: 1 })
+    expect(pty.pid).toBe(4242)
     expect(data.join('')).toBe('é')
     expect(exits).toEqual([7])
+  })
+
+  it('stops delivering output to a data listener once its disposable is released', () => {
+    let emit: (chunk: Uint8Array) => void = () => {}
+    const runtime: BunPtyRuntime = {
+      spawn(_cmd, options) {
+        emit = (chunk) => options.terminal.data(undefined, chunk)
+        return { pid: 1, exitCode: null, exited: new Promise(() => {}), terminal: { write() {}, resize() {}, close() {} }, kill() {} }
+      },
+    }
+    const pty = bunPtySpawner(runtime).spawn('/bin/sh', [], { name: 'x', cols: 80, rows: 24, cwd: '/', env: {} })
+    const seen: string[] = []
+    const handle = pty.onData((chunk) => seen.push(chunk)) as { dispose(): void }
+    emit(new TextEncoder().encode('a'))
+    handle.dispose()
+    emit(new TextEncoder().encode('b'))
+    expect(seen).toEqual(['a'])
   })
 })

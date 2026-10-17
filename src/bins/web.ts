@@ -27,6 +27,16 @@ import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
 import { WEB_BIN_LIMITS } from './web-limits.ts'
 
+/**
+ * Whole-host shutdown deadline. Below PM2's `kill_timeout` (15s in
+ * ecosystem.config.cjs) with margin for the process to print its report and
+ * exit. The per-step worst-case breakdown lives beside the cleanup chain in
+ * `createWebServer`'s `close()` (src/web/server.ts): bounded chain 12.5s with
+ * terminal teardown (≤ TERMINAL_SHUTDOWN_BUDGET_MS, 4s) running concurrently
+ * from the start, plus 1s slack for owner-lock release and sync steps.
+ */
+const SHUTDOWN_DEADLINE_MS = 13_500
+
 // `~/.dnt-harness`, or the pre-rename `~/.mini-dsh` while only that exists.
 const appHome = resolveAppHome()
 
@@ -125,6 +135,13 @@ async function main(): Promise<void> {
       return
     }
     shuttingDown = true
+    // A hung cleanup step must not run into PM2's SIGKILL: that would skip the
+    // report of what was left behind. Exit on our own deadline instead.
+    const deadline = setTimeout(() => {
+      console.error(`shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms; exiting with cleanup incomplete`)
+      process.exit(1)
+    }, SHUTDOWN_DEADLINE_MS)
+    deadline.unref()
     void server.close().then(
       () => process.exit(0),
       (error: unknown) => {
