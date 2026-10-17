@@ -470,7 +470,8 @@ export function knownModelLimit(modelId: string): number | null {
 
   // ── DeepSeek ───────────────────────────────────────────────────
   if (m.includes('deepseek')) {
-    if (m.includes('v4') || m.includes('deepseek-4')) return CONTEXT_1M
+    // `deepseek-flash` is the current V4.1 Flash name (1M window).
+    if (m.includes('v4') || m.includes('deepseek-4') || m.includes('deepseek-flash')) return CONTEXT_1M
     return CONTEXT_128K
   }
 

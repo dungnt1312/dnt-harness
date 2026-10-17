@@ -104,7 +104,7 @@ export {
   type LoadedAttachment,
 } from './harness/attachments/store.ts'
 export { LlmService } from './harness/llm/service.ts'
-export { DeepSeekProvider } from './harness/llm/deepseek.ts'
+export { DEEPSEEK_MODELS, DeepSeekProvider } from './harness/llm/deepseek.ts'
 export { OpenAiCompletionsProvider, type OpenAiCompletionsOptions } from './harness/llm/openai.ts'
 export {
   DEFAULT_CONTEXT_LIMIT,

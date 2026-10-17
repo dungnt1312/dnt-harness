@@ -854,10 +854,13 @@ describe('provider registry', () => {
     let s: WebServer | undefined
     try {
       s = await createWebServer({ root, configFile: config, seedDeepseekFromEnv: true })
-      const list = (await (await fetch(`${s.url}/api/providers`)).json()) as { id: string; keyMasked: string }[]
+      const list = (await (await fetch(`${s.url}/api/providers`)).json()) as { id: string; keyMasked: string; models: string[] }[]
       expect(list[0]?.id).toBe('deepseek')
       expect(list[0]?.keyMasked).toBe('••••-key')
-      const persisted = JSON.parse(await fs.readFile(config, 'utf8')) as { providers?: { id: string }[] }
+      // Seeded with live model names only: the retired deepseek-chat/-reasoner fail upstream.
+      expect(list[0]?.models[0]).toBe('deepseek-flash')
+      expect(list[0]?.models).not.toContain('deepseek-chat')
+      const persisted = JSON.parse(await fs.readFile(config, 'utf8')) as { providers?: { id: string }[]; defaults?: { model?: string | null } }
       expect(persisted.providers?.[0]?.id).toBe('deepseek')
     } finally {
       if (previous === undefined) delete process.env['DEEPSEEK_API_KEY']

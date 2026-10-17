@@ -24,6 +24,7 @@ const upstream = process.env['E2E_UPSTREAM'] ?? 'http://127.0.0.1:6536'
 // The old CLI only knows the legacy DeepSeek provider (env-registered); the
 // new one resolves the same name/model from the store. Same provider name and
 // model ⇒ the A/B compares the old `openai.ts` against the new one.
+// The old CLI's legacy default; the A/B only holds while both send it.
 const model = 'deepseek-chat'
 
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dnt-e2e-ab-'))

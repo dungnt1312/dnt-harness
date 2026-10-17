@@ -52,6 +52,7 @@ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/li
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
+import { DEEPSEEK_MODELS } from '../harness/llm/deepseek.ts'
 import { expressibleThinkingLevel, isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
@@ -899,7 +900,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         name: 'deepseek',
         baseUrl: process.env['DEEPSEEK_BASE_URL']?.trim() || 'https://api.deepseek.com',
         apiKey: key,
-        models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+        models: [...DEEPSEEK_MODELS],
         enabled: true,
       }]
       durableDefaults = repairDefaults(durableDefaults, list)

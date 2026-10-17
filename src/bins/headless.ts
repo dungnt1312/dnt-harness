@@ -29,6 +29,7 @@ import path from 'node:path'
 import { loadRepoEnv, readApiKey, resolveAppHome } from './env.ts'
 import {
   AgentsService,
+  DEEPSEEK_MODELS,
   DeepSeekProvider,
   Kernel,
   LlmService,
@@ -202,7 +203,7 @@ async function main(): Promise<void> {
   const candidates = new Map<string, { readonly models: readonly string[]; readonly modelSettings?: (typeof enabled)[number]['modelSettings'] }>(
     enabled.map((entry) => [entry.id, entry]),
   )
-  if (legacyKey !== undefined) candidates.set('deepseek', { models: new DeepSeekProvider('').models })
+  if (legacyKey !== undefined) candidates.set('deepseek', { models: DEEPSEEK_MODELS })
   let selectedProvider = flagProvider
   let selectedModel = flagModel
   if (selectedProvider === undefined && selectedModel !== undefined) {

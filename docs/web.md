@@ -140,13 +140,13 @@ model selection:
 ```json
 {
   "version": 2,
-  "defaults": { "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": null },
+  "defaults": { "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": null },
   "providers": [{
     "id": "deepseek",
     "name": "deepseek",
     "baseUrl": "https://api.deepseek.com",
     "apiKey": "sk-…",
-    "models": ["deepseek-chat", "deepseek-reasoner"],
+    "models": ["deepseek-flash", "deepseek-v4-pro"],
     "enabled": true
   }]
 }
@@ -252,10 +252,10 @@ provider list for the Settings panel.
 ```json
 {
   "provider": "deepseek",
-  "model": "deepseek-chat",
+  "model": "deepseek-flash",
   "folder": "/workspace",
-  "models": ["deepseek-chat", "deepseek-reasoner"],
-  "providers": [{ "id": "deepseek", "name": "deepseek", "enabled": true, "keyMasked": "••••abcd", "models": ["deepseek-chat"] }]
+  "models": ["deepseek-flash", "deepseek-v4-pro"],
+  "providers": [{ "id": "deepseek", "name": "deepseek", "enabled": true, "keyMasked": "••••abcd", "models": ["deepseek-flash"] }]
 }
 ```
 
@@ -267,7 +267,7 @@ it.
 
 ```json
 // body
-{ "model": "deepseek-reasoner" }
+{ "model": "deepseek-v4-pro" }
 ```
 
 `400` when the name is not in the provider's offered models.
@@ -400,7 +400,7 @@ snapshots existed, which keep inheriting the live global defaults; the
 `GET` answers the **effective** controls:
 
 ```json
-{ "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": "high", "source": "session" }
+{ "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": "high", "source": "session" }
 ```
 
 `source` is `session` when the conversation owns a preference and
@@ -435,7 +435,7 @@ reconfigure after creating a workspace or rebooting the host.
 
 ```json
 // GET
-{ "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": null }
+{ "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": null }
 ```
 
 `PUT` accepts the same shape (`null` provider/model is an explicit blank

@@ -297,7 +297,7 @@ describe('headless CLI', () => {
       expect((await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl'))).toHaveLength(0)
     }, 30_000)
 
-    it('legacy DEEPSEEK_API_KEY alone selects deepseek-chat, so --thinking works with no store', async () => {
+    it('legacy DEEPSEEK_API_KEY alone selects deepseek-flash, so --thinking works with no store', async () => {
       dataDir = await mkdtemp(path.join(tmpdir(), 'cli-legacy-'))
       const root = fileURLToPath(new URL('../../', import.meta.url))
       const bodies: Record<string, unknown>[] = []
@@ -317,7 +317,7 @@ describe('headless CLI', () => {
         )
         expect(result.code).toBe(0)
         expect(result.stderr).not.toContain('no model selected')
-        expect(bodies[0]?.['model']).toBe('deepseek-chat')
+        expect(bodies[0]?.['model']).toBe('deepseek-flash')
         expect(bodies[0]?.['reasoning_effort']).toBe('high')
       } finally {
         await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
