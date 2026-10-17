@@ -27,7 +27,9 @@
     "node-pty"
   ],
   "scripts": {
-    "test": "vitest run",
+    "test": "node scripts/node-preflight.mjs && vitest run",
+    "preflight:node": "node scripts/node-preflight.mjs",
+    "probe:runtime": "bun scripts/runtime-probes.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
     "chat": "bun src/bins/headless.ts",

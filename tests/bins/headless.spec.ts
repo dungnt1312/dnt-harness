@@ -10,12 +10,13 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { bunExecutable } from '../helpers/runtime-executable.ts'
 
 const binPath = fileURLToPath(new URL('../../src/bins/headless.ts', import.meta.url))
 
 function runCli(args: string[], env: Record<string, string> = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('bun', [binPath, ...args], {
+    const child = spawn(bunExecutable(), [binPath, ...args], {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
       env: { ...process.env, DEEPSEEK_API_KEY: '', ...env },
     })
