@@ -93,8 +93,13 @@ function startPm2(rest) {
   // instead of silently keeping the old one.
   if (isRegistered(name)) must(runVisible('pm2', ['delete', name]))
   const script = fileURLToPath(import.meta.url)
+  // The absolute Bun binary running this launcher, not the bare name: pm2
+  // spawns its interpreter without a shell, and on Windows `bun` installed
+  // through npm is a .cmd shim that such a spawn cannot run (ENOENT, while
+  // pm2 still reports the app online).
+  const interpreter = typeof Bun !== 'undefined' ? process.execPath : 'bun'
   // pm2 keeps the invoking cwd, which web uses as the default --root.
-  must(runVisible('pm2', ['start', script, '--interpreter', 'bun', '--name', name, '--time', '--', 'web', ...others]))
+  must(runVisible('pm2', ['start', script, '--interpreter', interpreter, '--name', name, '--time', '--', 'web', ...others]))
   must(runVisible('pm2', ['save']))
   process.stdout.write(`\ndnt-harness is running under pm2 as "${name}".\n  logs:     pm2 logs ${name}\n  restart:  dnt-harness restart\n  upgrade:  dnt-harness upgrade\n  reboot:   pm2 startup   (run once, then "pm2 save")\n`)
 }

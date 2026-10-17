@@ -25,6 +25,27 @@
 const envFile = require('node:path').join(__dirname, '.env')
 if (require('node:fs').existsSync(envFile)) process.loadEnvFile(envFile)
 
+/**
+ * The Bun binary as an absolute path. pm2 spawns its interpreter without a
+ * shell, so on Windows a bare `bun` that is only an npm .cmd shim fails with
+ * ENOENT while pm2 still lists the app as online. `BUN_BIN` wins; otherwise
+ * PATH is searched for the real executable, including the binary an npm
+ * global install keeps beside its shim.
+ */
+function resolveBun() {
+  if (process.env.BUN_BIN) return process.env.BUN_BIN
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const exe = process.platform === 'win32' ? 'bun.exe' : 'bun'
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue
+    for (const candidate of [path.join(dir, exe), path.join(dir, 'node_modules', 'bun', 'bin', exe)]) {
+      if (fs.existsSync(candidate)) return candidate
+    }
+  }
+  return 'bun'
+}
+
 const port = process.env.PORT || '3082'
 const allowedHosts = (process.env.DNT_HARNESS_ALLOWED_HOSTS || '').trim()
 const oauthOrigins = (process.env.DNT_HARNESS_OAUTH_ORIGINS || '').trim()
@@ -36,7 +57,7 @@ module.exports = {
       cwd: __dirname,
       script: 'src/bins/web.ts',
       args: `--port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
-      interpreter: 'bun',
+      interpreter: resolveBun(),
       exec_mode: 'fork',
       instances: 1,
       kill_timeout: 15_000,
