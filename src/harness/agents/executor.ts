@@ -213,7 +213,7 @@ interface SessionsLike {
   readCanonicalEvents?(id: SessionId): Promise<readonly SessionEvent[] | undefined>
   has(id: SessionId): boolean
   workspaceOf(id: SessionId): WorkspaceId | undefined
-  summaries(): readonly { readonly id: SessionId }[]
+  summaries(): readonly { readonly id: SessionId; readonly parentSessionId?: string | null }[]
   delete(id: SessionId): Promise<void>
 }
 
@@ -412,46 +412,63 @@ export class ChildExecutor {
    */
   async recoverFromStorage(): Promise<number> {
     const sessions = this.sessions()
-    if (sessions === undefined) return 0
-    let recovered = 0
+    if (sessions?.readCanonicalEvents === undefined) return 0
+    // Group children by the parent link the summary already carries, then read
+    // histories one at a time — a single parent log plus a single child log —
+    // never loading them: boot recovery must not materialize every stored
+    // conversation in memory (a store with thousands of sessions would
+    // otherwise hold them all for the process lifetime). Only ids are indexed.
+    const childIdsByParent = new Map<SessionId, SessionId[]>()
     for (const summary of sessions.summaries()) {
-      const loaded = await sessions.load(summary.id).catch(() => undefined)
-      if (loaded === undefined) continue
-      const meta = childMetaOf(loaded.events)
-      if (meta === undefined) continue
-      const parentId = meta.parentSessionId as SessionId
-      const parent = sessions.has(parentId) ? await sessions.load(parentId).catch(() => undefined) : undefined
-      const problem = parent === undefined
-        ? 'its parent session is missing'
-        : sessions.workspaceOf(parentId) !== sessions.workspaceOf(summary.id)
-          ? 'its parent belongs to another workspace'
-          : !spawnCommitted(parent.events, summary.id)
-            // No parent relationship record: the spawn never reached its
-            // commit point, so this is a leftover, not a child.
-            ? 'its parent never recorded the spawn'
-            : meta.projectId !== undefined && boundProject(parent.events) !== meta.projectId
-              ? 'its parent is bound to another project'
-              : undefined
-      if (problem !== undefined) {
-        console.warn(`agents: skipped child ${summary.id}: ${problem}`)
-        continue
-      }
-      this.indexChild(parentId, summary.id)
-      recovered += 1
-      // A crash between the committed spawn and the child's settlement leaves
-      // the parent's log result-less forever, and every projection reads that
-      // as a child still running. Where the child's own log holds nothing but
-      // the interrupted recovery fact — an interrupted terminal turn, or no
-      // turn at all — the guarded repair backfills that verdict into the
-      // parent. A terminal completed/cancelled/failed child turn stays
-      // untouched: it proves the child stopped, never that the parent
-      // accepted its result, so that contract remains `uncertain`.
-      if (parent !== undefined && sessions.readCanonicalEvents !== undefined) {
-        const prior = latestChildResult(parent.events, summary.id)
-        const terminal = terminalTurnReason(loaded.events)
-        if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
-          const workspace = sessions.workspaceOf(summary.id)
-          if (workspace !== undefined) await this.reconcile(workspace, summary.id)
+      // An unrelated conversation has no parent link, so it is never read.
+      if (typeof summary.parentSessionId !== 'string') continue
+      const parentId = summary.parentSessionId as SessionId
+      const ids = childIdsByParent.get(parentId) ?? []
+      ids.push(summary.id)
+      childIdsByParent.set(parentId, ids)
+    }
+    let recovered = 0
+    for (const [parentId, childIds] of childIdsByParent) {
+      const parentEvents = sessions.has(parentId)
+        ? await sessions.readCanonicalEvents(parentId).catch(() => undefined)
+        : undefined
+      for (const childId of childIds) {
+        const childEvents = await sessions.readCanonicalEvents(childId).catch(() => undefined)
+        if (childEvents === undefined) continue
+        const meta = childMetaOf(childEvents)
+        if (meta === undefined) continue
+        const problem = parentEvents === undefined
+          ? 'its parent session is missing'
+          : sessions.workspaceOf(parentId) !== sessions.workspaceOf(childId)
+            ? 'its parent belongs to another workspace'
+            : !spawnCommitted(parentEvents, childId)
+              // No parent relationship record: the spawn never reached its
+              // commit point, so this is a leftover, not a child.
+              ? 'its parent never recorded the spawn'
+              : meta.projectId !== undefined && boundProject(parentEvents) !== meta.projectId
+                ? 'its parent is bound to another project'
+                : undefined
+        if (problem !== undefined) {
+          console.warn(`agents: skipped child ${childId}: ${problem}`)
+          continue
+        }
+        this.indexChild(parentId, childId)
+        recovered += 1
+        // A crash between the committed spawn and the child's settlement leaves
+        // the parent's log result-less forever, and every projection reads that
+        // as a child still running. Where the child's own log holds nothing but
+        // the interrupted recovery fact — an interrupted terminal turn, or no
+        // turn at all — the guarded repair backfills that verdict into the
+        // parent. A terminal completed/cancelled/failed child turn stays
+        // untouched: it proves the child stopped, never that the parent
+        // accepted its result, so that contract remains `uncertain`.
+        if (parentEvents !== undefined) {
+          const prior = latestChildResult(parentEvents, childId)
+          const terminal = terminalTurnReason(childEvents)
+          if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
+            const workspace = sessions.workspaceOf(childId)
+            if (workspace !== undefined) await this.reconcile(workspace, childId)
+          }
         }
       }
     }
