@@ -109,10 +109,10 @@ succeeds.
 ## Starting it
 
 ```sh
-dnt-harness web     # installed via `npm i -g dnt-harness`; client is prebuilt
+dnt-harness web     # installed via `bun add -g dnt-harness`; client is prebuilt
 # from a source checkout:
-npm run build:web   # build the React client into web-dist/ (one time)
-npm run web         # serve at http://127.0.0.1:3082 (default port)
+bun run build:web   # build the React client into web-dist/ (one time)
+bun run web         # serve at http://127.0.0.1:3082 (default port)
 ```
 
 The web bin (`src/bins/web.ts`) accepts:
@@ -805,9 +805,10 @@ One stream carries every terminal in a workspace: browsers cap HTTP/1.1 at
 about six connections per origin and the chat stream already holds one.
 Keystrokes POST to `/input` batched per 16 ms frame rather than per character.
 
-`node-pty` is imported lazily. Without it the routes answer `501` with the
-install hint and the rest of the product is untouched; see the README for the
-one-time npm install-script approval.
+On macOS and Linux under Bun the PTY is Bun's built-in `Bun.spawn({ terminal })`;
+node-pty's addon starts processes under Bun but never delivers their output.
+Elsewhere (Windows) `node-pty` is imported lazily. Without it the routes answer
+`501` with the install hint and the rest of the product is untouched.
 
 ## The approval bridge
 

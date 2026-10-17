@@ -3,8 +3,8 @@
  *
  *   pm2 start ecosystem.config.cjs
  *
- * Runs the web bin through tsx so the session log, tools, and SSE stream are
- * live; serve the built client first (npm run build:web).
+ * Runs the web bin with Bun so the session log, tools, and SSE stream are
+ * live; serve the built client first (bun run build:web).
  *
  * Optional environment variables (read when pm2 loads this file):
  *   PORT                    listen port (default 3082)
@@ -34,17 +34,14 @@ module.exports = {
     {
       name: 'dnt-harness',
       cwd: __dirname,
-      // Load tsx in-process (--import) instead of running the tsx CLI: the CLI
-      // spawns a child node with stdio:inherit and no windowsHide, which pops
-      // up a visible console window on Windows.
       script: 'src/bins/web.ts',
-      node_args: '--import tsx',
       args: `--port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
-      interpreter: 'node',
+      interpreter: 'bun',
       exec_mode: 'fork',
       instances: 1,
       kill_timeout: 15_000,
-      max_memory_restart: '3G',
+      // Bun holds ~20% more RSS than Node on the same data; 3G caused restart loops.
+      max_memory_restart: '4G',
       autorestart: true,
       env: {
         NODE_ENV: 'development',

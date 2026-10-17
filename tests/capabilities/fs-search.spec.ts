@@ -31,7 +31,7 @@ describe('search reliability', () => {
     await put(`${'a'.repeat(40)}.ts`)
     const module = fileURLToPath(new URL('../../src/capabilities/fs/tools.ts', import.meta.url))
     const code = `import(${JSON.stringify(module)}).then(async ({globTool}) => console.log(await globTool().execute({pattern:${JSON.stringify('*a'.repeat(18) + 'b')}},{root:${JSON.stringify(root)}})))`
-    const run = spawnSync(process.execPath, ['--import', 'tsx', '-e', code], { timeout: 2500, encoding: 'utf8' })
+    const run = spawnSync('bun', ['-e', code], { timeout: 2500, encoding: 'utf8' })
     expect(run.error?.message).toBeUndefined()
     expect(run.status).toBe(0)
     expect(run.stdout.trim()).toBe('no matches')

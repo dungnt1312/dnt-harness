@@ -1,6 +1,6 @@
-#!/usr/bin/env node
-// CLI launcher for the npm package. The harness ships as TypeScript source
-// (Node refuses to strip types inside node_modules), so run it through tsx.
+#!/usr/bin/env bun
+// CLI launcher for the npm package. The harness ships as TypeScript source,
+// which Bun runs directly.
 //
 //   dnt-harness [web] [--port 3082 --root . --yolo --auth ...]
 //   dnt-harness chat [--message "hi"]
@@ -29,7 +29,7 @@ const USAGE = `Usage: dnt-harness [web|chat|pair|start pm2|restart|upgrade] [opt
 
 const isWindows = process.platform === 'win32'
 
-// On Windows, pm2 and npm are .cmd shims. Node cannot spawn those without a
+// On Windows, pm2 is a .cmd shim, which cannot be spawned without a
 // shell, so build one command line and quote any argument that needs it.
 function quote(arg) {
   return /^[\w@%+=:,./\\-]+$/.test(arg) ? arg : `"${arg.replace(/"/g, '\\"')}"`
@@ -48,7 +48,7 @@ function runVisible(command, commandArgs) {
 
 function requirePm2() {
   if (run('pm2', ['-v'], { stdio: 'ignore' }).status === 0) return
-  process.stderr.write('dnt-harness: pm2 is not installed. Run: npm i -g pm2\n')
+  process.stderr.write('dnt-harness: pm2 is not installed. Run: bun add -g pm2\n')
   process.exit(1)
 }
 
@@ -94,7 +94,7 @@ function startPm2(rest) {
   if (isRegistered(name)) must(runVisible('pm2', ['delete', name]))
   const script = fileURLToPath(import.meta.url)
   // pm2 keeps the invoking cwd, which web uses as the default --root.
-  must(runVisible('pm2', ['start', script, '--name', name, '--time', '--', 'web', ...others]))
+  must(runVisible('pm2', ['start', script, '--interpreter', 'bun', '--name', name, '--time', '--', 'web', ...others]))
   must(runVisible('pm2', ['save']))
   process.stdout.write(`\ndnt-harness is running under pm2 as "${name}".\n  logs:     pm2 logs ${name}\n  restart:  dnt-harness restart\n  upgrade:  dnt-harness upgrade\n  reboot:   pm2 startup   (run once, then "pm2 save")\n`)
 }
@@ -113,7 +113,7 @@ function restartPm2(rest) {
 function upgrade(rest) {
   const { name } = takeName(rest)
   const current = installedVersion()
-  const view = run('npm', ['view', 'dnt-harness', 'version'], { encoding: 'utf8' })
+  const view = run('bun', ['info', 'dnt-harness', 'version'], { encoding: 'utf8' })
   const latest = view.status === 0 ? String(view.stdout).trim() : ''
   if (latest === '') {
     process.stderr.write('dnt-harness: could not read the latest version from npm.\n')
@@ -129,14 +129,14 @@ function upgrade(rest) {
   // Stop first: on Windows a running process keeps its files locked, which
   // breaks the replacement of native modules such as node-pty.
   if (managed) must(runVisible('pm2', ['stop', name]))
-  const installed = runVisible('npm', ['i', '-g', `dnt-harness@${latest}`])
+  const installed = runVisible('bun', ['add', '-g', `dnt-harness@${latest}`])
   // Bring the server back even when the install failed, so it is never left down.
   if (managed) {
     must(runVisible('pm2', ['restart', name, '--update-env']))
     must(runVisible('pm2', ['save']))
   }
   if (installed !== 0) {
-    process.stderr.write('dnt-harness: npm install failed; the previous version is still in place.\n')
+    process.stderr.write('dnt-harness: bun install failed; the previous version is still in place.\n')
     process.exit(installed)
   }
   process.stdout.write(managed
@@ -157,7 +157,5 @@ if (args[0] === 'start' && args[1] === 'pm2') {
 } else {
   const command = args[0] !== undefined && Object.hasOwn(entries, args[0]) ? args.shift() : 'web'
   process.argv.splice(2, process.argv.length, ...args)
-  const { register } = await import('tsx/esm/api')
-  register()
   await import(new URL(`../src/bins/${entries[command]}`, import.meta.url).href)
 }

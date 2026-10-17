@@ -14,8 +14,8 @@
  * any other durable fact.
  *
  * Usage:
- *   tsx src/bins/headless.ts --message "hello"
- *   tsx src/bins/headless.ts            # interactive REPL, 'exit' quits
+ *   bun src/bins/headless.ts --message "hello"
+ *   bun src/bins/headless.ts            # interactive REPL, 'exit' quits
  */
 import { createInterface } from 'node:readline/promises'
 import path from 'node:path'

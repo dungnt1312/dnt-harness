@@ -143,7 +143,7 @@ neither skill text nor instructions can enable an unavailable tool.
 - [Prompt contract](prompt-contract.md): context order, trust, budget and overrides.
 - [Claude format](claude-format.md): instructions, imports, hooks and agent layers.
 - [Guides](guides.md): setup, configuration, plugin authoring and testing.
-- Run `pnpm test`, `pnpm run typecheck`, and `pnpm run build:web` as relevant.
+- Run `bun run test`, `bun run typecheck`, and `bun run build:web` as relevant.
   Start with affected tests, then run the full test suite for behavior changes.
 - Keep runtime guidance short. Full docs stay on disk; skill bodies load on demand.
   Test that new guidance reaches root/child context and does not widen permissions.

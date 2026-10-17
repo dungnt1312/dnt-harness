@@ -6,40 +6,41 @@ plugin, and testing.
 ## Installing the package
 
 ```sh
-npm i -g dnt-harness
+bun add -g dnt-harness
 dnt-harness                       # = dnt-harness web, http://127.0.0.1:3082
 dnt-harness web --port 4000 --yolo
 dnt-harness chat --message "hello"
 dnt-harness pair                  # new pairing code for a running --auth server
 dnt-harness start pm2 --port 3082 # run the web server under pm2
 dnt-harness restart               # restart it, same flags
-dnt-harness upgrade               # npm i -g the latest, then restart
+dnt-harness upgrade               # bun add -g the latest, then restart
 ```
 
 `dnt-harness upgrade [--name N]` compares the installed version with
-`npm view dnt-harness version` and does nothing when it is not newer. Otherwise
+`bun info dnt-harness version` and does nothing when it is not newer. Otherwise
 it stops the pm2 process (Windows locks files of a running process), runs
-`npm i -g dnt-harness@<latest>`, and restarts the process even if the install
+`bun add -g dnt-harness@<latest>`, and restarts the process even if the install
 failed, so the server is never left down. Without a pm2 process it only
 upgrades the package. `dnt-harness --version` prints the installed version.
 
-On Windows `pm2` and `npm` are `.cmd` shims, so the launcher runs them through
+On Windows `pm2` is a `.cmd` shim, so the launcher runs it through
 a shell with quoted arguments; the same commands work on macOS and Linux.
 
 `dnt-harness start pm2 [--name N] [web flags]` requires `pm2` on PATH (it prints
-`npm i -g pm2` otherwise). It deletes any pm2 process with the same name, starts
-`bin/dnt-harness.mjs web <flags>` with `--time` log stamps, and runs `pm2 save`.
+`bun add -g pm2` otherwise). It deletes any pm2 process with the same name, starts
+`bin/dnt-harness.mjs web <flags>` with `--interpreter bun` and `--time` log
+stamps, and runs `pm2 save`.
 The process keeps the cwd you ran the command in, which becomes the default
 `--root`. Use `pm2 logs|stop|restart <name>` afterwards, and `pm2 startup` once
 for start on boot. This is separate from the repo's `ecosystem.config.cjs`, which
 is for running from a source checkout.
 
-The `dnt-harness` bin is `bin/dnt-harness.mjs`. It registers `tsx` and imports
-`src/bins/{web,headless,pair}.ts`, because Node does not strip types for files
-inside `node_modules`. The published tarball (`files` in `package.json`) holds
+The `dnt-harness` bin is `bin/dnt-harness.mjs` (shebang `bun`). It imports
+`src/bins/{web,headless,pair}.ts`, which Bun runs as TypeScript directly.
+The published tarball (`files` in `package.json`) holds
 `bin`, `src`, `web-dist`, `skills`, `commands` and `README.md`; `prepack` runs
 `vite build`, so `web-dist/` is always fresh. Flags and behavior match the
-`npm run web` / `npm run chat` / `npm run pair` scripts below.
+`bun run web` / `bun run chat` / `bun run pair` scripts below.
 
 Releasing: `npm version <patch|minor>`, then `npm publish` (needs npm login and
 2FA/OTP). Check the contents first with `npm pack --dry-run`.
@@ -47,13 +48,13 @@ Releasing: `npm version <patch|minor>`, then `npm publish` (needs npm login and
 ## Getting started (from source)
 
 ```sh
-npm install        # install dependencies (Node >= 22.19.0)
-npm test           # vitest run
-npm run typecheck  # tsc --noEmit for both tsconfig.json and tsconfig.web.json
+bun install        # install dependencies (Bun >= 1.3)
+bun run test       # vitest run (not `bun test`, Bun's own runner)
+bun run typecheck  # tsc --noEmit for both tsconfig.json and tsconfig.web.json
 ```
 
-`npm test` runs the whole vitest suite (kernel, harness, capabilities, web, and a
-spawned-CLI smoke test). `npm run typecheck` covers the Node side (`src`,
+`bun run test` runs the whole vitest suite (kernel, harness, capabilities, web, and a
+spawned-CLI smoke test). `bun run typecheck` covers the server side (`src`,
 `tests`) and the browser side (`web`, `vite.config.ts`).
 
 ## Configuration
@@ -79,13 +80,13 @@ echo 'DEEPSEEK_API_KEY=sk-...' > .env   # optional; never commit this file
 
 ## The headless CLI
 
-`npm run chat` runs a REPL. With `DEEPSEEK_API_KEY` it registers DeepSeek;
+`bun run chat` runs a REPL. With `DEEPSEEK_API_KEY` it registers DeepSeek;
 without a key it still starts, and a model call fails because no provider is
 registered.
 
 ```sh
-npm run chat                                          # interactive REPL; 'exit' / 'quit' quits
-npx tsx src/bins/headless.ts --message "hello"        # one-shot
+bun run chat                                          # interactive REPL; 'exit' / 'quit' quits
+bun src/bins/headless.ts --message "hello"            # one-shot
 ```
 
 Flags for `src/bins/headless.ts`:
@@ -105,8 +106,8 @@ stream to stdout as `session/event` frames arrive.
 ## The web CLI
 
 ```sh
-npm run build:web   # one-time: build the React client into web-dist/
-npm run web         # serve at http://127.0.0.1:3082
+bun run build:web   # one-time: build the React client into web-dist/
+bun run web         # serve at http://127.0.0.1:3082
 ```
 
 See [web.md](web.md) for flags and the full API.
@@ -173,7 +174,7 @@ export function apply(ctx: Context): void {
 
 ## MCP production migration
 
-`npx tsx src/bins/migrate-mcp.ts --data-dir <home> --workspace <id>` prints a dry run and does not spawn a server or open a network connection. Add `--apply` to write a checksummed backup and a v2 document. Omitted `enabled` is quarantined off. A legacy `oauth` block becomes an external token, not a managed session. The web bin refuses to start when `mcp-compatibility.json` asks for a newer safety kernel than this binary has. Protocol pin, outcomes, and the route inventory are in `docs/decisions/mcp-production-boundaries.md`.
+`bun src/bins/migrate-mcp.ts --data-dir <home> --workspace <id>` prints a dry run and does not spawn a server or open a network connection. Add `--apply` to write a checksummed backup and a v2 document. Omitted `enabled` is quarantined off. A legacy `oauth` block becomes an external token, not a managed session. The web bin refuses to start when `mcp-compatibility.json` asks for a newer safety kernel than this binary has. Protocol pin, outcomes, and the route inventory are in `docs/decisions/mcp-production-boundaries.md`.
 
 ### Composing from a YAML file
 
@@ -236,20 +237,20 @@ tests/
 ### Useful commands
 
 ```sh
-npm test                 # run once
-npm run test:watch       # watch mode
-npx vitest run tests/kernel   # a subset
+bun run test             # run once
+bun run test:watch       # watch mode
+bunx vitest run tests/kernel  # a subset
 ```
 
 ### Running an integration check end-to-end
 
 ```sh
-npx tsx src/bins/headless.ts --message "hello"
+bun src/bins/headless.ts --message "hello"
 ```
 
 …or the real thing:
 
 ```sh
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
-npm run chat
+bun run chat
 ```

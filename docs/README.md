@@ -30,14 +30,14 @@ This documentation is organized so each layer can be read independently:
 ## Quick reference
 
 ```sh
-pnpm install        # install dependencies
-pnpm test           # run the vitest suite
-pnpm run typecheck  # typecheck server (tsconfig.json) + web (tsconfig.web.json)
+bun install         # install dependencies
+bun run test        # run the vitest suite (not `bun test`, Bun's own runner)
+bun run typecheck   # typecheck server (tsconfig.json) + web (tsconfig.web.json)
 
-pnpm run chat       # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
+bun run chat        # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
 
-pnpm run build:web  # build the React client into web-dist/
-pnpm run web        # serve the web UI (default port 3082)
+bun run build:web   # build the React client into web-dist/
+bun run web         # serve the web UI (default port 3082)
 ```
 
 ## Where things live

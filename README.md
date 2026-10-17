@@ -35,7 +35,7 @@ Full docs live in [`docs/`](docs/README.md):
 ## Install
 
 ```sh
-npm i -g dnt-harness     # Node >= 22.19.0
+bun add -g dnt-harness   # Bun >= 1.3
 dnt-harness              # web UI at http://127.0.0.1:3082
 ```
 
@@ -47,7 +47,7 @@ to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
 | `dnt-harness [web] [--port N --root DIR --yolo --auth --allowed-host H --oauth-origin https://H --data-dir DIR]` | serve the web UI (default) |
 | `dnt-harness chat [--message "hi"]` | headless REPL or one-shot |
 | `dnt-harness pair [--data-dir DIR]` | mint a pairing code for a running `--auth` server |
-| `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `npm i -g pm2`) |
+| `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `bun add -g pm2`) |
 | `dnt-harness restart [--name N]` | restart the pm2 process, keeping the flags it was started with |
 | `dnt-harness upgrade [--name N]` | install the latest version from npm, then restart the pm2 process |
 
@@ -58,28 +58,22 @@ the folder you ran it from as the default `--root`. For start on boot, run
 
 Sessions and provider config live in `~/.dnt-harness/`. Add a provider in
 Settings, or set `DEEPSEEK_API_KEY` in the environment before the first start.
-The package ships TypeScript source and runs it through `tsx`; the web client
-is prebuilt, so no build step is needed after installing.
+The package ships TypeScript source and runs it with Bun directly; the web
+client is prebuilt, so no build step is needed after installing.
 
 ## Getting started (from source)
 
 ```sh
-npm install
-npm test         # vitest run
-npm run typecheck
+bun install
+bun run test     # vitest run (not `bun test`, Bun's own runner)
+bun run typecheck
 ```
 
-The Workbench terminal needs `node-pty`, which places a prebuilt binary (and
-on Windows a bundled ConPTY DLL) from its install script. `pnpm-workspace.yaml`
-already allows that build; with npm 11 or newer the script is blocked by
-default and the terminal then reports itself unavailable, so approve it once:
-
-```sh
-npm install-scripts approve node-pty
-```
-
-Everything else runs normally without it — a missing PTY backend disables the
-terminal and nothing else.
+The Workbench terminal uses Bun's built-in PTY on macOS and Linux. On Windows
+it needs `node-pty`, which places a prebuilt binary and a bundled ConPTY DLL
+from its install script; `trustedDependencies` in `package.json` allows that
+script. Everything else runs normally without it — a missing PTY backend
+disables the terminal and nothing else.
 
 ## Configuration
 
@@ -105,15 +99,15 @@ The project was called **mini-dsh**. Existing installs keep working without chan
 ## Chat
 
 ```sh
-npm run chat           # REPL; registers DeepSeek only when the key is set
-npx tsx src/bins/headless.ts --message "hello"   # one-shot
+bun run chat           # REPL; registers DeepSeek only when the key is set
+bun src/bins/headless.ts --message "hello"   # one-shot
 ```
 
 ## Web
 
 ```sh
-npm run build:web      # build the React client into web-dist/
-npm run web            # serve it at http://127.0.0.1:3082 (--yolo, --root, --port)
+bun run build:web      # build the React client into web-dist/
+bun run web            # serve it at http://127.0.0.1:3082 (--yolo, --root, --port)
 ```
 
 The toolbar switches the active model (`PUT /api/model`, offered names come

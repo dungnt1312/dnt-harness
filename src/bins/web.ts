@@ -7,8 +7,8 @@
  * `<homedir>/.dnt-harness/data`) and reopen on restart.
  * Serve the built client first:
  *
- *   npm run build:web
- *   npm run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>
+ *   bun run build:web
+ *   bun run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>
  *                  --oauth-origin <https://host[,https://host2]>]
  *
  * `--oauth-origin` states the https origin the app is reached at, so MCP OAuth
