@@ -12,7 +12,8 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 import type { TokenEndpointAuth } from './config.ts'
-import { assertOutboundUrl, OutboundPolicyError, dispatcherFor, isLoopbackUrl } from './outbound-policy.ts'
+import { BodyTooLargeError, defaultOutboundHttp, discardBody, readBoundedBytes, type OutboundHttp, type OutboundResponse } from './outbound-http.ts'
+import { assertOutboundUrl, OutboundPolicyError, isLoopbackUrl } from './outbound-policy.ts'
 import { OAuthStore, type OAuthTokens, type OAuthServerRecord } from './oauth-store.ts'
 
 /** Resolves a confidential client's secret for one server, at the moment it is needed. */
@@ -25,6 +26,8 @@ interface ClientAuth {
 }
 
 const SKEW_MS = 30_000
+/** Token responses are small JSON; anything larger is refused unread. */
+const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
 
 // Shared by managers using the same store. Network refresh locks are separate
 // from short disk-write queues so revocation never waits for the endpoint.
@@ -88,7 +91,7 @@ export class OAuthTemporaryError extends OAuthFlowError {
 export class ManagedOAuth {
   constructor(
     private readonly store: OAuthStore,
-    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly http: OutboundHttp = defaultOutboundHttp(),
     private readonly now: () => number = () => Date.now(),
     private readonly secretFor: ClientSecretSource = async () => undefined,
     private readonly currentConfig?: (workspaceId: string, server: string) => Promise<string | undefined>,
@@ -358,15 +361,14 @@ export class ManagedOAuth {
       assertOauthUrl(revocationEndpoint, current.resource)
       const client = await this.clientAuth(workspaceId, server, current.clientId, current.tokenEndpointAuth)
       const { headers, body } = authenticated(new URLSearchParams({ token: current.accessToken }), client)
-      const response = await this.fetchImpl(revocationEndpoint, {
+      const response = await this.http.request(revocationEndpoint, {
         method: 'POST',
-        redirect: 'manual',
         headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
         body,
-        signal: AbortSignal.timeout(15_000),
-        ...(this.fetchImpl === fetch ? { dispatcher: dispatcherFor(new URL(revocationEndpoint)) } : {}),
+        timeoutMs: 15_000,
+        allowLoopback: isLoopbackUrl(new URL(current.resource)),
       })
-      await response.body?.cancel().catch(() => undefined)
+      await discardBody(response)
       return { local: 'revoked', remote: response.ok ? 'succeeded' : 'failed' }
     } catch {
       return { local: 'revoked', remote: 'failed' }
@@ -376,26 +378,46 @@ export class ManagedOAuth {
   private async exchange(endpoint: string, grant: URLSearchParams, client: ClientAuth, resource: string): Promise<OAuthTokens> {
     assertOauthUrl(endpoint, resource)
     const { headers, body } = authenticated(grant, client)
-    let response: Response
+    let response: OutboundResponse
     try {
-      response = await this.fetchImpl(endpoint, {
+      response = await this.http.request(endpoint, {
         method: 'POST',
-        redirect: 'manual',
         headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', ...headers },
         body,
-        signal: AbortSignal.timeout(15_000),
-        ...(this.fetchImpl === fetch ? { dispatcher: dispatcherFor(new URL(endpoint)) } : {}),
+        timeoutMs: 15_000,
+        allowLoopback: isLoopbackUrl(new URL(resource)),
       })
     } catch (error) {
+      if (error instanceof OutboundPolicyError) throw new OAuthFlowError(error.message)
       throw new OAuthTemporaryError(`token endpoint temporarily unreachable: ${error instanceof Error ? error.message : String(error)}`)
     }
-    if (response.status >= 300 && response.status < 400) throw new OAuthFlowError('token endpoint redirected')
+    if (response.status >= 300 && response.status < 400) {
+      await discardBody(response)
+      throw new OAuthFlowError('token endpoint redirected')
+    }
     if (response.status >= 500 || response.status === 429) {
-      await response.body?.cancel().catch(() => undefined)
+      await discardBody(response)
       throw new OAuthTemporaryError(`token endpoint temporarily unavailable (HTTP ${response.status})`)
     }
-    if (!response.ok) throw new OAuthFlowError('token endpoint rejected the exchange')
-    const parsed = await response.json() as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; token_type?: unknown }
+    if (!response.ok) {
+      await discardBody(response)
+      throw new OAuthFlowError('token endpoint rejected the exchange')
+    }
+    let text: string
+    try {
+      text = (await readBoundedBytes(response, MAX_TOKEN_RESPONSE_BYTES)).toString('utf8')
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) throw new OAuthFlowError('token response is too large')
+      // The grant may well be fine: a timeout or a dropped body after 200 says nothing about it.
+      throw new OAuthTemporaryError(`token response could not be read: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    let parsed: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; token_type?: unknown }
+    try {
+      parsed = JSON.parse(text) as typeof parsed
+    } catch {
+      throw new OAuthFlowError('token response is not JSON')
+    }
+    if (parsed === null || typeof parsed !== 'object') throw new OAuthFlowError('token response is not a JSON object')
     if (typeof parsed.access_token !== 'string' || parsed.access_token === '') throw new OAuthFlowError('token response has no access token')
     if (parsed.token_type !== undefined && String(parsed.token_type).toLowerCase() !== 'bearer') {
       throw new OAuthFlowError('token response is not a bearer token')

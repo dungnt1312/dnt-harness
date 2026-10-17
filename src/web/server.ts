@@ -855,7 +855,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const oauthStore = new OAuthStore(path.join(resourceHome, 'oauth'), oauthKey)
   // A confidential client's secret is resolved from the workspace secrets at
   // each exchange; it never sits beside the tokens.
-  const oauth = new ManagedOAuth(oauthStore, fetch, () => Date.now(), async (workspaceId, serverName) => {
+  // OAuth network calls go through the shared policy transport (outbound-http.ts).
+  const oauth = new ManagedOAuth(oauthStore, undefined, () => Date.now(), async (workspaceId, serverName) => {
     const config = await mcpStore.loadMcp(workspaceId)
     const ref = managedAuthOf(config.servers[serverName])?.clientSecret
     if (ref === undefined) return undefined

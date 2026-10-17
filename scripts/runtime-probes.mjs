@@ -7,7 +7,7 @@ import { lookup } from 'node:dns/promises'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const REQUIRED_BUN = '1.4.3'
 const results = []
@@ -67,6 +67,14 @@ try {
   record("bare 'undici' is Bun's shim (dispatcher bypassed)", !bareResult.honored, bareResult.reason)
 } finally {
   server.close()
+}
+
+// RH-1: the production outbound transport, imported without Vitest.
+{
+  const probe = spawnSync(process.execPath, [fileURLToPath(new URL('./outbound-http-probe.mjs', import.meta.url))], { encoding: 'utf8', timeout: 60_000 })
+  const output = `${probe.stdout ?? ''}${probe.stderr ?? ''}`.trim()
+  for (const line of output.split('\n')) console.log(`  ${line}`)
+  record('outbound-http production probe (RH-1)', probe.status === 0, probe.status === 0 ? 'see indented output' : `exit ${probe.status}`)
 }
 
 try {

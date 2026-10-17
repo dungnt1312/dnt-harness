@@ -6,6 +6,7 @@ import { editImageTool, fetchMedia, generateImageTool, parseImageResponse, shoul
 import { resolveInGrants } from '../../src/capabilities/fs/grants.ts'
 import type { AttachmentRef } from '../../src/harness/attachments/store.ts'
 import type { ToolExecution } from '../../src/harness/tools/types.ts'
+import { senderHttp } from '../support/outbound-sender.ts'
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('pixels')])
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10])
@@ -18,6 +19,8 @@ function options(overrides: { readonly resolve?: () => ImageApiResolution; reado
   const value: ImageToolOptions = {
     resolve: overrides.resolve ?? (() => CONFIGURED),
     fetch: overrides.fetch,
+    // Foreign media hops go through the policy envelope; only the final send is the mock.
+    outboundHttp: senderHttp((url, init) => overrides.fetch(url, init)),
     ...(overrides.maxBytes !== undefined ? { maxBytes: overrides.maxBytes } : {}),
     store: async (workspaceId, input): Promise<AttachmentRef> => {
       stored.push({ workspaceId, bytes: input.bytes })
@@ -46,17 +49,47 @@ const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
 describe('GenerateImage tool', () => {
-  it('pins foreign global-fetch downloads and bounds redirect loops', async () => {
+  it('pins foreign downloads to the policy dispatcher and bounds redirect loops', async () => {
+    const gateway = vi.fn(async () => new Response('gateway must not be used for a foreign url', { status: 500 }))
     const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit & { dispatcher?: unknown }) => {
       expect(init?.dispatcher).toBeDefined()
       expect(init?.redirect).toBe('manual')
       return new Response(null, { status: 302, headers: { location: '/again' } })
     })
-    vi.stubGlobal('fetch', fetchMock)
-    try {
-      await expect(fetchMedia('https://cdn.test/image', 'https://img.test', fetch, AbortSignal.timeout(1000))).rejects.toThrow(/too many media redirects/)
-      expect(fetchMock).toHaveBeenCalledTimes(6)
-    } finally { vi.unstubAllGlobals() }
+    const http = senderHttp((url, init) => fetchMock(url, init))
+    await expect(fetchMedia('https://cdn.test/image', 'https://img.test', { gateway: gateway as unknown as typeof fetch, http }, AbortSignal.timeout(1000))).rejects.toThrow(/too many media redirects/)
+    expect(fetchMock).toHaveBeenCalledTimes(6)
+    expect(gateway).not.toHaveBeenCalled()
+  })
+
+  it('keeps the configured-origin exception only while the chain never left it', async () => {
+    const sent: { url: string; via: 'gateway' | 'policy'; authorization: string | null }[] = []
+    const gateway = (async (input: string, init?: RequestInit) => {
+      sent.push({ url: input, via: 'gateway', authorization: new Headers(init?.headers).get('authorization') })
+      return new Response(null, { status: 302, headers: { location: 'https://cdn.test/hop' } })
+    }) as unknown as typeof fetch
+    const http = senderHttp(async (url, init) => {
+      sent.push({ url, via: 'policy', authorization: new Headers(init.headers).get('authorization') })
+      // A foreign hop sends the chain back to the configured (private) origin.
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8317/v1/files/x.png' } })
+    })
+    const credentials = (url: URL) => url.origin === 'http://127.0.0.1:8317' ? { authorization: 'Bearer sk-local' } : {}
+    const error = await fetchMedia('http://127.0.0.1:8317/v1/files/start.png', 'http://127.0.0.1:8317/v1', { gateway, http }, AbortSignal.timeout(1000), credentials).catch((cause: unknown) => cause)
+    expect(String(error)).toMatch(/refusing media url .*127\.0\.0\.1/)
+    // Initial same-origin hop used the gateway with credentials; the foreign hop got none; the return to the private origin was never sent.
+    expect(sent).toEqual([
+      { url: 'http://127.0.0.1:8317/v1/files/start.png', via: 'gateway', authorization: 'Bearer sk-local' },
+      { url: 'https://cdn.test/hop', via: 'policy', authorization: null },
+    ])
+  })
+
+  it('refuses a foreign initial url that points at the configured private origin host', async () => {
+    const gateway = vi.fn()
+    const http = senderHttp(vi.fn())
+    // Same host, different origin (port): not the configured origin, so public-only policy applies.
+    await expect(fetchMedia('http://127.0.0.1:9999/x.png', 'http://127.0.0.1:8317/v1', { gateway: gateway as unknown as typeof fetch, http }, AbortSignal.timeout(1000)))
+      .rejects.toThrow(/refusing media url/)
+    expect(gateway).not.toHaveBeenCalled()
   })
   it('posts an OpenAI images request and stores the decoded b64 bytes in the workspace', async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ created: 1, data: [{ b64_json: PNG.toString('base64'), revised_prompt: 'a fluffy cat' }] }))

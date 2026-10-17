@@ -14,7 +14,8 @@ import { McpDispatchError, receiptForTransportFailure } from './boundaries.ts'
 import type { McpServerConfig } from './config.ts'
 import { MCP_LIMITS } from './limits.ts'
 import { parseBearerChallenge } from './oauth-discovery.ts'
-import { assertOutboundUrl, operatorHeaders, dispatcherFor } from './outbound-policy.ts'
+import { defaultOutboundHttp, discardBody, OutboundTransportUnavailableError, type OutboundHttp, type OutboundResponse } from './outbound-http.ts'
+import { assertOutboundUrl, operatorHeaders, OutboundPolicyError } from './outbound-policy.ts'
 import { assertHardContainmentAvailable, minimalStdioEnv, resolveCanonicalExecutable } from './process-controller.ts'
 import { assertInitializeResult, assertCursor, assertSessionId, vettedTool } from './protocol.ts'
 import { SseParser } from './sse-parser.ts'
@@ -462,6 +463,7 @@ class HttpTransport implements Transport {
     private readonly tokens: BearerTokenSource,
     private readonly events: TransportEvents = {},
     private readonly onToken: (token: string) => void = () => {},
+    private readonly http: OutboundHttp = defaultOutboundHttp(),
   ) {}
 
   async start(): Promise<void> {
@@ -523,7 +525,7 @@ class HttpTransport implements Transport {
     await response.body?.cancel().catch(() => {})
   }
 
-  private async post(body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal, onDispatch?: (token: string | undefined) => void, credentials?: { readonly token: string | undefined }): Promise<Response> {
+  private async post(body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal, onDispatch?: (token: string | undefined) => void, credentials?: { readonly token: string | undefined }): Promise<OutboundResponse> {
     if (this.config.url === undefined) throw new McpTransportError('http transport requires a url')
     const target = assertOutboundUrl(this.config.url, { allowLoopbackHttp: true })
     // One deadline covers the token and the request: a token source that never
@@ -545,24 +547,34 @@ class HttpTransport implements Transport {
     this.lastToken = token
     if (token !== undefined) this.onToken(token)
     const sessionAtSend = this.sessionId
-    const pendingResponse = fetch(target, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: {
-        ...operatorHeaders(this.config.headers),
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream',
-        origin: target.origin,
-        ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
-        ...(sessionAtSend !== undefined ? { 'mcp-session-id': sessionAtSend } : {}),
-        ...(this.protocolVersion !== undefined ? { 'mcp-protocol-version': this.protocolVersion } : {}),
-      },
-      body: JSON.stringify(body),
-      signal: deadline,
-      dispatcher: dispatcherFor(target),
-    } as RequestInit)
-    onDispatch?.(token)
-    const response = await pendingResponse
+    let response: OutboundResponse
+    try {
+      // The deadline signal stays on the body: the SSE/JSON read below is
+      // bounded by the same timeout and caller abort as the headers.
+      response = await this.http.request(target, {
+        method: 'POST',
+        allowLoopback: true,
+        headers: {
+          ...operatorHeaders(this.config.headers),
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          origin: target.origin,
+          ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
+          ...(sessionAtSend !== undefined ? { 'mcp-session-id': sessionAtSend } : {}),
+          ...(this.protocolVersion !== undefined ? { 'mcp-protocol-version': this.protocolVersion } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: deadline,
+        onSend: () => onDispatch?.(token),
+      })
+    } catch (error) {
+      // Policy refusal (literal or at connect time) and a missing real
+      // transport are decided before any byte reaches the server.
+      if (error instanceof OutboundPolicyError || error instanceof OutboundTransportUnavailableError) {
+        throw new McpDispatchError(error.message, receiptForTransportFailure(false, 'local_policy_denied'))
+      }
+      throw error
+    }
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel().catch(() => {})
       throw new McpDispatchError('HTTP redirect was not followed', receiptForTransportFailure(true, 'redirect_followed'))
@@ -597,7 +609,12 @@ class HttpTransport implements Transport {
     }
     const sessionHeader = response.headers.get('mcp-session-id')
     if (sessionHeader !== null) {
-      assertSessionId(sessionHeader)
+      try {
+        assertSessionId(sessionHeader)
+      } catch (error) {
+        await discardBody(response)
+        throw error
+      }
       this.sessionId = sessionHeader
     }
     if (!response.ok) {
@@ -608,7 +625,7 @@ class HttpTransport implements Transport {
   }
 
   /** Incremental SSE event parser: no full-response buffering; matches request id. */
-  private async readSseResult(response: Response, requestId: number): Promise<unknown> {
+  private async readSseResult(response: OutboundResponse, requestId: number): Promise<unknown> {
     if (response.body === null) throw new McpTransportError('SSE response has no body')
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
@@ -644,18 +661,19 @@ class HttpTransport implements Transport {
     this.abort.abort()
     // Terminate the server-side Streamable HTTP session when one exists.
     if (this.config.url !== undefined && this.sessionId !== undefined) {
-      await fetch(assertOutboundUrl(this.config.url, { allowLoopbackHttp: true }), {
+      const response = await this.http.request(this.config.url, {
         method: 'DELETE',
-        redirect: 'manual',
+        allowLoopback: true,
         headers: {
           origin: new URL(this.config.url).origin,
           'mcp-session-id': this.sessionId,
           ...(this.protocolVersion !== undefined ? { 'mcp-protocol-version': this.protocolVersion } : {}),
           ...(this.lastToken !== undefined ? { authorization: `Bearer ${this.lastToken}` } : {}),
         },
-        signal: AbortSignal.timeout(5_000),
-        dispatcher: dispatcherFor(new URL(this.config.url)),
-      } as RequestInit).catch(() => undefined)
+        timeoutMs: 5_000,
+      }).catch(() => undefined)
+      // Redirects and errors alike: nothing to read, release the socket.
+      if (response !== undefined) await discardBody(response)
     }
     this.sessionId = undefined
   }
@@ -687,7 +705,7 @@ function untilAborted<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T
  * decompresses gzip/deflate/br transparently, so counting after decoding is
  * what bounds a small compressed body that inflates to gigabytes.
  */
-async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+async function readBoundedText(response: OutboundResponse, maxBytes: number): Promise<string> {
   if (response.body === null) return ''
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
@@ -766,7 +784,13 @@ export class McpServerClient {
       readonly onInsufficientScope?: ((scope: string | undefined) => Promise<void> | void) | undefined
     },
     private readonly onAudit: (event: { readonly kind: 'call' | 'breaker' | 'reconnect'; readonly detail: string; readonly durationMs: number; readonly isError: boolean }) => void,
-    private readonly runtime: { readonly breakerDurationMs?: number; readonly healthIntervalMs?: number; readonly reconnectJitterMs?: number } = {},
+    private readonly runtime: {
+      readonly breakerDurationMs?: number
+      readonly healthIntervalMs?: number
+      readonly reconnectJitterMs?: number
+      /** The policy transport for HTTP servers; tests inject one with a low-level sender. */
+      readonly outboundHttp?: OutboundHttp
+    } = {},
   ) {}
 
   /** Whether the breaker currently allows a call. */
@@ -1049,7 +1073,7 @@ export class McpServerClient {
             ...((this.resolved.headers ?? this.config.headers) !== undefined
               ? { headers: this.resolved.headers ?? this.config.headers }
               : {}),
-          }, tokens, events, (token) => { this.usedTokens.add(token) })
+          }, tokens, events, (token) => { this.usedTokens.add(token) }, this.runtime.outboundHttp ?? defaultOutboundHttp())
     // A failed or dead transport is replaced, never abandoned: its process
     // (and watchdog timers) would otherwise outlive the reference to it.
     const previous = this.transport

@@ -1,4 +1,5 @@
 import type { VideoRef } from '../attachments/video-store.ts'
+import { defaultOutboundHttp, discardBody, type OutboundHttp, type OutboundResponse } from '../mcp/outbound-http.ts'
 import { fetchMedia, loadImageSource, type ImageToolOptions } from './image-tools.ts'
 import type { ToolDefinition, ToolExecution } from './types.ts'
 
@@ -39,8 +40,10 @@ export interface GenerateVideoOptions extends Pick<ImageToolOptions, 'read' | 'r
   readonly timeoutMs?: number
   /** Per-request budget for create/poll calls. */
   readonly requestTimeoutMs?: number
-  /** Test seam. */
+  /** Test seam: the configured provider endpoint's fetch (not used for foreign media hops). */
   readonly fetch?: typeof fetch
+  /** Test seam: the policy transport for foreign download hops (inject a low-level sender into it). */
+  readonly outboundHttp?: OutboundHttp
   /** Test seam: resolves after `ms`, rejects with the signal's reason when aborted. */
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }
@@ -122,6 +125,7 @@ function sleepDefault(ms: number, signal: AbortSignal): Promise<void> {
 
 export function generateVideoTool(options: GenerateVideoOptions): ToolDefinition {
   const doFetch = options.fetch ?? fetch
+  const media = { gateway: doFetch, http: options.outboundHttp ?? defaultOutboundHttp() }
   const sleep = options.sleep ?? sleepDefault
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -219,14 +223,17 @@ export function generateVideoTool(options: GenerateVideoOptions): ToolDefinition
       const target = final.videoUrl !== null && /^https?:\/\//i.test(final.videoUrl) ? final.videoUrl : `${base}/videos/${encodeURIComponent(requestId)}/content`
       // Credentials go only under the configured endpoint: same origin AND inside its path
       // (a bare string prefix let `https://vid.test.evil.tld` match `https://vid.test`).
-      let download: Response
+      let download: OutboundResponse
       try {
-        download = await fetchMedia(target, base, doFetch, signal, (url) =>
+        download = await fetchMedia(target, base, media, signal, (url) =>
           url.origin === new URL(base).origin && url.pathname.startsWith(new URL(`${base}/`).pathname) ? headers(false) : {})
       } catch (error) {
         throw new Error(`download video failed: ${message(error)}; request_id=${requestId}`)
       }
-      if (!download.ok) throw new Error(`download video HTTP ${download.status}; request_id=${requestId}`)
+      if (!download.ok) {
+        await discardBody(download)
+        throw new Error(`download video HTTP ${download.status}; request_id=${requestId}`)
+      }
       if (download.body === null) throw new Error(`download video: empty body; request_id=${requestId}`)
       const stored = await options.store(workspaceId, download.body, signal)
 

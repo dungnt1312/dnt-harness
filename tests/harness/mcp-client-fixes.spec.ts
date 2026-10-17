@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { McpServerClient, MCP_PROTOCOL_VERSION } from '../../src/harness/mcp/client.ts'
-import { assertOutboundUrl, outboundDispatcher } from '../../src/harness/mcp/outbound-policy.ts'
+import { assertOutboundUrl } from '../../src/harness/mcp/outbound-policy.ts'
+import { defaultOutboundHttp } from '../../src/harness/mcp/outbound-http.ts'
+import { senderHttp, type SentInit } from '../support/outbound-sender.ts'
 import { MCP_LIMITS } from '../../src/harness/mcp/limits.ts'
 import { fileURLToPath } from 'node:url'
 
@@ -9,13 +11,18 @@ afterEach(async () => {
   for (const client of clients.splice(0)) await client.disconnect()
   vi.restoreAllMocks()
 })
+type Send = (url: string, init: SentInit) => Promise<Response>
+/** The final send under the outbound policy envelope; tests swap its implementation. */
+let sender = vi.fn<Send>()
 function httpClient(tokens?: () => Promise<string | undefined>, runtime = {}) {
-  const client = new McpServerClient('fx', { name: 'fx', transport: 'http', url: 'https://example.test/mcp', enabled: true }, { tokenSource: tokens }, () => {}, runtime)
+  const outboundHttp = senderHttp((url, init) => sender(url, init))
+  const client = new McpServerClient('fx', { name: 'fx', transport: 'http', url: 'https://example.test/mcp', enabled: true }, { tokenSource: tokens }, () => {}, { ...runtime, outboundHttp })
   clients.push(client)
   return client
 }
 function mockHttp(tools: unknown[] = []) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+  sender = vi.fn<Send>()
+  return sender.mockImplementation(async (_url, init) => {
     const rpc = JSON.parse(String(init?.body)) as { id?: number; method: string }
     if (rpc.id === undefined) return new Response(null, { status: 202 })
     return new Response(JSON.stringify({ id: rpc.id, result: rpc.method === 'initialize'
@@ -54,9 +61,9 @@ function barrier<T = void>() {
 
 describe('MCP client audit regressions', () => {
   it('rejects DNS names resolving to private addresses at connection time', async () => {
-    await expect(fetch('https://localhost/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+    await expect(defaultOutboundHttp().request('https://localhost/')).rejects.toThrow()
     // A hostname distinct from the explicit localhost fixture has no private-address exception.
-    await expect(fetch('https://localhost.localdomain/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+    await expect(defaultOutboundHttp().request('https://localhost.localdomain/')).rejects.toThrow()
   })
 
   it('rejects a non-string pagination cursor before requesting another page', async () => {
@@ -74,7 +81,9 @@ describe('MCP client audit regressions', () => {
     for (const host of ['fe80::1', 'fe90::1', 'fea0::1', 'febf:ffff::1']) {
       expect(() => assertOutboundUrl(`https://[${host}]/`)).toThrow(/prohibited/)
     }
-    for (const host of ['fe7f::1', 'fec0::1']) expect(assertOutboundUrl(`https://[${host}]/`).protocol).toBe('https:')
+    // fec0::/10 (deprecated site-local) directly above is prohibited too; the next block up is not.
+    expect(() => assertOutboundUrl('https://[fec0::1]/')).toThrow(/prohibited/)
+    for (const host of ['fe7f::1', 'fe7f:ffff::1']) expect(assertOutboundUrl(`https://[${host}]/`).protocol).toBe('https:')
   })
 
   it('does not treat NAT64 embedded loopback as direct loopback', () => {

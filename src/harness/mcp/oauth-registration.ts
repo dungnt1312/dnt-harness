@@ -13,6 +13,7 @@
 import type { TokenEndpointAuth } from './config.ts'
 import { assertOutboundUrl, isLoopbackUrl } from './outbound-policy.ts'
 import { fetchLimitedJson, OAuthConnectError, type DiscoveredOAuth } from './oauth-discovery.ts'
+import type { OutboundHttp } from './outbound-http.ts'
 import type { OAuthServerRecord } from './oauth-store.ts'
 
 export interface ResolvedClient {
@@ -27,7 +28,8 @@ export async function resolveClient(input: {
   readonly discovered: DiscoveredOAuth
   readonly redirectUri: string
   readonly previous?: OAuthServerRecord | undefined
-  readonly fetchImpl?: typeof fetch
+  /** Test seam: a policy transport with an injected low-level sender. */
+  readonly http?: OutboundHttp
   readonly now?: () => number
 }): Promise<ResolvedClient> {
   const configuredId = input.configured?.clientId
@@ -62,7 +64,7 @@ export async function resolveClient(input: {
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
     }),
-  }, input.fetchImpl ?? fetch, isLoopbackUrl(new URL(input.discovered.resource))).catch((error: unknown) => {
+  }, input.http, isLoopbackUrl(new URL(input.discovered.resource))).catch((error: unknown) => {
     if (error instanceof OAuthConnectError) throw new OAuthConnectError('registration_failed', error.message)
     throw error
   })

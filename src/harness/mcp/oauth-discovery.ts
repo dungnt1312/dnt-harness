@@ -13,7 +13,8 @@
  * outbound policy, never follows a redirect, and reads a bounded body.
  */
 import { MCP_ACCEPTED_PROTOCOL_VERSION as MCP_PROTOCOL_VERSION } from './boundaries.ts'
-import { assertOutboundUrl, OutboundPolicyError, dispatcherFor, isLoopbackUrl } from './outbound-policy.ts'
+import { defaultOutboundHttp, discardBody, type OutboundHttp, type OutboundResponse } from './outbound-http.ts'
+import { assertOutboundUrl, OutboundPolicyError, isLoopbackUrl } from './outbound-policy.ts'
 
 export type OAuthConnectCode = 'discovery_failed' | 'client_required' | 'registration_failed'
 
@@ -88,8 +89,15 @@ export function resourceCovers(serverUrl: string, resource: string): boolean {
   return server.pathname === covered.pathname || server.pathname === prefix || server.pathname.startsWith(`${prefix}/`)
 }
 
-/** Fetch JSON under the outbound policy: no redirects, a timeout, a size bound. */
-export async function fetchLimitedJson(url: string, init: RequestInit, fetchImpl: typeof fetch, local = false): Promise<{ readonly status: number; readonly headers: Headers; readonly body: unknown }> {
+/** A JSON request through the policy transport; only these fields are sent. */
+export interface LimitedJsonInit {
+  readonly method: string
+  readonly headers?: Readonly<Record<string, string>>
+  readonly body?: string
+}
+
+/** Fetch JSON under the outbound policy: no redirects, a timeout (through the body), a size bound. */
+export async function fetchLimitedJson(url: string, init: LimitedJsonInit, http: OutboundHttp = defaultOutboundHttp(), local = false): Promise<{ readonly status: number; readonly headers: OutboundResponse['headers']; readonly body: unknown }> {
   let target: URL
   try {
     target = assertOutboundUrl(url, { allowLoopbackHttp: local })
@@ -97,42 +105,53 @@ export async function fetchLimitedJson(url: string, init: RequestInit, fetchImpl
     if (error instanceof OutboundPolicyError) throw new OAuthConnectError('discovery_failed', `${url}: ${error.message}`)
     throw error
   }
-  let response: Response
+  let response: OutboundResponse
   try {
-    response = await fetchImpl(target, {
-      ...init,
-      redirect: 'manual',
-      headers: { accept: 'application/json', ...(init.headers as Record<string, string> | undefined) },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      ...(fetchImpl === fetch ? { dispatcher: dispatcherFor(target) } : {}),
+    response = await http.request(target, {
+      method: init.method,
+      headers: { accept: 'application/json', ...init.headers },
+      ...(init.body !== undefined ? { body: init.body } : {}),
+      timeoutMs: FETCH_TIMEOUT_MS,
+      allowLoopback: local,
     })
   } catch (error) {
     throw new OAuthConnectError('discovery_failed', `${target.origin} could not be reached: ${error instanceof Error ? error.message : String(error)}`)
   }
   if (response.status >= 300 && response.status < 400) {
-    await response.body?.cancel().catch(() => undefined)
+    await discardBody(response)
     throw new OAuthConnectError('discovery_failed', `${target.origin} answered with a redirect, which is not followed`)
   }
-  const text = await readBounded(response)
+  let text: string
+  try {
+    text = await readBounded(response)
+  } catch (error) {
+    if (error instanceof OAuthConnectError) throw error
+    throw new OAuthConnectError('discovery_failed', `${target.origin} body could not be read: ${error instanceof Error ? error.message : String(error)}`)
+  }
   let body: unknown
   try { body = text === '' ? undefined : JSON.parse(text) } catch { body = undefined }
   return { status: response.status, headers: response.headers, body }
 }
 
-async function readBounded(response: Response): Promise<string> {
+async function readBounded(response: OutboundResponse): Promise<string> {
   if (response.body === null) return ''
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    size += value.byteLength
-    if (size > MAX_METADATA_BYTES) {
-      await reader.cancel().catch(() => undefined)
-      throw new OAuthConnectError('discovery_failed', 'OAuth metadata is too large')
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_METADATA_BYTES) throw new OAuthConnectError('discovery_failed', 'OAuth metadata is too large')
+      chunks.push(value)
     }
-    chunks.push(value)
+  } catch (error) {
+    // Oversize, deadline or read failure: never leave the stream (and socket) pinned.
+    await reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    reader.releaseLock()
   }
   return Buffer.concat(chunks).toString('utf8')
 }
@@ -172,7 +191,7 @@ function sameIssuer(a: string, b: string): boolean {
   return left !== undefined && right !== undefined && left.href === right.href
 }
 
-async function challenge(serverUrl: string, fetchImpl: typeof fetch): Promise<BearerChallenge> {
+async function challenge(serverUrl: string, http: OutboundHttp): Promise<BearerChallenge> {
   const result = await fetchLimitedJson(serverUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
@@ -180,7 +199,7 @@ async function challenge(serverUrl: string, fetchImpl: typeof fetch): Promise<Be
       jsonrpc: '2.0', id: 0, method: 'initialize',
       params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'dnt-harness', version: '0.1.0' } },
     }),
-  }, fetchImpl, isLoopbackUrl(new URL(serverUrl))).catch((error: unknown) => {
+  }, http, isLoopbackUrl(new URL(serverUrl))).catch((error: unknown) => {
     // A streamed success body can exceed the bound; that still means "no OAuth".
     if (error instanceof OAuthConnectError && error.message === 'OAuth metadata is too large') {
       throw new OAuthConnectError('discovery_failed', 'the server answered without asking for authorization')
@@ -195,10 +214,10 @@ async function challenge(serverUrl: string, fetchImpl: typeof fetch): Promise<Be
   return parseBearerChallenge(result.headers.get('www-authenticate')) ?? {}
 }
 
-async function protectedResource(serverUrl: URL, hint: string | undefined, fetchImpl: typeof fetch): Promise<Record<string, unknown> | undefined> {
+async function protectedResource(serverUrl: URL, hint: string | undefined, http: OutboundHttp): Promise<Record<string, unknown> | undefined> {
   const candidates = hint !== undefined ? [hint] : prmCandidates(serverUrl)
   for (const candidate of candidates) {
-    const result = await fetchLimitedJson(candidate, { method: 'GET' }, fetchImpl, isLoopbackUrl(serverUrl))
+    const result = await fetchLimitedJson(candidate, { method: 'GET' }, http, isLoopbackUrl(serverUrl))
     const body = record(result.body)
     if (result.status === 200 && body !== undefined) return body
     if (hint !== undefined) throw new OAuthConnectError('discovery_failed', `protected resource metadata at ${candidate} answered HTTP ${result.status}`)
@@ -206,11 +225,11 @@ async function protectedResource(serverUrl: URL, hint: string | undefined, fetch
   return undefined
 }
 
-async function authorizationServer(issuer: string, fetchImpl: typeof fetch, local: boolean): Promise<Record<string, unknown>> {
+async function authorizationServer(issuer: string, http: OutboundHttp, local: boolean): Promise<Record<string, unknown>> {
   const issuerUrl = normalise(issuer)
   if (issuerUrl === undefined) throw new OAuthConnectError('discovery_failed', `authorization server '${issuer}' is not a URL`)
   for (const candidate of asCandidates(issuerUrl)) {
-    const result = await fetchLimitedJson(candidate, { method: 'GET' }, fetchImpl, local)
+    const result = await fetchLimitedJson(candidate, { method: 'GET' }, http, local)
     const body = record(result.body)
     if (result.status !== 200 || body === undefined) continue
     if (typeof body['issuer'] !== 'string' || !sameIssuer(body['issuer'], issuer)) {
@@ -238,13 +257,13 @@ function endpoint(metadata: Record<string, unknown>, key: string, required: bool
 }
 
 /** Discover everything a sign-in needs, or fail with `discovery_failed` naming the check. */
-export async function discoverOAuth(serverUrl: string, options: { readonly fetchImpl?: typeof fetch; readonly scopes?: readonly string[] } = {}): Promise<DiscoveredOAuth> {
-  const fetchImpl = options.fetchImpl ?? fetch
+export async function discoverOAuth(serverUrl: string, options: { readonly http?: OutboundHttp; readonly scopes?: readonly string[] } = {}): Promise<DiscoveredOAuth> {
+  const http = options.http ?? defaultOutboundHttp()
   const server = normalise(serverUrl)
   if (server === undefined) throw new OAuthConnectError('discovery_failed', `'${serverUrl}' is not a URL`)
   const local = isLoopbackUrl(server)
-  const bearer = await challenge(serverUrl, fetchImpl)
-  const prm = await protectedResource(server, bearer.resourceMetadata, fetchImpl)
+  const bearer = await challenge(serverUrl, http)
+  const prm = await protectedResource(server, bearer.resourceMetadata, http)
 
   let resource = serverUrl
   let issuers = [server.origin]
@@ -263,7 +282,7 @@ export async function discoverOAuth(serverUrl: string, options: { readonly fetch
   const failures: string[] = []
   for (const issuer of issuers) {
     try {
-      const metadata = await authorizationServer(issuer, fetchImpl, local)
+      const metadata = await authorizationServer(issuer, http, local)
       if (!strings(metadata['code_challenge_methods_supported']).includes('S256')) {
         throw new OAuthConnectError('discovery_failed', 'the authorization server does not support PKCE S256')
       }

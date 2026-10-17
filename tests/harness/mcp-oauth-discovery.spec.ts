@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { discoverOAuth, OAuthConnectError, parseBearerChallenge, resourceCovers } from '../../src/harness/mcp/oauth-discovery.ts'
 import { startOAuthFixture, type OAuthFixture, type OAuthFixtureOptions } from '../support/oauth-fixture.ts'
+import { realSend, senderHttp } from '../support/outbound-sender.ts'
+
+/** The discovery send, injected under the outbound policy envelope. */
+const sent = (handler: typeof fetch) => senderHttp((url, init) => handler(url, init))
 
 let fixture: OAuthFixture | undefined
 afterEach(async () => { await fixture?.close(); fixture = undefined })
@@ -53,7 +57,7 @@ describe('discoverOAuth', () => {
       if (target.includes('protected-resource')) return Response.json({ resource: 'https://public.example/mcp', authorization_servers: ['https://public.example'] })
       return Response.json({ issuer: 'https://public.example', code_challenge_methods_supported: ['S256'], authorization_endpoint: 'https://public.example/authorize', token_endpoint: 'http://127.0.0.1:8765/token' })
     }) as typeof fetch
-    expect((await failure(discoverOAuth('https://public.example/mcp', { fetchImpl }))).message).toMatch(/plain HTTP/)
+    expect((await failure(discoverOAuth('https://public.example/mcp', { http: sent(fetchImpl) }))).message).toMatch(/plain HTTP/)
   })
 
   it.each(['token_endpoint', 'registration_endpoint', 'resource_metadata', 'authorization_servers'])('rejects HTTPS loopback advertised in %s by a public resource', async (field) => {
@@ -65,7 +69,7 @@ describe('discoverOAuth', () => {
       if (url.includes('protected-resource') || url.endsWith('/prm')) return Response.json({ resource: 'https://public.example/mcp', authorization_servers: [field === 'authorization_servers' ? 'https://127.0.0.1' : 'https://public.example'] })
       return Response.json({ issuer: field === 'authorization_servers' ? 'https://127.0.0.1' : 'https://public.example', code_challenge_methods_supported: ['S256'], authorization_endpoint: 'https://public.example/authorize', token_endpoint: 'https://public.example/token', [field]: 'https://127.0.0.1/private' })
     }) as typeof fetch
-    expect((await failure(discoverOAuth('https://public.example/mcp', { fetchImpl }))).message).toMatch(/prohibited/)
+    expect((await failure(discoverOAuth('https://public.example/mcp', { http: sent(fetchImpl) }))).message).toMatch(/prohibited/)
     expect(seen.some((url) => url.startsWith('https://127.0.0.1'))).toBe(false)
   })
 
@@ -123,15 +127,15 @@ describe('discoverOAuth', () => {
         return Response.json({ resource: f.mcpUrl, authorization_servers: [bad, f.origin] })
       }
       if (target.startsWith(bad)) return Response.json({ issuer: 'https://wrong.example' })
-      return fetch(url, init)
+      return realSend(String(url), init as never) as unknown as Response
     }) as typeof fetch
-    expect((await discoverOAuth(f.mcpUrl, { fetchImpl })).issuer).toBe(f.origin)
+    expect((await discoverOAuth(f.mcpUrl, { http: sent(fetchImpl) })).issuer).toBe(f.origin)
     const none = (async (url: URL | RequestInfo, init?: RequestInit) => {
       if (String(url).includes('oauth-protected-resource')) return Response.json({ resource: f.mcpUrl, authorization_servers: [bad, 'https://also-bad.example'] })
       if (String(url).includes('.well-known/oauth-authorization-server')) return Response.json({ issuer: 'https://wrong.example' })
-      return fetch(url, init)
+      return realSend(String(url), init as never) as unknown as Response
     }) as typeof fetch
-    const error = await failure(discoverOAuth(f.mcpUrl, { fetchImpl: none }))
+    const error = await failure(discoverOAuth(f.mcpUrl, { http: sent(none) }))
     expect(error.message).toContain(bad)
     expect(error.message).toContain('https://also-bad.example')
   })
@@ -167,13 +171,13 @@ describe('discoverOAuth', () => {
 
   it('does not follow redirects and bounds the metadata size', async () => {
     const redirecting = (async () => new Response(null, { status: 302, headers: { location: 'https://elsewhere.example' } })) as typeof fetch
-    expect((await failure(discoverOAuth('https://mcp.example.com/mcp', { fetchImpl: redirecting }))).message).toMatch(/redirect/)
+    expect((await failure(discoverOAuth('https://mcp.example.com/mcp', { http: sent(redirecting) }))).message).toMatch(/redirect/)
     let calls = 0
     const huge = (async () => {
       calls += 1
       if (calls === 1) return new Response('{}', { status: 401, headers: { 'www-authenticate': 'Bearer resource_metadata="https://mcp.example.com/prm"' } })
       return new Response(`{"x":"${'a'.repeat(70_000)}"}`, { status: 200, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
-    expect((await failure(discoverOAuth('https://mcp.example.com/mcp', { fetchImpl: huge }))).message).toMatch(/too large/)
+    expect((await failure(discoverOAuth('https://mcp.example.com/mcp', { http: sent(huge) }))).message).toMatch(/too large/)
   })
 })
