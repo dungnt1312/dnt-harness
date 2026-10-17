@@ -5,6 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
+import { detectMaxTokensField, detectSupportsStore, toolCallIdReissueCount } from '../../src/harness/llm/openai.ts'
 import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
 import { buildContext, wrapUntrusted } from '../../src/harness/context/builder.ts'
 import { resolveModelBudget } from '../../src/harness/context/budget.ts'
@@ -13,13 +14,14 @@ import { BUNDLED_MODES, DEFAULT_MODE_ID } from '../../src/harness/modes/bundled.
 interface CapturedRequest {
   url: string
   body: Record<string, unknown>
+  headers: Record<string, string>
 }
 
 /** Stub global fetch with an SSE chat-completions responder. */
 function stubFetch(chunks: readonly string[] = ['{"choices":[{"delta":{"content":"ok"}}]}']): CapturedRequest[] {
   const captured: CapturedRequest[] = []
-  const fake = vi.fn(async (input: string | URL, init?: { body?: string }) => {
-    captured.push({ url: String(input), body: JSON.parse(init?.body ?? '{}') as Record<string, unknown> })
+  const fake = vi.fn(async (input: string | URL, init?: { body?: string; headers?: Record<string, string> }) => {
+    captured.push({ url: String(input), body: JSON.parse(init?.body ?? '{}') as Record<string, unknown>, headers: init?.headers ?? {} })
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -430,5 +432,338 @@ describe('openai completions adapter: retry before the stream starts', () => {
     const error = await collect(fast()).catch((caught: unknown) => caught as Error)
     expect((error as Error).message.length).toBeLessThan(5_000)
     expect((error as Error).message).not.toContain('x'.repeat(100))
+  })
+
+  it('surfaces a bounded excerpt for structured HTTP error bodies', async () => {
+    scripted([() => new Response('{"error":{"type":"unknown","message":"relay says: bad tool sequence detected"}}', { status: 400 })])
+    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
+    expect((error as Error).message).toContain('HTTP 400: unknown')
+    expect((error as Error).message).toContain('bad tool sequence detected')
+  })
+
+  it('caps the surfaced excerpt at 200 characters', async () => {
+    scripted([() => new Response(JSON.stringify({ error: { message: 'y'.repeat(1_000) } }), { status: 400 })])
+    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
+    expect((error as Error).message).toContain('…')
+    expect((error as Error).message.length).toBeLessThan(300)
+  })
+
+  it('falls back to a top-level message and stays silent for a body cut off mid-JSON', async () => {
+    scripted([() => new Response('{"message":"line one\\n\\n  line two"}', { status: 400 })])
+    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
+    expect((error as Error).message).toContain('line one line two')
+
+    // The bounded reader truncates this body, so it no longer parses as JSON.
+    scripted([() => new Response(JSON.stringify({ error: { message: 'z'.repeat(9_000) } }), { status: 400 })])
+    const big = await collect(fast()).catch((caught: unknown) => caught as Error)
+    expect((big as Error).message).not.toContain('z'.repeat(100))
+  })
+
+  it('redacts credentials an auth error echoes back before they reach the durable message', async () => {
+    const key = 'sk-live-THISISTHESECRETKEY0123'
+    scripted([() => new Response(JSON.stringify({ error: { message: `Incorrect API key provided: ${key}. Also tried Bearer abcdEFGH12345678 and key_9f8e7d6c5b4a.` } }), { status: 401 })])
+    const provider = new OpenAiCompletionsProvider({ name: 'test', apiKey: key, baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1 })
+    const error = await collect(provider).catch((caught: unknown) => caught as Error)
+    const message = (error as Error).message
+    expect(message).toContain('HTTP 401: auth_configuration')
+    expect(message).toContain('Incorrect API key provided')
+    expect(message).not.toContain('THISISTHESECRETKEY')
+    expect(message).not.toContain('abcdEFGH12345678')
+    expect(message).not.toContain('9f8e7d6c5b4a')
+    expect(message).toContain('[redacted]')
+
+    // A key with no token shape is still caught verbatim.
+    const plain = 'plainpassword42'
+    scripted([() => new Response(JSON.stringify({ error: { message: `rejected credential ${plain}` } }), { status: 403 })])
+    const other = await collect(new OpenAiCompletionsProvider({ name: 'test', apiKey: plain, baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1 })).catch((caught: unknown) => caught as Error)
+    expect((other as Error).message).not.toContain(plain)
+  })
+})
+
+/** One raw SSE response assembled from records, with no extra finish appended. */
+function stubRecords(records: readonly string[]): void {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(
+    `${records.map((record) => `data: ${record}\n\n`).join('')}data: [DONE]\n\n`,
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  )))
+}
+
+async function collectEvents(p: OpenAiCompletionsProvider, request: Parameters<OpenAiCompletionsProvider['stream']>[0], signal?: AbortSignal): Promise<unknown[]> {
+  const events: unknown[] = []
+  for await (const event of p.stream(request, signal !== undefined ? { signal } : undefined)) events.push(event)
+  return events
+}
+
+describe('openai completions adapter: compatibility layer', () => {
+  it('detects the output-cap field, keeping the historical one for unrecognized endpoints', () => {
+    expect(detectMaxTokensField('deepseek', 'https://api.deepseek.com')).toBe('max_tokens')
+    expect(detectMaxTokensField('ocproxy', 'http://127.0.0.1:6536/v1')).toBe('max_tokens')
+    expect(detectMaxTokensField('zai', 'https://anything.example/v1')).toBe('max_tokens')
+    expect(detectMaxTokensField('openai', 'https://api.openai.com/v1')).toBe('max_completion_tokens')
+    // A gateway that merely relays OpenAI keeps the modern field by URL.
+    expect(detectMaxTokensField('my-relay', 'https://api.openai.com/v1')).toBe('max_completion_tokens')
+    // An arbitrarily named local gateway must not change wire behavior.
+    expect(detectMaxTokensField('cliproxy1', 'http://127.0.0.1:6536/v1')).toBe('max_tokens')
+    expect(detectSupportsStore('openai', 'https://api.openai.com/v1')).toBe(true)
+    expect(detectSupportsStore('cliproxy1', 'http://127.0.0.1:6536/v1')).toBe(false)
+    // A provider merely NAMED openai (LiteLLM, Azure, vLLM, llama.cpp…) keeps
+    // the historical body: the name alone never opts into the native fields.
+    expect(detectMaxTokensField('openai', 'http://127.0.0.1:4000/v1')).toBe('max_tokens')
+    expect(detectSupportsStore('openai', 'http://127.0.0.1:4000/v1')).toBe(false)
+    // Host match is exact, not a substring of some other host.
+    expect(detectSupportsStore('x', 'https://api.openai.com.evil.example/v1')).toBe(false)
+    expect(detectSupportsStore('x', 'not a url')).toBe(false)
+  })
+
+  it('writes the cap into the detected field and sends no other field of its own', async () => {
+    const cases: readonly { name: string; baseUrl: string; field: 'max_tokens' | 'max_completion_tokens' }[] = [
+      { name: 'deepseek', baseUrl: 'https://api.deepseek.com', field: 'max_tokens' },
+      { name: 'cliproxy1', baseUrl: 'http://127.0.0.1:6536/v1', field: 'max_tokens' },
+      { name: 'openai', baseUrl: 'https://api.openai.com/v1', field: 'max_completion_tokens' },
+    ]
+    for (const testCase of cases) {
+      const captured = stubFetch()
+      const p = new OpenAiCompletionsProvider({ name: testCase.name, apiKey: '', baseUrl: testCase.baseUrl, maxOutputTokens: { m: 4_096 } })
+      await collectEvents(p, { model: 'm', messages: [] })
+      const body = captured[0]!.body
+      expect(body[testCase.field]).toBe(4_096)
+      expect(body[testCase.field === 'max_tokens' ? 'max_completion_tokens' : 'max_tokens']).toBeUndefined()
+    }
+  })
+
+  it('an explicit maxTokensField beats detection, and a model with no cap sends the fallback in the detected field', async () => {
+    const captured = stubFetch()
+    const overridden = new OpenAiCompletionsProvider({ name: 'openai', apiKey: '', baseUrl: 'https://api.openai.com/v1', maxTokensField: 'max_tokens', maxOutputTokens: { m: 64 } })
+    await collectEvents(overridden, { model: 'm', messages: [] })
+    expect(captured[0]!.body['max_tokens']).toBe(64)
+    expect(captured[0]!.body['max_completion_tokens']).toBeUndefined()
+
+    const unknown = stubFetch()
+    await collectEvents(provider(), { model: 'no-such-model-xyz', messages: [] })
+    expect(unknown[0]!.body['max_tokens']).toBe(32_000)
+    expect('max_completion_tokens' in unknown[0]!.body).toBe(false)
+
+    const native = stubFetch()
+    await collectEvents(new OpenAiCompletionsProvider({ name: 'openai', apiKey: '', baseUrl: 'https://api.openai.com/v1' }), { model: 'no-such-model-xyz', messages: [] })
+    expect(native[0]!.body['max_completion_tokens']).toBe(32_000)
+    expect('max_tokens' in native[0]!.body).toBe(false)
+  })
+
+  it('an unrecognized endpoint gets the exactly historical body', async () => {
+    const before = stubFetch()
+    await run({ model: 'gpt-5.6', messages: [] })
+    const historical = before[0]!.body
+    expect(historical['stream_options']).toEqual({ include_usage: true })
+    expect('store' in historical).toBe(false)
+    expect('prompt_cache_key' in historical).toBe(false)
+
+    const after = stubFetch()
+    await run({ model: 'gpt-5.6', messages: [], providerOptions: {} })
+    expect(after[0]!.body).toEqual(historical)
+  })
+
+  it('sends store:false only where the flag is declared or detected, and honors usage opt-out', async () => {
+    const native = stubFetch()
+    await collectEvents(new OpenAiCompletionsProvider({ name: 'openai', apiKey: '', baseUrl: 'https://api.openai.com/v1' }), { messages: [] })
+    expect(native[0]!.body['store']).toBe(false)
+
+    const declared = stubFetch()
+    await collectEvents(new OpenAiCompletionsProvider({ name: 'cliproxy1', apiKey: '', baseUrl: 'http://127.0.0.1:6536/v1', supportsStore: true }), { messages: [] })
+    expect(declared[0]!.body['store']).toBe(false)
+
+    const withoutUsage = stubFetch()
+    await collectEvents(new OpenAiCompletionsProvider({ name: 'cliproxy1', apiKey: '', baseUrl: 'http://127.0.0.1:6536/v1', supportsUsageInStreaming: false }), { messages: [] })
+    expect('stream_options' in withoutUsage[0]!.body).toBe(false)
+  })
+
+  it('fails a physical attempt that never sends headers when a deadline is configured', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => {
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+      })
+      return new Response('')
+    }))
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', headerTimeoutMs: 20, maxRetries: 0 })
+    await expect(collectEvents(p, { messages: [] })).rejects.toMatchObject({ reason: 'first_progress_timeout', phase: 'headers', transient: true })
+  })
+
+  it('a caller stop during the header wait stays a cancellation, not a deadline', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => {
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+      })
+      return new Response('')
+    }))
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(new Error('stopped')), 10)
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', headerTimeoutMs: 60_000, maxRetries: 0 })
+    await expect(collectEvents(p, { messages: [] }, controller.signal)).rejects.toMatchObject({ reason: 'cancelled' })
+  })
+
+  it('a caller stop after headers still reaches a stalled stream when a deadline is configured', async () => {
+    // The body is bound to the attempt signal, as a real fetch body is: if the
+    // caller's abort stopped being forwarded once headers arrived, this read
+    // would hang until the test timeout.
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => {
+      const wire = init?.signal
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+          wire?.addEventListener('abort', () => controller.error(wire.reason), { once: true })
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }))
+    const controller = new AbortController()
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', headerTimeoutMs: 60_000, maxRetries: 0 })
+    const stream = p.stream({ messages: [] }, { signal: controller.signal })[Symbol.asyncIterator]()
+    const first = await stream.next()
+    expect(first.value).toMatchObject({ type: 'delta', delta: 'hi' })
+    controller.abort(new Error('stopped'))
+    await expect(stream.next()).rejects.toMatchObject({ reason: 'cancelled' })
+  }, 5_000)
+})
+
+describe('openai completions adapter: provider options', () => {
+  const tools = [{ name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }]
+
+  it('lowers only whitelisted fields and drops the rest', async () => {
+    const captured = stubFetch()
+    await run({
+      messages: [],
+      tools,
+      providerOptions: {
+        toolChoice: 'required',
+        parallelToolCalls: false,
+        responseFormat: 'json_object',
+        stop: ['STOP', ''],
+        temperature: 0.2,
+        seed: 7,
+      },
+    })
+    const body = captured[0]!.body
+    expect(body['tool_choice']).toBe('required')
+    expect(body['parallel_tool_calls']).toBe(false)
+    expect(body['response_format']).toEqual({ type: 'json_object' })
+    expect(body['stop']).toEqual(['STOP'])
+    expect('temperature' in body).toBe(false)
+    expect('seed' in body).toBe(false)
+  })
+
+  it('maps a named tool choice and passes a full response_format object through', async () => {
+    const captured = stubFetch()
+    const schema = { type: 'json_schema', json_schema: { name: 'answer' } }
+    await run({ messages: [], tools, providerOptions: { toolChoice: { name: 'Read' }, responseFormat: schema } })
+    expect(captured[0]!.body['tool_choice']).toEqual({ type: 'function', function: { name: 'Read' } })
+    expect(captured[0]!.body['response_format']).toEqual(schema)
+  })
+
+  it('never sends a tool choice when the request exposes no tools', async () => {
+    const captured = stubFetch()
+    await run({ messages: [], providerOptions: { toolChoice: 'required' } })
+    expect('tool_choice' in captured[0]!.body).toBe(false)
+  })
+
+  it('ignores malformed option values instead of forwarding them', async () => {
+    const captured = stubFetch()
+    await run({
+      messages: [],
+      tools,
+      providerOptions: { toolChoice: { nope: true }, parallelToolCalls: 'yes', responseFormat: 'xml', stop: 'STOP' },
+    })
+    const body = captured[0]!.body
+    expect('tool_choice' in body).toBe(false)
+    expect('parallel_tool_calls' in body).toBe(false)
+    expect('response_format' in body).toBe(false)
+    expect('stop' in body).toBe(false)
+  })
+})
+
+describe('openai completions adapter: session affinity', () => {
+  it('always sends the affinity header but gates prompt_cache_key on declared support', async () => {
+    const declared = stubFetch()
+    await collectEvents(
+      new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', supportsPromptCacheKey: true }),
+      { messages: [], sessionAffinity: 'sess-1' },
+    )
+    expect(declared[0]!.headers['x-session-affinity']).toBe('sess-1')
+    expect(declared[0]!.body['prompt_cache_key']).toBe('sess-1')
+
+    // Undeclared endpoints still get the header, never the body field: a strict
+    // relay must not receive an unknown key.
+    const gated = stubFetch()
+    await run({ messages: [], sessionAffinity: 'sess-2' })
+    expect(gated[0]!.headers['x-session-affinity']).toBe('sess-2')
+    expect('prompt_cache_key' in gated[0]!.body).toBe(false)
+
+    const absent = stubFetch()
+    await run({ messages: [] })
+    expect('x-session-affinity' in absent[0]!.headers).toBe(false)
+    expect('prompt_cache_key' in absent[0]!.body).toBe(false)
+  })
+
+  it('keeps one stable affinity across a session and truncates an oversized key', async () => {
+    const captured = stubFetch()
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', supportsPromptCacheKey: true })
+    const session = 's'.repeat(120)
+    await collectEvents(p, { messages: [], sessionAffinity: session })
+    await collectEvents(p, { messages: [], sessionAffinity: session })
+    expect(captured.map((request) => request.headers['x-session-affinity'])).toEqual([session, session])
+    expect(captured[0]!.body['prompt_cache_key']).toHaveLength(64)
+    expect(captured[0]!.body['prompt_cache_key']).toBe(captured[1]!.body['prompt_cache_key'])
+  })
+})
+
+describe('openai completions adapter: re-sent tool-call headers', () => {
+  it('accepts a fresh id before arguments accumulated and executes one call', async () => {
+    const before = toolCallIdReissueCount()
+    stubRecords([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"name":"Glob"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    const events = await collectEvents(provider(), { messages: [] })
+    expect(events).toContainEqual({ type: 'toolCalls', calls: [{ id: 'B', name: 'Glob', args: {} }] })
+    expect(toolCallIdReissueCount()).toBe(before + 1)
+  })
+
+  it('still fails when the id changes after arguments accumulated', async () => {
+    stubRecords([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob","arguments":"{\\"p\\":1}"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"arguments":"{}"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    await expect(collectEvents(provider(), { messages: [] })).rejects.toThrow(/conflicting tool ID/)
+  })
+
+  it('wire.toolCallIdReuse expect keeps accumulated arguments and takes the newest id', async () => {
+    stubRecords([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob","arguments":"{\\"p\\":"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"arguments":"1}"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', wire: { toolCallIdReuse: 'expect' } })
+    expect(await collectEvents(p, { messages: [] })).toContainEqual({ type: 'toolCalls', calls: [{ id: 'B', name: 'Glob', args: { p: 1 } }] })
+  })
+
+  it('treats a blank id as a placeholder, rejects a non-string id without echoing it', async () => {
+    // Blank means "no id in this fragment": the slot waits for the real header.
+    stubRecords([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"  ","function":{"name":"Glob"}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"arguments":"{}"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    expect(await collectEvents(provider(), { messages: [] })).toContainEqual({ type: 'toolCalls', calls: [{ id: 'A', name: 'Glob', args: {} }] })
+    // A call that never gets an identity still fails at the batch boundary.
+    stubRecords([
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"Glob","arguments":"{}"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    await expect(collectEvents(provider(), { messages: [] })).rejects.toMatchObject({ reason: 'invalid_tool_input' })
+    // A non-string id is malformed data: fail without echoing the value.
+    stubRecords(['{"choices":[{"delta":{"tool_calls":[{"index":0,"id":12345,"function":{"name":"Glob"}}]}}]}'])
+    await expect(collectEvents(provider(), { messages: [] })).rejects.toMatchObject({ reason: 'invalid_tool_input' })
+    await expect(collectEvents(provider(), { messages: [] })).rejects.not.toThrow('12345')
   })
 })

@@ -3958,6 +3958,10 @@ ${entry.description}`.toLowerCase().includes(query))
         ...(effective.provider != null ? { providerName: effective.provider } : {}),
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
         contextId,
+        // Stable per conversation: the provider can route every request of this
+        // session to the same shard, keeping its prefix cache warm. Only a
+        // dispatched root/child request is stamped, never a preview.
+        ...(scope !== undefined ? { sessionAffinity: scope.sessionId } : {}),
       }),
       messages: assembled.messages,
       outputCeilingTokens: assembled.maxOutputTokens,

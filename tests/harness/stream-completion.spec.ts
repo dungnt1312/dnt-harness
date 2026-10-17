@@ -105,6 +105,47 @@ describe('explicit stream completion', () => {
     const events = await collect(call(0, 'a', 'Glob', '{') + call(1, 'b', 'Read', '{}') + record({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '}' } }] } }] }) + finish('tool_calls') + 'data: [DONE]\n\n')
     expect(events.find(e => e.type === 'toolCalls')).toMatchObject({ calls: [{ id: 'a', args: {} }, { id: 'b', args: {} }] })
   })
+  it('A11 tolerates a gateway re-sending the tool-call header before arguments', async () => {
+    const header = (id: string) => record({ choices: [{ delta: { tool_calls: [{ index: 0, id, function: { name: 'Glob' } }] } }] })
+    const args = record({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } }] })
+    const events = await collect(header('c') + header('d') + args + finish('tool_calls') + 'data: [DONE]\n\n')
+    // One executable call, carrying the newest id the gateway sent.
+    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'd', name: 'Glob', args: {} }] }])
+  })
+  it('A11 tolerates header repeats with no usable identity (`id: null`, blank name)', async () => {
+    // The live opencode-relayed DeepSeek stream repeats the header on every
+    // continuation fragment as `{"id":null,"type":null,"function":{"name":"",...}}`.
+    // Those fragments carry no identity and must not kill the turn.
+    const header = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'Glob', arguments: '' } }] } }] })
+    const noise = (args: string) => record({ choices: [{ delta: { tool_calls: [{ index: 0, id: null, type: null, function: { name: '', arguments: args } }] } }] })
+    const events = await collect(header + noise('{') + noise('}') + finish('tool_calls') + 'data: [DONE]\n\n')
+    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'call_1', name: 'Glob', args: {} }] }])
+  })
+  it('A11 lets identity arrive after blank placeholders', async () => {
+    const placeholder = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: '', function: { name: '', arguments: '' } }] } }] })
+    const header = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_9', function: { name: 'Glob', arguments: '{}' } }] } }] })
+    const events = await collect(placeholder + header + finish('tool_calls') + 'data: [DONE]\n\n')
+    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'call_9', name: 'Glob', args: {} }] }])
+  })
+  it('A11 still rejects a non-string tool id', async () => {
+    const wire = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 42, function: { name: 'Glob', arguments: '{}' } }] } }] })
+    await expect(collect(wire + finish('tool_calls') + 'data: [DONE]\n\n')).rejects.toMatchObject({ reason: 'invalid_tool_input' })
+  })
+  it('A11 keeps parallel calls apart through null-id continuations', async () => {
+    // Interleaved, out-of-order indexes — the shape the live relay emits for
+    // parallel tool calls.
+    const frag = (f: unknown) => record({ choices: [{ delta: { tool_calls: [f] } }] })
+    const wire = frag({ index: 1, id: 'b', function: { name: 'Glob', arguments: '' } })
+      + frag({ index: 0, id: 'a', function: { name: 'Glob', arguments: '' } })
+      + frag({ index: 1, id: null, type: null, function: { name: '', arguments: '{"pattern":"b"}' } })
+      + frag({ index: 0, id: null, type: null, function: { name: '', arguments: '{"pattern":"a"}' } })
+      + finish('tool_calls') + 'data: [DONE]\n\n'
+    const events = await collect(wire)
+    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [
+      { id: 'a', name: 'Glob', args: { pattern: 'a' } },
+      { id: 'b', name: 'Glob', args: { pattern: 'b' } },
+    ] }])
+  })
   it.each([call(128), call(1), call() + call(0, 'different'), call() + call(0, 'c', 'Read'), call(0, 'c', 'Glob', '{'), call() + call(1)])('A11 rejects invalid whole batch', async wire => {
     await expect(collect(wire + finish('tool_calls') + 'data: [DONE]\n\n')).rejects.toBeInstanceOf(Error)
   })

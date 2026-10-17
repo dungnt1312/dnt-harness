@@ -146,6 +146,18 @@ export interface ModelRequest {
    * lowers the adapter's catalog, operator or fallback output cap.
    */
   readonly outputCeilingTokens?: number
+  /**
+   * Host-stamped provider request options. Each adapter lowers only the fields
+   * it has a documented wire meaning for (an unknown key is dropped, never
+   * forwarded); nothing reaches the wire blind.
+   */
+  readonly providerOptions?: Readonly<Record<string, unknown>>
+  /**
+   * Host-stamped stable identity of the conversation for provider-side cache
+   * affinity. Folded into affinity headers, and — only where the endpoint
+   * declares support — into `prompt_cache_key`. Never serialized as itself.
+   */
+  readonly sessionAffinity?: string
 }
 
 export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'

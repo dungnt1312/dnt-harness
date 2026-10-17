@@ -101,6 +101,126 @@ export interface OpenAiCompletionsOptions {
   readonly completionPolicy?: 'strict' | 'finish-eof'
   /** Operator per-model output-token caps; they win over the catalog value. */
   readonly maxOutputTokens?: Readonly<Record<string, number>>
+  /**
+   * Body field carrying the output cap. Unset means detect it from
+   * `name`/`baseUrl`; unrecognized endpoints keep the historical `max_tokens`.
+   */
+  readonly maxTokensField?: 'max_tokens' | 'max_completion_tokens'
+  /**
+   * Whether this endpoint accepts `prompt_cache_key`. Off unless declared:
+   * strict relays reject unknown body fields. The affinity headers still flow
+   * whenever a request stamps `sessionAffinity`.
+   */
+  readonly supportsPromptCacheKey?: boolean
+  /** Whether this endpoint understands `store`. Only then is `store: false` sent. */
+  readonly supportsStore?: boolean
+  /** Whether the final stream chunk carries `usage` (default true). */
+  readonly supportsUsageInStreaming?: boolean
+  /**
+   * Wait for response headers before giving up on one physical attempt.
+   * Unset means no separate deadline: the existing stream timers apply.
+   */
+  readonly headerTimeoutMs?: number
+  /**
+   * Wire-contract expectations. `'expect'` reads a repeated tool-call index
+   * that arrives with a fresh id as a re-sent header (see the adapter's
+   * tool-call assembly); `'tolerate'` is the default.
+   */
+  readonly wire?: {
+    readonly toolCallIdReuse?: 'tolerate' | 'expect'
+  }
+}
+
+/**
+ * OpenAI itself, recognized by host only. A provider merely *named* "openai"
+ * is often a relay (LiteLLM, Azure, vLLM, llama.cpp) that would reject `store`
+ * or ignore `max_completion_tokens`, so the name never opts an endpoint in.
+ */
+const isOpenAiNative = (baseUrl: string): boolean => {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === 'api.openai.com'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Providers documented to take the legacy `max_tokens` field even though
+ * their endpoint is not OpenAI's; mirrors opencode's `openai-chat` list.
+ */
+const LEGACY_MAX_TOKENS_PROVIDERS: ReadonlySet<string> = new Set([
+  'deepseek', 'moonshotai', 'togetherai', 'together', 'zai', 'zai-coding-plan',
+  'zhipuai', 'zhipuai-coding-plan', 'nvidia', 'cerebras', 'chutes',
+  'cloudflare-ai-gateway', 'cloudflare-workers-ai',
+])
+const LEGACY_MAX_TOKENS_HOSTS: readonly string[] = [
+  'deepseek.com', 'api.moonshot.', 'api.together.', 'api.z.ai', 'open.bigmodel.cn',
+  'integrate.api.nvidia.com', 'cerebras.ai', 'llm.chutes.ai',
+  'gateway.ai.cloudflare.com', 'api.cloudflare.com',
+]
+
+/**
+ * Which body field carries the output cap. OpenAI-native endpoints take
+ * `max_completion_tokens` — the field their newer models require — while the
+ * documented compatible families above keep `max_tokens`. An endpoint that
+ * cannot be recognized keeps `max_tokens` too: an arbitrarily named gateway is
+ * far more likely to be a compatible relay than OpenAI itself, so shipping
+ * SR-0 must not change what existing deployments receive.
+ */
+export function detectMaxTokensField(name: string, baseUrl: string): 'max_tokens' | 'max_completion_tokens' {
+  if (LEGACY_MAX_TOKENS_PROVIDERS.has(name.toLowerCase())) return 'max_tokens'
+  const url = baseUrl.toLowerCase()
+  if (LEGACY_MAX_TOKENS_HOSTS.some((host) => url.includes(host))) return 'max_tokens'
+  return isOpenAiNative(baseUrl) ? 'max_completion_tokens' : 'max_tokens'
+}
+
+/** Only OpenAI-native endpoints are known to accept an explicit `store`. */
+export function detectSupportsStore(_name: string, baseUrl: string): boolean {
+  return isOpenAiNative(baseUrl)
+}
+
+/** `prompt_cache_key` is documented at 64 characters. */
+const OPENAI_PROMPT_CACHE_KEY_MAX = 64
+
+/**
+ * Diagnostics: how many times a re-sent tool-call header (a fresh id at an
+ * index that already carried this call's id) was tolerated instead of failing
+ * the turn. Non-zero means the endpoint's wire contract is looser than the
+ * standard one.
+ */
+let toolCallIdReissues = 0
+
+/** Read the process-wide count of tolerated tool-call id re-sends. */
+export function toolCallIdReissueCount(): number {
+  return toolCallIdReissues
+}
+
+/**
+ * Lower the host-approved subset of `providerOptions` onto the body. Only
+ * fields with a documented chat-completions meaning are serialized; anything
+ * else is dropped rather than forwarded, because one unknown field makes a
+ * strict gateway reject the whole request.
+ */
+export function applyProviderOptions(body: Record<string, unknown>, options: Readonly<Record<string, unknown>> | undefined, hasTools: boolean): void {
+  if (options === undefined) return
+  // A tool choice without tools is meaningless; sending it would be rejected.
+  const choice = options['toolChoice']
+  if (hasTools) {
+    if (choice === 'auto' || choice === 'none' || choice === 'required') body['tool_choice'] = choice
+    else if (choice !== null && typeof choice === 'object' && !Array.isArray(choice) && typeof (choice as { name?: unknown }).name === 'string') {
+      body['tool_choice'] = { type: 'function', function: { name: (choice as { name: string }).name } }
+    }
+  }
+  const parallel = options['parallelToolCalls']
+  if (typeof parallel === 'boolean') body['parallel_tool_calls'] = parallel
+  const format = options['responseFormat']
+  if (format === 'text' || format === 'json_object') body['response_format'] = { type: format }
+  else if (format !== null && typeof format === 'object' && !Array.isArray(format)) body['response_format'] = format
+  const stop = options['stop']
+  if (Array.isArray(stop)) {
+    const sequences = stop.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+    if (sequences.length > 0) body['stop'] = sequences
+  }
 }
 
 /**
@@ -208,58 +328,105 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     // thinking override can patch it; unsupported (model, level) pairs
     // leave it untouched rather than risking an undocumented field.
     const model = request.model ?? this.fallbackModel
+    const tools = request.tools ?? []
+    const hasTools = tools.length > 0
+    const affinity = request.sessionAffinity
+    // Every knob below resolves once, before the body is written: no magic
+    // values scattered through the assembly, and `compatibility ?? detect`.
+    const maxTokensField = this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
+    const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
     const body: Record<string, unknown> = {
       model,
       messages: toWireMessages(request.messages),
-      ...(request.tools !== undefined && request.tools.length > 0
-        ? { tools: request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
+      ...(hasTools
+        ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
         : {}),
       stream: true,
       // The final chunk then carries `usage` (real prompt/cached counts),
       // which the context meter shows instead of a raw estimate.
-      stream_options: { include_usage: true },
+      ...(this.options.supportsUsageInStreaming !== false ? { stream_options: { include_usage: true } } : {}),
+      // Stateless by default where the flag exists; every other endpoint omits
+      // the field entirely rather than risk rejecting an unknown one.
+      ...(supportsStore ? { store: false } : {}),
     }
     const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens)
-    if (maxTokens !== undefined) body['max_tokens'] = maxTokens
+    if (maxTokens !== undefined) body[maxTokensField] = maxTokens
     applyThinkingOverride(body, model, request.thinkingLevel, maxTokens)
+    applyProviderOptions(body, request.providerOptions, hasTools)
+    // Off unless the endpoint declares support: strict relays reject unknown
+    // body fields. The affinity headers below flow regardless.
+    if (this.options.supportsPromptCacheKey === true && affinity !== undefined && affinity !== '') {
+      body['prompt_cache_key'] = affinity.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX)
+    }
     const payload = JSON.stringify(body)
     const signal = options?.signal
     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
     const maxAttempts = options?.requestOwner ? 1 : Math.min(4, 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES))
     let response: Response
+    // The caller's abort is forwarded to the attempt controller for as long as
+    // that attempt's body may still be read, not just until headers arrive:
+    // the response body is bound to the attempt signal, so dropping the
+    // forwarder early would leave a cancelled run blocked in `read()`.
+    let detachAbort = (): void => {}
     // Retry only before the stream starts: nothing has been yielded, so a
     // second request cannot duplicate output. Rate limits and transient
     // gateway/server failures are retried with backoff; everything else
     // (auth, bad request, a mid-stream failure) surfaces at once.
     for (let attempt = 1; ; attempt++) {
       let wait: number | undefined
+      // A header deadline is opt-in: without one this loop behaves exactly as
+      // before. Each physical attempt gets its own timer and controller.
+      const headerTimeout = this.options.headerTimeoutMs
+      const attemptController = headerTimeout === undefined ? undefined : new AbortController()
+      const forwardAbort = (): void => attemptController?.abort(signal?.reason)
+      const headerTimer = attemptController === undefined || headerTimeout === undefined
+        ? undefined
+        : setTimeout(() => attemptController.abort(new ProviderError(`provider sent no response headers within ${headerTimeout}ms`, { reason: 'first_progress_timeout', phase: 'headers', transient: true })), headerTimeout)
+      if (attemptController !== undefined) {
+        if (signal?.aborted === true) attemptController.abort(signal.reason)
+        else signal?.addEventListener('abort', forwardAbort, { once: true })
+      }
+      detachAbort = () => signal?.removeEventListener('abort', forwardAbort)
+      const wireSignal = attemptController?.signal ?? signal
       try {
         response = await fetch(`${this.options.baseUrl}/chat/completions`, {
           method: 'POST',
-          ...(signal !== undefined ? { signal } : {}),
+          ...(wireSignal !== undefined ? { signal: wireSignal } : {}),
           headers: {
             'content-type': 'application/json',
             // Local gateways often accept no credential at all; sending an empty
             // Bearer makes some of them reject the call outright.
             ...(this.options.apiKey === '' ? {} : { authorization: `Bearer ${this.options.apiKey}` }),
+            // Provider-side prompt-cache affinity: every request of one session
+            // reaches the same shard, so its prefix cache stays reusable. Only
+            // sent when the host stamped an identity.
+            ...(affinity !== undefined && affinity !== '' ? { 'x-session-affinity': affinity } : {}),
           },
           body: payload,
         })
       } catch (error) {
-        const classified = signal?.aborted ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' }) : classifyTransport(error, 'connect')
+        const deadline = attemptController?.signal.reason instanceof ProviderError ? attemptController.signal.reason : undefined
+        const classified = signal?.aborted
+          ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' })
+          : deadline ?? classifyTransport(error, 'connect')
+        detachAbort()
         if (!classified.retryable || attempt >= maxAttempts) throw classified
         await sleep(backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS), signal)
         continue
+      } finally {
+        if (headerTimer !== undefined) clearTimeout(headerTimer)
       }
       if (response.ok) break
       let cleanupSettled = true
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
+      detachAbort()
       const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
       const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
       const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
       if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
         const retryAfter = retryAfterMs(response.headers.get('retry-after'))
-        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
+        const excerpt = httpErrorExcerpt(detail, this.options.apiKey)
+        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
         error.transportSettled = cleanupSettled
         throw error
       }
@@ -267,6 +434,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       await sleep(Math.min(MAX_RETRY_DELAY_MS, wait ?? backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)), signal)
     }
     if (response.body === null) {
+      detachAbort()
       throw new ProviderError(`${this.name}: empty response body`, { transient: true })
     }
 
@@ -293,7 +461,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         // failure the user ever sees: classify on it, and carry it in the
         // message (bounded — this text lands in the durable session log).
         if (parsed.error !== undefined) {
-          const text = gatewayErrorText(parsed.error).slice(0, WIRE_LIMITS.errorChars)
+          const text = redactSecrets(gatewayErrorText(parsed.error), this.options.apiKey).slice(0, WIRE_LIMITS.errorChars)
           const quota = /quota|billing|credit|balance/i.test(text)
           const contextExceeded = isContextExceeded(400, text)
           // Default-retryable, but permanent diagnostics always win over a
@@ -335,14 +503,38 @@ export class OpenAiCompletionsProvider implements LlmProvider {
             const index = fragment.index
             if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= WIRE_LIMITS.calls) throw protocolError('invalid_tool_input', 'invalid tool index')
             const slot = calls[index] ?? { id: '', name: '', argsString: '' }
-            if (fragment.id !== undefined) {
-              if (typeof fragment.id !== 'string' || !fragment.id.trim() || (slot.id && slot.id !== fragment.id)) throw protocolError('invalid_tool_input', 'conflicting tool ID')
-              slot.id = fragment.id
+            if (fragment.id !== undefined && fragment.id !== null) {
+              const id = fragment.id
+              // A continuation fragment may repeat the header with no usable
+              // id (`null` / `""` — the live opencode-relayed DeepSeek stream
+              // does). That is "no id in this fragment", not a new call, so the
+              // slot keeps the id its header established; a call that never
+              // gets one fails the batch at finish, where identity is checked.
+              if (typeof id !== 'string') throw protocolError('invalid_tool_input', 'invalid tool ID')
+              if (id.trim() !== '') {
+                if (slot.id && slot.id !== id) {
+                  // A gateway may re-send the tool-call header with a fresh id at
+                  // the same index. While no arguments accumulated the slot still
+                  // describes one call, so the last header wins. Once arguments
+                  // exist the two ids would merge different calls into one
+                  // executable batch: a hard failure, unless the endpoint is
+                  // declared to re-send headers (`wire.toolCallIdReuse: 'expect'`,
+                  // where the accumulated arguments and name are kept).
+                  if (slot.argsString !== '' && this.options.wire?.toolCallIdReuse !== 'expect') throw protocolError('invalid_tool_input', 'conflicting tool ID')
+                  toolCallIdReissues += 1
+                }
+                slot.id = id
+              }
             }
-            if (fragment.function?.name !== undefined) {
+            if (fragment.function?.name !== undefined && fragment.function.name !== null) {
               const name = fragment.function.name
-              if (typeof name !== 'string' || !name.trim() || (slot.name && slot.name !== name)) throw protocolError('invalid_tool_input', 'conflicting tool name')
-              slot.name = name
+              // Same rule as the id: a repeated header may blank the name out.
+              // Only a usable name participates, so `""` leaves the slot alone.
+              if (typeof name !== 'string') throw protocolError('invalid_tool_input', 'invalid tool name')
+              if (name.trim() !== '') {
+                if (slot.name && slot.name !== name) throw protocolError('invalid_tool_input', 'conflicting tool name')
+                slot.name = name
+              }
             }
             const args = fragment.function?.arguments ?? ''
             if (typeof args !== 'string') throw protocolError('invalid_tool_input', 'invalid argument fragment')
@@ -381,6 +573,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       if (settled) reader.releaseLock()
       throw failure
     } finally {
+      detachAbort()
       if (!settled) {
         const closing = !cleanupAttempted
         try {
@@ -425,6 +618,45 @@ function gatewayErrorText(error: unknown): string {
     if (typeof message === 'string' && message !== '') return message
   }
   return JSON.stringify(error)
+}
+
+/**
+ * A compact excerpt of an HTTP error body for the surfaced message. Only
+ * structured JSON error payloads qualify (OpenAI `error` shape or a top-level
+ * `message` string), whitespace-collapsed and capped: a proxy's HTML page or a
+ * bare blob must never be pasted into the visible error, and an opaque status
+ * like `400: unknown` must still tell the operator what the relay complained
+ * about. The excerpt lands in the durable session log, so credentials are
+ * redacted: the configured key verbatim, and anything shaped like a token
+ * (an auth error commonly echoes the key it rejected).
+ */
+function httpErrorExcerpt(detail: string, apiKey: string): string {
+  const trimmed = detail.trim()
+  if (trimmed === '') return ''
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return ''
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return ''
+  const record = parsed as Record<string, unknown>
+  let text: string | undefined
+  if (record['error'] !== undefined && record['error'] !== null) text = gatewayErrorText(record['error'])
+  else if (typeof record['message'] === 'string' && record['message'] !== '') text = record['message']
+  if (text === undefined) return ''
+  const flat = redactSecrets(text, apiKey).replace(/\s+/g, ' ').trim()
+  if (flat === '') return ''
+  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
+}
+
+/** Token-shaped substrings: `sk-…`, `pk_…`, `key-…`, and `Bearer <token>`. */
+const SECRET_SHAPES = /\b(?:sk|pk|rk|key|api[-_]?key)[-_][A-Za-z0-9_-]{8,}|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi
+
+function redactSecrets(text: string, apiKey: string): string {
+  let out = text
+  if (apiKey.length >= 4) out = out.split(apiKey).join('[redacted]')
+  return out.replace(SECRET_SHAPES, '[redacted]')
 }
 
 /** The `usage` object of a completions chunk; cache fields vary by server. */
