@@ -15,7 +15,14 @@
  *
  * Usage:
  *   bun src/bins/headless.ts --message "hello"
+ *   bun src/bins/headless.ts --provider ocproxy --model deepseek-v4.1-flash-free --message "hello"
  *   bun src/bins/headless.ts            # interactive REPL, 'exit' quits
+ *
+ * Model selection: `--provider`/`--model` (`--model provider/model` is
+ * accepted too), else the same `providers.json` store the web host uses
+ * (`--config` points at a different file), else the legacy
+ * `DEEPSEEK_API_KEY` provider. `--thinking <level>` is validated against the
+ * selected model before it reaches the wire.
  */
 import { createInterface } from 'node:readline/promises'
 import path from 'node:path'
@@ -25,14 +32,18 @@ import {
   DeepSeekProvider,
   Kernel,
   LlmService,
+  OpenAiCompletionsProvider,
   ToolsService,
   attachApproval,
   bashTool,
   bashOutputTool,
+  expressibleThinkingLevel,
+  isThinkingLevel,
   killShellTool,
   fileSessions,
   fsTools,
   newInputId,
+  THINKING_LEVELS,
   WorkspaceService,
   type ApprovalOptions,
   type Agent,
@@ -63,6 +74,7 @@ import { DangerousCommandsStore } from '../harness/guard/store.ts'
 import { liftsReadOnlyBash, riskyBashMatch } from '../harness/modes/bash-policy.ts'
 import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { homedir } from 'node:os'
+import { loadProviderStore, maxOutputTokenOverrides, repairDefaults } from '../web/provider-store.ts'
 
 loadRepoEnv()
 
@@ -71,6 +83,11 @@ interface CliOptions {
   readonly root: string
   readonly dataDir: string
   readonly message: string | undefined
+  /** Provider store consulted for the effective provider/model selection. */
+  readonly config: string
+  readonly provider: string | undefined
+  readonly model: string | undefined
+  readonly thinking: string | undefined
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
@@ -78,14 +95,25 @@ function parseArgs(argv: readonly string[]): CliOptions {
   let root = process.cwd()
   let dataDir = path.join(resolveAppHome(process.cwd()), 'data')
   let message: string | undefined
+  // Mirrors the web host's provider store, so the CLI and the UI select from
+  // the same file unless `--config` points somewhere else.
+  let config = path.join(resolveAppHome(), 'providers.json')
+  let provider: string | undefined
+  let model: string | undefined
+  let thinking: string | undefined
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--yolo') yolo = true
     else if (arg === '--root') root = argv[i + 1] ?? root
     else if (arg === '--data-dir') dataDir = argv[i + 1] ?? dataDir
     else if (arg === '--message') message = argv[i + 1]
+    else if (arg === '--config') config = argv[i + 1] ?? config
+    // A selection flag with no value is reported, not silently dropped.
+    else if (arg === '--provider') provider = argv[i + 1] ?? ''
+    else if (arg === '--model') model = argv[i + 1] ?? ''
+    else if (arg === '--thinking') thinking = argv[i + 1] ?? ''
   }
-  return { yolo, root, dataDir, message }
+  return { yolo, root, dataDir, message, config, provider, model, thinking }
 }
 
 /** Render one session's durable stream to stdout as events arrive. */
@@ -146,8 +174,83 @@ async function askUser(call: { name: string; args: Record<string, unknown> }): P
 }
 
 async function main(): Promise<void> {
-  const { yolo, root, dataDir, message } = parseArgs(process.argv.slice(2))
+  const { yolo, root, dataDir, message, config, provider: flagProvider, model: flagModel, thinking: flagThinking } = parseArgs(process.argv.slice(2))
   const apiKey = readApiKey()
+  // Providers come from the same store the web host edits, plus the legacy env
+  // key — never from an implicit mock. Loaded before any resource is taken so
+  // a bad flag exits without holding the data home.
+  const store = loadProviderStore(config)
+  const enabled = store.providers.filter((entry) => entry.enabled)
+  const legacyKey = apiKey !== undefined && enabled.some((entry) => entry.id === 'deepseek') ? undefined : apiKey
+  if (enabled.length === 0 && legacyKey === undefined) {
+    process.stderr.write(`no provider configured (${config}) and no DEEPSEEK_API_KEY; model calls fail until one is registered.\n`)
+  }
+  for (const [flag, value] of [['--provider', flagProvider], ['--model', flagModel], ['--thinking', flagThinking]] as const) {
+    if (value === '') {
+      process.stderr.write(`dnt-harness: ${flag} needs a value.\n`)
+      process.exitCode = 1
+      return
+    }
+  }
+
+  // The one effective selection, resolved once: explicit flags, then the
+  // store's defaults, then the legacy env provider. It is stamped on every
+  // request, so a run never depends on whichever model the provider happens
+  // to advertise first. Only providers that will actually be registered are
+  // candidates: an enabled store entry, or the legacy env provider.
+  const storedDefaults = repairDefaults(store.defaults, store.providers)
+  const candidates = new Map<string, { readonly models: readonly string[]; readonly modelSettings?: (typeof enabled)[number]['modelSettings'] }>(
+    enabled.map((entry) => [entry.id, entry]),
+  )
+  if (legacyKey !== undefined) candidates.set('deepseek', { models: new DeepSeekProvider('').models })
+  let selectedProvider = flagProvider
+  let selectedModel = flagModel
+  if (selectedProvider === undefined && selectedModel !== undefined) {
+    // `--model <provider>/<model>` sugar, resolved only against a registered
+    // provider id: real model ids may contain slashes of their own.
+    const cut = selectedModel.indexOf('/')
+    if (cut > 0 && candidates.has(selectedModel.slice(0, cut))) {
+      selectedProvider = selectedModel.slice(0, cut)
+      selectedModel = selectedModel.slice(cut + 1)
+    }
+  }
+  if (selectedProvider !== undefined && !candidates.has(selectedProvider)) {
+    const known = [...candidates.keys()]
+    process.stderr.write(`dnt-harness: provider '${selectedProvider}' is not configured or not enabled${known.length > 0 ? ` (available: ${known.join(', ')})` : ''}.\n`)
+    process.exitCode = 1
+    return
+  }
+  if (selectedModel !== undefined) {
+    // A bare model still needs a provider; prefer the one that advertises it.
+    selectedProvider = selectedProvider ?? [...candidates].find(([, entry]) => entry.models.includes(selectedModel!))?.[0]
+  }
+  const defaultProvider = storedDefaults.provider !== null && storedDefaults.provider !== undefined && candidates.has(storedDefaults.provider) ? storedDefaults.provider : undefined
+  selectedProvider = selectedProvider ?? defaultProvider ?? (legacyKey !== undefined ? 'deepseek' : undefined)
+  selectedModel = selectedModel ?? (defaultProvider !== undefined && defaultProvider === selectedProvider ? storedDefaults.model ?? undefined : candidates.get(selectedProvider ?? '')?.models[0])
+  let selectedThinking = storedDefaults.thinkingLevel ?? (selectedProvider !== undefined && selectedModel !== undefined ? candidates.get(selectedProvider)?.modelSettings?.[selectedModel]?.thinkingLevel : undefined)
+  if (flagThinking !== undefined) {
+    if (!isThinkingLevel(flagThinking)) {
+      process.stderr.write(`dnt-harness: --thinking must be one of ${THINKING_LEVELS.join(', ')}.\n`)
+      process.exitCode = 1
+      return
+    }
+    const accepted = expressibleThinkingLevel(selectedModel, flagThinking)
+    if (accepted === undefined) {
+      process.stderr.write(`dnt-harness: model '${selectedModel ?? '(none)'}' cannot express thinking level '${flagThinking}'.\n`)
+      process.exitCode = 1
+      return
+    }
+    selectedThinking = accepted
+  } else if (selectedThinking !== undefined) {
+    // A stored level is a preference, not a contract: an unsupported one is
+    // simply not carried, exactly as the web host resolves it.
+    selectedThinking = expressibleThinkingLevel(selectedModel, selectedThinking)
+  }
+  if (selectedProvider === undefined) {
+    process.stderr.write(`no provider selected: pass --provider or configure ${config}.\n`)
+  } else if (selectedModel === undefined) {
+    process.stderr.write(`no model selected for provider '${selectedProvider}': pass --model; requests fall back to its first model.\n`)
+  }
   // One writer per data home: a web host (or another CLI) on the same
   // directory would append independent sequence numbers to shared logs.
   let ownerLock: DataHomeLock
@@ -230,10 +333,19 @@ async function main(): Promise<void> {
   kernel.ctx.tools.register(killShellTool({ processes }))
   kernel.ctx.tools.register(todoWriteTool())
   kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir), ...defaultSecretRoots(homedir())], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
-  if (apiKey !== undefined) {
-    kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
-  } else {
-    process.stderr.write('no DEEPSEEK_API_KEY; model calls fail until a provider is registered.\n')
+  // Providers come from the same store the web host edits, plus the legacy
+  // env key — never from an implicit mock.
+  for (const entry of enabled) {
+    kernel.ctx.llm.register(new OpenAiCompletionsProvider({
+      name: entry.id,
+      apiKey: entry.apiKey,
+      baseUrl: entry.baseUrl,
+      ...(entry.models.length > 0 ? { models: entry.models } : {}),
+      maxOutputTokens: maxOutputTokenOverrides(entry),
+    }))
+  }
+  if (legacyKey !== undefined) {
+    kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
   }
 
   const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
@@ -257,11 +369,11 @@ async function main(): Promise<void> {
       workspacePath: canonicalRoot,
     })
     // The provider's last report calibrates the budget, as in the web host.
-    const calibration = latestCalibration(session.events, { model: projected.model, provider: projected.providerName })
+    const calibration = latestCalibration(session.events, { model: selectedModel, provider: selectedProvider })
     const assembled = buildContext({
       events: session.events, mode, modeRevision: 0,
-      model: projected.model, providerName: projected.providerName,
-      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(projected.model === undefined ? {} : { model: projected.model }),
+      model: selectedModel, providerName: selectedProvider,
+      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(selectedModel === undefined ? {} : { model: selectedModel }),
       ...(environment !== undefined ? { environment } : {}),
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(calibration !== undefined ? { calibration } : {}),
@@ -271,7 +383,19 @@ async function main(): Promise<void> {
     const contextId = randomUUID()
     const turnId = agentScope.getStore()?.turnId
     if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
-    return next({ ...projected, contextId, messages: assembled.messages, tools: schemas, outputCeilingTokens: assembled.maxOutputTokens })
+    return next({
+      ...projected,
+      ...(selectedProvider !== undefined ? { providerName: selectedProvider } : {}),
+      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
+      ...(selectedThinking !== undefined ? { thinkingLevel: selectedThinking } : {}),
+      // Stable per conversation: every request of this session carries the
+      // same affinity, so provider-side prefix caches stay reusable.
+      sessionAffinity: session.id,
+      contextId,
+      messages: assembled.messages,
+      tools: schemas,
+      outputCeilingTokens: assembled.maxOutputTokens,
+    })
   }, true)
 
   /** Durably accept one input, adopt anything still pending, then run. */

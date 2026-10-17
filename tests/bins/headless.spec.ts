@@ -69,7 +69,7 @@ describe('headless CLI', () => {
     const address = provider.address() as { port: number }
     const env = { DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}` }
     try {
-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'remember'], env)
+      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'remember'], env)
       expect(result.code).toBe(0)
       const context = requests[0]!.messages.map((message) => message.content).join('\n')
       expect(context).toContain(wsRoot)
@@ -83,7 +83,7 @@ describe('headless CLI', () => {
       await mkdir(modes, { recursive: true })
       await writeFile(path.join(modes, 'no-memory.md'), '---\nname: No memory\nmemoryPinned: false\nmemoryRetrieval: false\n---\n\nMemory disabled.\n')
       await writeFile(path.join(modes, '.selected.json'), JSON.stringify({ selected: 'no-memory' }))
-      const disabled = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'again'], env)
+      const disabled = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'again'], env)
       expect(disabled.code).toBe(0)
       expect(requests[2]!.messages.map((message) => message.content).join('\n')).not.toContain('CLI index marker')
       await expect(readFile(path.join(projectRoot, 'disabled.md'))).rejects.toThrow()
@@ -112,7 +112,7 @@ describe('headless CLI', () => {
     await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
     const address = provider.address() as { port: number }
     try {
-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'look'], {
+      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'look'], {
         DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
       })
       expect(result.code).toBe(0)
@@ -149,7 +149,7 @@ describe('headless CLI', () => {
     await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
     const address = provider.address() as { port: number }
     try {
-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'clean up'], {
+      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'clean up'], {
         DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
       })
       expect(result.code).toBe(0)
@@ -162,7 +162,7 @@ describe('headless CLI', () => {
 
   it('starts without DEEPSEEK_API_KEY and does not fall back to a mock provider', async () => {
     dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-'))
-    const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--message', 'hello'])
+    const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--message', 'hello'])
 
     expect(code).toBe(0)
     expect(stderr).toContain('no DEEPSEEK_API_KEY')
@@ -170,4 +170,158 @@ describe('headless CLI', () => {
     expect(stdout).toContain('no provider registered')
     expect(stdout).not.toContain('mock')
   }, 30_000)
+
+  describe('model selection', () => {
+    /** A store entry pointing at a fake OpenAI-compatible gateway. */
+    async function writeStore(configFile: string, baseUrl: string, options: { model?: string; defaults?: boolean } = {}): Promise<void> {
+      const model = options.model ?? 'deepseek-v4.1-flash-free'
+      await writeFile(configFile, JSON.stringify({
+        version: 2,
+        defaults: options.defaults === true ? { provider: 'fake', model, thinkingLevel: null } : { provider: null, model: null, thinkingLevel: null },
+        providers: [{ id: 'fake', name: 'fake', baseUrl: `${baseUrl}/v1`, apiKey: '', models: [model], enabled: true }],
+        aliases: [],
+        aliasGeneration: 0,
+      }))
+    }
+
+    async function sessionEvents(dir: string): Promise<Record<string, any>[]> {
+      const logs = (await readdir(dir, { recursive: true })).filter((file) => file.endsWith('events.jsonl') && file.includes(`${path.sep}sessions${path.sep}`))
+      return (await readFile(path.join(dir, logs[0]!), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>)
+    }
+
+    it('--provider/--model/--thinking reach the wire and the durable log', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-select-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const bodies: Record<string, unknown>[] = []
+      const headers: Record<string, unknown>[] = []
+      const provider = createServer(async (req, res) => {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        bodies.push(JSON.parse(raw) as Record<string, unknown>)
+        headers.push(req.headers)
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
+      })
+      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+      const address = provider.address() as { port: number }
+      const config = path.join(dataDir, 'providers.json')
+      await writeStore(config, `http://127.0.0.1:${address.port}`)
+      try {
+        const result = await runCli([
+          '--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'hi',
+          '--provider', 'fake', '--model', 'deepseek-v4.1-flash-free', '--thinking', 'high',
+        ])
+        expect(result.code).toBe(0)
+        expect(bodies[0]?.['model']).toBe('deepseek-v4.1-flash-free')
+        // The level must reach the wire, not stop at the settings layer.
+        expect(bodies[0]?.['reasoning_effort']).toBe('high')
+        // One stable affinity for the conversation.
+        expect(headers[0]?.['x-session-affinity']).toBeTypeOf('string')
+        const events = await sessionEvents(dataDir)
+        expect(events.find((event) => event.type === 'assistant/message')?.controls).toEqual({ model: 'deepseek-v4.1-flash-free', provider: 'fake' })
+      } finally {
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+      }
+    }, 30_000)
+
+    it('without flags the provider store decides the pair, and provider/model sugar works', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-defaults-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const models: unknown[] = []
+      const provider = createServer(async (req, res) => {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        models.push((JSON.parse(raw) as Record<string, unknown>)['model'])
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
+      })
+      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+      const address = provider.address() as { port: number }
+      const config = path.join(dataDir, 'providers.json')
+      await writeStore(config, `http://127.0.0.1:${address.port}`, { model: 'stored-model', defaults: true })
+      try {
+        const stored = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'one'])
+        expect(stored.code).toBe(0)
+        expect(models[0]).toBe('stored-model')
+        // `--model <provider>/<model>` is resolved against the store.
+        const sugar = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'two', '--model', 'fake/stored-model'])
+        expect(sugar.code).toBe(0)
+        expect(models[1]).toBe('stored-model')
+        expect(sugar.stderr).not.toContain('no provider selected')
+      } finally {
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+      }
+    }, 30_000)
+
+    it('refuses a thinking level the selected model cannot express', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-thinking-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const config = path.join(dataDir, 'providers.json')
+      await writeStore(config, 'http://127.0.0.1:1', { model: 'mystery-model' })
+      const unknown = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--thinking', 'bogus'])
+      expect(unknown.code).toBe(1)
+      expect(unknown.stderr).toContain('--thinking must be one of')
+
+      const unsupported = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--model', 'mystery-model', '--thinking', 'high'])
+      expect(unsupported.code).toBe(1)
+      expect(unsupported.stderr).toContain("cannot express thinking level 'high'")
+      // The rejected flag never opened a session or touched the data home.
+      expect((await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl'))).toHaveLength(0)
+    }, 30_000)
+
+    it('refuses an unknown or disabled provider and a selection flag with no value, before touching the data home', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-bad-provider-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const config = path.join(dataDir, 'providers.json')
+      await writeFile(config, JSON.stringify({
+        version: 2,
+        defaults: { provider: null, model: null, thinkingLevel: null },
+        providers: [
+          { id: 'fake', name: 'fake', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '', models: ['m'], enabled: true },
+          { id: 'off', name: 'off', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '', models: ['m'], enabled: false },
+        ],
+        aliases: [],
+        aliasGeneration: 0,
+      }))
+      const unknown = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--provider', 'nope'])
+      expect(unknown.code).toBe(1)
+      expect(unknown.stderr).toContain("provider 'nope' is not configured or not enabled (available: fake)")
+
+      const disabled = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--provider', 'off'])
+      expect(disabled.code).toBe(1)
+      expect(disabled.stderr).toContain("provider 'off' is not configured or not enabled")
+
+      const missing = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--model'])
+      expect(missing.code).toBe(1)
+      expect(missing.stderr).toContain('--model needs a value')
+      expect((await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl'))).toHaveLength(0)
+    }, 30_000)
+
+    it('legacy DEEPSEEK_API_KEY alone selects deepseek-chat, so --thinking works with no store', async () => {
+      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-legacy-'))
+      const root = fileURLToPath(new URL('../../', import.meta.url))
+      const bodies: Record<string, unknown>[] = []
+      const provider = createServer(async (req, res) => {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        bodies.push(JSON.parse(raw) as Record<string, unknown>)
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
+      })
+      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+      const address = provider.address() as { port: number }
+      try {
+        const result = await runCli(
+          ['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'hi', '--thinking', 'high'],
+          { DEEPSEEK_API_KEY: 'sk-test-legacy', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}` },
+        )
+        expect(result.code).toBe(0)
+        expect(result.stderr).not.toContain('no model selected')
+        expect(bodies[0]?.['model']).toBe('deepseek-chat')
+        expect(bodies[0]?.['reasoning_effort']).toBe('high')
+      } finally {
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+      }
+    }, 30_000)
+  })
 })
