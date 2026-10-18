@@ -1,9 +1,14 @@
+import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { expect, it } from 'vitest'
 import { createWebServer } from '../../src/web/server.ts'
 import type { SessionId, WorkspaceId } from '../../src/util/brand.ts'
 
 it('filters parent snapshot and live replay, resumes by cursor, and preserves default clients', async () => {
-  const server = await createWebServer({ providers: [] })
+  // A temp provider store keeps the host off the user's real providers.json.
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'session-load-perf-'))
+  const server = await createWebServer({ providers: [], configFile: path.join(root, 'providers.json') })
   try {
     const wid = 'default'
     const session = server.kernel.ctx.sessions.create(wid as WorkspaceId)
@@ -35,5 +40,5 @@ it('filters parent snapshot and live replay, resumes by cursor, and preserves de
     expect(chunk).toContain('agent/child-result')
     expect(chunk).not.toContain('must not leak')
     await reader.cancel()
-  } finally { await server.close() }
+  } finally { await server.close(); await fs.rm(root, { recursive: true, force: true }) }
 })
