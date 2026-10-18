@@ -831,8 +831,9 @@ boundaries matter more than the feature:
   Closing the last terminal is a decision and is never undone automatically.
 - **Default shell** is a browser-local preference (`terminalShell` in
   `dnt-harness.workbench.v1`), set from the Terminal view's shell menu. Unset, it
-  defers to the host's own order: the platform's login shell first (zsh on
-  macOS), then Bash, then PowerShell when Bash is absent on Windows. A
+  defers to the host's own order: the platform's login shell first (on macOS
+  the account's login shell, zsh by default or Bash after `chsh`), then Bash,
+  then PowerShell when Bash is absent on Windows. A
   remembered shell the host no longer offers falls back to that order instead
   of failing every open.
 - **Shells** come from the shared resolver (`capabilities/shell/detect.ts`) and
@@ -863,18 +864,37 @@ about six connections per origin and the chat stream already holds one.
 Keystrokes POST to `/input` batched per 16 ms frame rather than per character.
 
 On macOS and Linux under Bun the PTY is Bun's built-in `Bun.spawn({ terminal })`.
+On macOS both shells start as login shells (`-l -i`), as Terminal.app does,
+so `/etc/zprofile` and `~/.zprofile` (where Homebrew adds itself to PATH) are
+read; the account's login shell is used by its exact path (a Homebrew zsh or
+bash included) unless `DNT_HARNESS_BASH` pins bash. When the host names no
+locale (`LC_ALL`, `LC_CTYPE` and `LANG` all unset, common under launchd or an
+IDE), the shell gets `LC_CTYPE=UTF-8` so its line editor accepts UTF-8 input;
+an explicit locale is kept. Linux keeps a non-login interactive bash (`-i`).
 On Windows it is `bun-pty` (a prebuilt Rust library loaded through `bun:ffi`,
 no install script), imported lazily. If it cannot load, the routes answer
 `501` with the reason and the rest of the product is untouched.
 
 **Platform support (this release).** Windows (bun-pty/ConPTY) has local
 smoke evidence (`bun scripts/pty-smoke-windows.mjs`: bash, PowerShell, cmd
-I/O, resize, natural exit, kill with background-job cleanup, 16 terminals). Linux (Bun 1.4.3 built-in PTY) is gated by
-`bun scripts/pty-probes.mjs --require` in the `runtime-probes` CI job (pending
-its first green CI run; no Linux evidence is recorded until then). **macOS
-is unverified.** The `ps`/tty session inspector exists, but no zsh/Bash
-teardown evidence has been recorded, so macOS terminal support is not claimed.
-See [release-checklist.md](release-checklist.md).
+I/O, resize, natural exit, kill with background-job cleanup, 16 terminals).
+Linux and macOS (Bun 1.4.3 built-in PTY) are gated by
+`bun scripts/pty-probes.mjs --require [--shell zsh|bash]` in the
+`runtime-probes` CI job: bash on ubuntu-24.04 and zsh 5.9 plus bash 3.2.57 on
+macos-15 (arm64), all green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
+The probes cover input/output, resize, remove, HUP→KILL escalation of a
+HUP-trapping shell and job, natural exit with a leftover background job, idle
+reap, `disposeAll` of 16 terminals within the shutdown budget, bounded
+create/close, split UTF-8, the default (login) shell on macOS, and an unrelated
+process that must never be signalled. **macOS terminal support (zsh and Bash)
+is claimed** on that run plus a local run on real macOS 26 (arm64).
+
+Session membership is read per platform: `/proc/<pid>/stat` on Linux, and on
+macOS `ps` for the process list plus getsid(2) (through `bun:ffi`) for each
+process's session. macOS reports no session id in `ps`, and the controlling
+tty is not an anchor: once the shell exits the kernel revokes the tty, so the
+jobs it left behind show `??` with parent 1 — getsid still names their
+session. See [release-checklist.md](release-checklist.md).
 
 ### Teardown semantics
 

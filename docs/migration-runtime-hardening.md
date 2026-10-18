@@ -109,9 +109,9 @@ switch.
 - **Limitation:** an external SIGKILL or host crash during teardown can leave
   shells/jobs running. There is no orphan reaping. Detached daemons are never
   cleaned up.
-- Support: Windows has smoke evidence, Linux is gated by CI probes
-  (pending their first green CI run), and
-  **macOS is unverified (not claimed)**.
+- Support: Windows has smoke evidence; Linux (bash) and macOS (zsh and
+  Bash) are gated by the `runtime-probes` CI probes, green in
+  [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
 
 ## Outbound policy (MCP HTTP, OAuth, foreign media)
 

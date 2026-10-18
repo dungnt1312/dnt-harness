@@ -47,7 +47,7 @@ The published tarball (`files` in `package.json`) holds
 
 Releasing: tag-triggered publish through `.github/workflows/release.yml`. The
 publish job needs every gate job (typecheck + `build:web`, deterministic
-suites, Linux runtime/PTY probes) and approval in the protected `release`
+suites, Linux and macOS runtime/PTY probes) and approval in the protected `release`
 environment. These gates are wired but pending their first green CI run.
 A separate `pack` job (no OIDC token) builds the tarball; `publish` only
 uploads it with `npm publish --ignore-scripts`. Follow [release-checklist.md](release-checklist.md); the manual
@@ -66,9 +66,12 @@ Node older than 22.19 (Vitest 3 + Undici 7). Put a supported Node first on PATH
 (e.g. `C:\laragon\bin\nodejs\node-v22.20.0-win-x64`). `bun run probe:runtime`
 (`scripts/runtime-probes.mjs`) checks that the Bun runtime is 1.4.3, that the
 resolved real Undici honors a custom dispatcher (bare `undici` under Bun is a
-native shim and does not), and that DNS lookup works. On Linux,
-`bun scripts/pty-probes.mjs --require` exercises real bash PTY teardown. Off
-Linux it skips, and `--require` makes it fail instead.
+native shim and does not), and that DNS lookup works. On Linux and macOS,
+`bun scripts/pty-probes.mjs --require` exercises real PTY teardown with bash;
+add `--shell zsh` for zsh. Elsewhere it skips, and `--require` makes it fail
+instead. CI runs bash on Linux and both shells on macOS
+([run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003)), which is the
+evidence for the Linux and macOS terminal support claims.
 
 ## Getting started (from source)
 

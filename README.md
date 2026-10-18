@@ -50,12 +50,13 @@ for behaviour changes in this release.
 
 **Platform support.** Terminal (PTY) support is claimed only where it has
 been verified. Windows (bun-pty/ConPTY) has local smoke evidence
-(`bun scripts/pty-smoke-windows.mjs`). Linux
-(Bun built-in PTY) is gated by the `runtime-probes` CI job
-(`bun scripts/pty-probes.mjs --require`); that gate is wired but pending
-its first green CI run, so Linux evidence is not yet recorded. **macOS terminal support is
-unverified** and is not claimed until zsh/Bash smoke evidence exists. See
-[docs/release-checklist.md](docs/release-checklist.md).
+(`bun scripts/pty-smoke-windows.mjs`). Linux and macOS (Bun built-in PTY)
+are gated by the `runtime-probes` CI job (`bun scripts/pty-probes.mjs
+--require`): bash on Linux (ubuntu-24.04), and zsh plus the system bash 3.2
+on macOS (macos-15, arm64), both green in
+[run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003). **macOS terminal support
+(zsh and Bash) is claimed** on that CI evidence and on a local run on real
+macOS 26 (arm64). See [docs/release-checklist.md](docs/release-checklist.md).
 
 `dnt-harness` has three subcommands; everything after the subcommand is passed
 to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
@@ -107,8 +108,9 @@ bun run build:web
 bun run probe:runtime   # Bun runtime probes (Undici dispatcher, DNS policy)
 ```
 
-The Workbench terminal uses Bun's built-in PTY on POSIX (Linux gated in CI,
-pending its first green run; macOS unverified, see above). On Windows
+The Workbench terminal uses Bun's built-in PTY on POSIX (Linux and macOS,
+gated in CI, see above). On macOS it opens your login shell (zsh by default)
+as a login shell, like Terminal.app. On Windows
 it uses `bun-pty`, which ships a prebuilt Rust PTY library for each platform
 and loads it through `bun:ffi`: no install script and no build toolchain. Everything else runs normally without it — a missing PTY backend
 disables the terminal and nothing else.

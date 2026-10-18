@@ -12,7 +12,8 @@ only when all of these hold:
      llm-openai, bench-metrics, base-prompt-guidance).
    - `linux-runtime-probes` (`runtime-probes.yml` via `workflow_call`): Bun
      1.4.3 runtime/Undici/DNS probes and `bun scripts/pty-probes.mjs --require`
-     (real bash PTY teardown).
+     (real bash PTY teardown) on Linux, plus the `macos-pty-probes` job:
+     the same probes with `--shell zsh` and `--shell bash` on macos-15.
    - `pack` (no OIDC token): tag equals version, `bun install
      --frozen-lockfile`, `npm pack` (prepack = `vite build`), tarball uploaded
      as an artifact.
@@ -101,18 +102,20 @@ Run on Windows with Bun 1.4.3 using an **absolute** Bun path for PM2:
       Linux terminal support is not claimed without this. (Pending its first
       green CI run.)
 
-### macOS (only if the release claims macOS terminal support)
+### macOS (claimed: zsh and Bash terminals)
 
-macOS terminal support is **currently not claimed**. To claim it:
+macOS terminal support **is claimed** for this release. Evidence:
 
-- [ ] On real macOS with Bun 1.4.3, zsh and Bash: input/output, resize, close,
+- [x] On real macOS with Bun 1.4.3, zsh and Bash: input/output, resize, close,
       idle reap, natural exit, and shutdown teardown of foreground/background
-      jobs and a HUP-trapping job (same scenarios as `scripts/pty-probes.mjs`).
-- [ ] Then update README.md, docs/web.md and docs/guides.md to say macOS is
-      supported.
-
-Without this evidence, the release scope is **Windows + Linux**, and the docs
-must say macOS is unverified.
+      jobs and a HUP-trapping job (`scripts/pty-probes.mjs`). Local: macOS 26
+      (arm64), zsh 5.9 and bash 3.2.57, 11/11 probes each with
+      `--require --shell zsh` and `--require --shell bash`. CI: the
+      `macos-pty-probes` job (macos-15 arm64, macOS 15.7), 11/11 for both
+      shells, green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
+- [x] README.md, docs/web.md and docs/guides.md say macOS is supported.
+- [ ] `macos-pty-probes` green on the release tag (link the run). If it is not,
+      drop the macOS claim from those docs before publishing.
 
 ### Optional live smokes (needed before the matching support claim)
 
