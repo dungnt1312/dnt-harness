@@ -6,10 +6,10 @@ Date: 2026-10-18. Baseline `337af2d`. HEAD `593cfc4`. Plan status: **in-review**
 
 | # | Phase | Summary |
 |---|---|---|
-| 0 | Baseline, runtimes | Node >=22.19 preflight, explicit Bun 1.4.3 resolver, `scripts/runtime-probes.mjs`, and a Linux CI probe job (`runtime-probes.yml`). Windows baseline recorded. Linux CI has never run. |
+| 0 | Baseline, runtimes | Node >=22.19 preflight, explicit Bun 1.4.3 resolver, `scripts/runtime-probes.mjs`, and a Linux CI probe job (`runtime-probes.yml`). Windows baseline recorded. Linux probe job green on 2026-10-18 ([run 39144804342](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342)); the full Vitest suite has not run on Linux or macOS. |
 | 1 | Outbound transport | `outbound-http.ts` loads real Undici by resolved entry and fails closed without a real dispatcher. Connect-time DNS vetting is applied to MCP, OAuth and foreign media. Media redirects keep the same-origin exception only until the first foreign hop. Bun probe 13/13. |
 | 2 | Bench repo safety | `compare-opencode-dnt` never resets or restores the source. Hardened read-only Git freeze. Per-contestant repos are rebuilt from HEAD/index/worktree layers (HEAD only, no history). Drift fails the run and keeps artifacts. |
-| 3 | PTY lifecycle | State machine `running → closing → exited \| failedTeardown`. Teardown is idempotent and session-owned (HUP → KILL with identity checks). DELETE awaits the outcome. Shutdown is bounded at 13.5s, under PM2's 15s. Linux/macOS process inspectors are unverified on real OSes. |
+| 3 | PTY lifecycle | State machine `running → closing → exited \| failedTeardown`. Teardown is idempotent and session-owned (HUP → KILL with identity checks). DELETE awaits the outcome. Shutdown is bounded at 13.5s, under PM2's 15s. The Linux process inspector is verified by the Linux PTY probes (run 39144804342); the macOS inspector is unverified. |
 | 4 | Model caps/errors | Shared `effective-model.ts` resolver with a versioned route identity (HMAC credential generation). 32k fallback plus bounded, memory-only relearn. The ceiling never invents a cap. Structured classifier: cap rejection is terminal, while shared-window overflow still squeezes. |
 | 5 | Reasoning round-trip | Optional `reasoning {text, complete, source}` on assistant messages. Strict DeepSeek replay of same-route complete reasoning. The pre-network gate covers the active tool loop. Nothing is fabricated. Reasoning is redacted before persistence. Compaction dual-reads v1/v2. Stored reasoning is never sent to delegation, child reports or SSE. |
 | 6 | Metrics, prompt, docs, release | Bench cache metrics are normalized per record, and missing usage stays unknown. The prompt drops the absolute bans. The release workflow `needs:` all gates, uses SHA-pinned actions, and builds the tarball without OIDC. Added migration notes and a release checklist. |
@@ -35,7 +35,7 @@ Every phase went through code review, and its findings were fixed before commit.
 
 ## Acceptance criteria
 
-Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun probe)** = real Bun 1.4.3 probe on Windows. **Pass (Linux CI)** = `runtime-probes` job on GitHub `ubuntu-latest`, Bun 1.4.3, Node 22.20.0, 2026-10-18, run [39144703578](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578) (PR #1). **Pending (Linux CI)** / **Pending (live smoke)** = gate not run. **Not met** = not implemented.
+Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun probe)** = real Bun 1.4.3 probe on Windows. **Pass (Linux CI)** = `runtime-probes` job on GitHub `ubuntu-latest`, Bun 1.4.3, Node 22.20.0, 2026-10-18, run [39144804342](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342) (PR #1). **Pending (Linux CI)** / **Pending (live smoke)** = gate not run. **Not met** = not implemented.
 
 | ID | Status | Note |
 |---|---|---|
@@ -67,7 +67,7 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | PH3-A..E | Pass (Windows/Node) | 28-row classifier table. Squeeze path is exercised through the real adapter and agent loop. |
 | PH4-A..F | Pass (Windows/Node) | Fake strict DeepSeek gateway: real HTTP/SSE plus a real CLI process. |
 | PH4-G | Pass (2026-10-18, Bun 1.4.3) | `scripts/smoke-deepseek-reasoning.ts` against the `ocproxy-2` OpenAI-compatible proxy, model `deepseek-v4.1-flash-free`, thinking `high`: turn 1 completed (3 assistant messages, 1 with complete reasoning, 2 tool results); turn 2 on the same session completed (5 assistants, 2 with reasoning, 3 tool results). Proves reasoning replay through that proxy; not the first-party DeepSeek endpoint or `deepseek-v4-pro`. |
-| QH-1 | Partial: Linux CI Pass; admin config pending | Runtime pins and gated release workflow are done. Linux `runtime-probes` is green ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578), 2026-10-18). Protected release env and tag protection are outstanding. |
+| QH-1 | Partial: Linux CI Pass; admin config pending | Runtime pins and gated release workflow are done. Linux `runtime-probes` is green ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342), 2026-10-18). Protected release env and tag protection are outstanding. |
 | QH-2 | Partial: metrics/docs Pass; prompt eval Not met | §11.3 behavioral recall/tool-count eval was not done. Prompt checks are string-level only. |
 
 ## Final verification (Windows)
@@ -86,11 +86,11 @@ Triage of the 5 files that fail at HEAD but are not on the baseline list:
 - `server-g1`, `repo-freeze`, `server-model-alias`: pass when run alone. Load flakes.
 - `registry.spec` "ring cap", `server-compaction` "cancels a hanging PreCompact hook" / "automatic pressure trigger" (ENOENT on checkpoint tmp): these also fail intermittently at baseline `337af2d`. They are pre-existing, and the first baseline run under-reported them. Running server-compaction + registry together gives 41/41 at both baseline and HEAD, in repeated runs.
 
-Verdict: no regression attributable to this plan was found. The Linux suite/probe baseline does not exist yet.
+Verdict: no regression attributable to this plan was found. Linux probe baseline exists as of 2026-10-18 ([run 39144804342](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342): runtime probes 8/8, repo-freeze spec 71/71, PTY probes 9/9). A full Vitest suite baseline on Linux or macOS does not exist yet.
 
 ## Pending gates (release-blocking)
 
-1. ~~GitHub Linux CI never ran.~~ Closed 2026-10-18: `runtime-probes` on PR #1 passed ([run 39144703578](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578); first run 39144485540 also green before the RH2-C step was added). Runtime probes 8/8 (outbound-http 16/16), repo-freeze spec 71/71, PTY probes 9/9. RH1-B Linux DNS, RH2-C POSIX names and RH3-A/C/E pass; Bun's built-in PTY is go for Linux. The full Vitest suite is still not run on Linux.
+1. ~~GitHub Linux CI never ran.~~ Closed 2026-10-18: `runtime-probes` on PR #1 passed ([run 39144804342](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342); earlier runs 39144485540 and 39144703578 also green, the first one before the RH2-C step was added). Runtime probes 8/8 (outbound-http 16/16), repo-freeze spec 71/71, PTY probes 9/9. RH1-B Linux DNS, RH2-C POSIX names and RH3-A/C/E pass; Bun's built-in PTY is go for Linux. The full Vitest suite is still not run on Linux or macOS.
 2. macOS: no evidence. macOS terminal support must not be claimed.
 3. RH1-G: public HTTPS MCP passed under Bun; OAuth refresh/revoke and media remain unrun.
 4. PH4-G: passed via the `ocproxy-2` proxy with `deepseek-v4.1-flash-free`. A run against the first-party DeepSeek endpoint is still unrecorded; claim native thinking+tools support only as proven through that proxy.
@@ -116,7 +116,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 - **Cap relearn:** relies on provider error text (bounded formats, one resend, ≤256000). A corrective resend consumes one logical-request attempt.
 - **Compaction summarizer:** may now fail fast as `context_exceeded` on very full windows, then fall back to extractive.
 - **Reasoning, live endpoint:** if the endpoint enforces older turns more strictly than the gate, legacy tool sessions get the actionable 400 hint. Redaction masks token shapes only. A process without the persisted hasher does not replay across restarts.
-- **Real-cert TLS** through the custom Undici connect is untested.
+- **Real-cert TLS** through the custom Undici connect is covered only by the RH1-G public MCP smoke on macOS (one endpoint).
 - **bun-pty native DLLs:** reviewed hashes are recorded in the release checklist. Re-review on any version bump.
 - **Rebase:** re-run the PH4 attempt-boundary tests after any rebase onto the HC plan (`plans/261017-0018-harness-core-hardening/`).
 - **Test suite on this machine:** needs `--maxWorkers=3`, and load flakes make full-suite comparisons noisy.
@@ -130,7 +130,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 
 ## Follow-ups
 
-1. Done 2026-10-18: Linux CI ran on PR #1 ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578)); RH3-A/C/E, RH1-B DNS and RH2-C POSIX pass, and Bun's built-in POSIX PTY is go on Linux. Remaining: a Linux baseline of the full Vitest suite.
+1. Done 2026-10-18: Linux CI ran on PR #1 ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342)); RH3-A/C/E, RH1-B DNS and RH2-C POSIX pass, and Bun's built-in POSIX PTY is go on Linux. Remaining: a full Vitest suite baseline on Linux and macOS.
 2. macOS zsh/Bash terminal evidence, or an explicit Windows/Linux-only release scope in the support docs.
 3. Remaining live smokes: RH1-G OAuth refresh/revoke and media under Bun (needs a disposable account), and PH4-G against the first-party DeepSeek endpoint with `DEEPSEEK_API_KEY`.
 4. Repo admin: configure the protected `release` environment and tag protection.
