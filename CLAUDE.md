@@ -16,6 +16,6 @@ scope, or changing harness onboarding. It is the agent-facing documentation entr
 - Runtimes: Bun 1.4.3 for the product and runtime probes (`bun run probe:runtime`);
   Node >= 22.19 (22.20 or 24) first on PATH for Vitest/Vite (`bun run preflight:node`
   fails fast otherwise). Do not claim macOS terminal support without evidence.
-  The Linux runtime/PTY gate (`runtime-probes` CI) is pending its first green CI run.
+  The Linux runtime/PTY gate (`runtime-probes` CI) went green on 2026-10-18 (probes 8/8, PTY probes 9/9).
 - Keep changes scoped; preserve user-owned files and report verification failures.
 - Store plans and reports in `plans/`, and documentation in `docs/`.
