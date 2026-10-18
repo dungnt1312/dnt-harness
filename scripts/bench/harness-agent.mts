@@ -212,21 +212,36 @@ async function main(): Promise<void> {
   const assistantTexts = events.filter((event) => event.type === 'assistant/message').map((event) => (event as { content: string }).content)
   const finalText = assistantTexts.length === 0 ? '' : assistantTexts[assistantTexts.length - 1]!
 
-  const facts = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; startedAt: number | undefined }>()
+  // A field the provider did not report stays undefined ("unknown"), never 0.
+  const measured = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+  const facts = new Map<string, { inputTokens: number | undefined; outputTokens: number | undefined; cachedInputTokens: number | undefined; startedAt: number | undefined }>()
   for (const event of events) {
     if (event.type !== 'model/attempt' && event.type !== 'execution/uncertain' && event.type !== 'execution/reconciled') continue
     const fact = (event as { fact: { attemptId: string; usage?: { inputTokens: number; outputTokens?: number; cachedInputTokens?: number }; startedAt?: number } }).fact
     if (fact.usage === undefined) continue
     facts.set(fact.attemptId, {
-      inputTokens: fact.usage.inputTokens,
-      outputTokens: fact.usage.outputTokens ?? 0,
-      cachedInputTokens: fact.usage.cachedInputTokens ?? 0,
+      inputTokens: measured(fact.usage.inputTokens),
+      outputTokens: measured(fact.usage.outputTokens),
+      cachedInputTokens: measured(fact.usage.cachedInputTokens),
       startedAt: fact.startedAt,
     })
   }
   const usageList = [...facts.values()]
-  const sum = (pick: (u: (typeof usageList)[number]) => number): number => usageList.reduce((acc, u) => acc + pick(u), 0)
-  const firstRequestInputTokens = usageList.length === 0 ? 0 : usageList.reduce((a, b) => ((a.startedAt ?? Infinity) <= (b.startedAt ?? Infinity) ? a : b)).inputTokens
+  // Sum only when every model call reported the field; otherwise the total is unknown.
+  const sum = (pick: (u: (typeof usageList)[number]) => number | undefined): number | undefined => {
+    if (usageList.length === 0) return undefined
+    let acc = 0
+    for (const u of usageList) {
+      const v = pick(u)
+      if (v === undefined) return undefined
+      acc += v
+    }
+    return acc
+  }
+  const firstRequestInputTokens = usageList.length === 0 ? undefined : usageList.reduce((a, b) => ((a.startedAt ?? Infinity) <= (b.startedAt ?? Infinity) ? a : b)).inputTokens
+  const inputTokens = sum((u) => u.inputTokens)
+  const outputTokens = sum((u) => u.outputTokens)
 
   const metrics = {
     harness: 'dnt-harness',
@@ -236,10 +251,13 @@ async function main(): Promise<void> {
     turns: count('turn/start'), steps: count('step/start'), assistantMessages: count('assistant/message'),
     toolCalls: toolSequence.length, failedToolResults: failedTools.length, toolSequence,
     turnEndReasons, errors, offeredTools,
-    inputTokens: sum((u) => u.inputTokens),
-    outputTokens: sum((u) => u.outputTokens),
+    // OpenAI-compatible `prompt_tokens` already INCLUDES cached tokens, so the
+    // total is input + output; cache is a subset and is never added again.
+    inputSemantics: 'inclusive',
+    inputTokens,
+    outputTokens,
     cachedInputTokens: sum((u) => u.cachedInputTokens),
-    totalTokens: sum((u) => u.inputTokens + u.outputTokens),
+    totalTokens: inputTokens !== undefined && outputTokens !== undefined ? inputTokens + outputTokens : undefined,
     modelCalls: usageList.length,
     firstRequestInputTokens,
     finalText,

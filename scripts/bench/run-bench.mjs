@@ -13,6 +13,7 @@ import { promises as fs } from 'node:fs'
 import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
+import { normalizeMetrics, show, summarizeCell, verifyReadAnswer } from './metrics.mjs'
 
 const REPO = process.cwd()
 const NODE = process.execPath
@@ -22,6 +23,8 @@ const BASE_URL = process.env.BENCH_BASE_URL ?? 'http://127.0.0.1:6536/v1'
 const API_KEY = process.env.BENCH_API_KEY ?? 'bench'
 const MODEL = process.env.BENCH_MODEL ?? 'deepseek-v4.1-flash-free'
 const TIMEOUT_MS = Number(process.env.BENCH_TIMEOUT_MS ?? '240000')
+/** Outer kill guard beyond the child's own TIMEOUT_MS. */
+const OUTER_GRACE_MS = 15000
 
 const argv = process.argv.slice(2)
 const flag = (name, fallback) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : fallback }
@@ -54,10 +57,20 @@ function run(cmd, args, opts = {}) {
     let stdout = '', stderr = ''
     child.stdout?.on('data', (d) => { stdout += d.toString('utf8') })
     child.stderr?.on('data', (d) => { stderr += d.toString('utf8') })
-    const timer = setTimeout(() => child.kill('SIGKILL'), (opts.timeoutMs ?? TIMEOUT_MS) + 15000)
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, wallMs: Date.now() - started }) })
-    child.on('error', (error) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: `${stderr}\n${error.message}`, wallMs: Date.now() - started }) })
+    // Outer guard = the child's own TIMEOUT_MS + 15s grace, so a child that
+    // honours its timeout writes metrics first; a kill here is still recorded
+    // as "timed out" (see withTimeout), never as "no metrics".
+    let killed = false
+    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL') }, (opts.timeoutMs ?? TIMEOUT_MS) + OUTER_GRACE_MS)
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, wallMs: Date.now() - started, timedOut: killed }) })
+    child.on('error', (error) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: `${stderr}\n${error.message}`, wallMs: Date.now() - started, timedOut: killed }) })
   })
+}
+
+/** A runner killed by the outer guard is a timeout, even if it wrote no metrics. */
+function withTimeout(metrics, res) {
+  if (!res.timedOut) return metrics
+  return { ...(metrics ?? {}), timedOut: true }
 }
 
 async function snapshot(dir) {
@@ -93,16 +106,11 @@ async function verify(task, dir) {
   }
 
   const text = (await fs.readFile(path.join(dir, '..', 'metrics.json'), 'utf8').then(JSON.parse).catch(() => ({}))).finalText ?? ''
-  if (task.id === 'explain-rounding') {
-    const ok = changed.length === 0 && removed.length === 0 && /round/i.test(text) && /discount/i.test(text)
-    return { success: ok, filesChanged: changed.length + removed.length }
-  }
-  if (task.id === 'nonexistent-api') {
-    const absent = /\b(no|not|never|doesn't|does not|doesn’t|cannot|can't|isn't|is not)\b/i.test(text)
-    const ok = changed.length === 0 && removed.length === 0 && absent
-    return { success: ok, filesChanged: changed.length + removed.length }
-  }
-  return { success: false, filesChanged: changed.length + removed.length }
+  // Read tasks: tree untouched AND the answer matches the expected one
+  // (file + rounding rule; or a plain statement of absence with no location).
+  const answer = verifyReadAnswer(task.id, text)
+  const untouched = changed.length === 0 && removed.length === 0
+  return { success: untouched && answer.ok, filesChanged: changed.length + removed.length, answerChecks: answer.checks }
 }
 
 async function runDnt(dir, prompt, eventsPath) {
@@ -116,7 +124,7 @@ async function runDnt(dir, prompt, eventsPath) {
     cwd: REPO, timeoutMs: TIMEOUT_MS,
     env: { ...process.env, BENCH_BASE_URL: BASE_URL, BENCH_API_KEY: API_KEY, BENCH_MODEL: MODEL, BENCH_MODE: 'autonomous', BENCH_TIMEOUT_MS: String(TIMEOUT_MS) },
   })
-  const metrics = await fs.readFile(metricsPath, 'utf8').then(JSON.parse).catch(() => null)
+  const metrics = withTimeout(await fs.readFile(metricsPath, 'utf8').then(JSON.parse).catch(() => null), res)
   return { metrics, wallMs: res.wallMs, stderrTail: res.stderr.slice(-400) }
 }
 
@@ -131,7 +139,7 @@ async function runOc(dir, prompt, eventsPath, configPath) {
     cwd: REPO, timeoutMs: TIMEOUT_MS,
     env: { ...process.env, OC_BIN, NODE_BIN: NODE, OPENCODE_CONFIG: configPath, BENCH_BASE_URL: BASE_URL, BENCH_API_KEY: API_KEY, BENCH_MODEL: MODEL, BENCH_PROVIDER: 'bench' },
   })
-  const metrics = await fs.readFile(metricsPath, 'utf8').then(JSON.parse).catch(() => null)
+  const metrics = withTimeout(await fs.readFile(metricsPath, 'utf8').then(JSON.parse).catch(() => null), res)
   return { metrics, wallMs: res.wallMs, stderrTail: res.stderr.slice(-400) }
 }
 
@@ -171,8 +179,6 @@ for (const task of selected) {
 }
 
 // ── aggregate ──────────────────────────────────────────────────────────────
-const mean = (xs) => (xs.length === 0 ? 0 : xs.reduce((a, b) => a + b, 0) / xs.length)
-const median = (xs) => { if (xs.length === 0) return 0; const s = [...xs].sort((a, b) => a - b); const mid = Math.floor(s.length / 2); return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2 }
 const summary = []
 for (const task of selected) {
   for (const harness of harnesses) {
@@ -180,17 +186,12 @@ for (const task of selected) {
     // A run that produced no model call (e.g. the provider stream failed the
     // protocol boundary) carries no loop metrics; keep it in the success rate
     // but exclude it from the medians so one fault cannot skew the row.
-    const valid = rs.filter((r) => (r.metrics?.steps ?? 0) > 0 && (r.metrics?.errors?.length ?? 0) === 0 && r.metrics?.timedOut !== true)
-    const m = (k) => valid.map((r) => r.metrics?.[k] ?? 0)
+    // Metrics are normalized per record (cache = cachedTokens ?? cachedInputTokens,
+    // finite/nonnegative only, missing = unknown) before any median; see metrics.mjs.
     summary.push({
-      task: task.id, harness: harness.name, runs: rs.length, validRuns: valid.length,
-      successRate: rs.filter((r) => r.verdict.success).length / rs.length,
-      protocolFaults: rs.filter((r) => (r.metrics?.errors?.length ?? 0) > 0).length,
-      stepsMedian: median(m('steps')), toolCallsMedian: median(m('toolCalls')),
-      wallSecondsMedian: median(valid.map((r) => r.wallMs / 1000)),
-      inputTokensMedian: median(m('inputTokens')), outputTokensMedian: median(m('outputTokens')),
-      cachedTokensMedian: median(m('cachedTokens') ?? m('cachedInputTokens')),
-      firstRequestInputMedian: median(m('firstRequestInputTokens')),
+      task: task.id,
+      ...summarizeCell(rs, harness.name),
+      runErrors: rs.filter((r) => (r.metrics?.errors?.length ?? 0) > 0).length,
       failures: rs.filter((r) => !r.verdict.success).map((r) => ({ rep: r.rep, verdict: r.verdict, err: r.metrics?.errors, stderr: r.stderrTail?.slice(0, 200) })),
     })
   }
@@ -207,19 +208,31 @@ lines.push(`- Model: \`${MODEL}\` (both harnesses → \`${BASE_URL}\`)`)
 lines.push(`- Task fixture: \`scripts/bench/tasks/discount-bug\` (2 of 5 tests failing)`)
 lines.push(`- Repetitions per cell: ${REPS}`)
 lines.push('')
-lines.push('| Task | Harness | Success | Prov. faults | Steps (med) | Tool calls (med) | Wall s (med) | In tok (med) | Out tok (med) | 1st-req in tok |')
-lines.push('|---|---|---|---|---|---|---|---|---|---|')
+lines.push('Input semantics: dnt-harness reports provider `prompt_tokens` (**inclusive** of cached tokens); opencode reports input **non-cached** (cache reads counted separately). Compare "In incl." across harnesses, not raw "In". Medians use valid runs only; success rate counts every run (failed/timed-out included). "unknown" = not reported (never coerced to 0).')
+lines.push('')
+lines.push('| Task | Harness | Success | Valid/runs | Run errors | Steps (med) | Tool calls (med) | Wall s (med) | In (med, semantics) | In incl. (med) | Out (med) | Cached (med, known runs) | 1st-req in |')
+lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
 for (const s of summary) {
-  lines.push(`| ${s.task} | ${s.harness} | ${(s.successRate * 100).toFixed(0)}% | ${s.protocolFaults} | ${s.stepsMedian} | ${s.toolCallsMedian} | ${s.wallSecondsMedian.toFixed(1)} | ${s.inputTokensMedian} | ${s.outputTokensMedian} | ${s.firstRequestInputMedian} |`)
+  const rate = s.successRate === undefined ? 'unknown' : `${(s.successRate * 100).toFixed(0)}%`
+  lines.push(`| ${s.task} | ${s.harness} | ${rate} | ${s.validRuns}/${s.runs} | ${s.runErrors} | ${show(s.stepsMedian)} | ${show(s.toolCallsMedian)} | ${show(s.wallSecondsMedian, 1)} | ${show(s.inputTokensMedian)} (${s.inputSemantics ?? 'unknown'}) | ${show(s.inputInclusiveTokensMedian)} | ${show(s.outputTokensMedian)} | ${show(s.cachedTokensMedian)} (${s.cachedTokensKnownRuns}) | ${show(s.firstRequestInputMedian)} |`)
 }
 lines.push('')
+for (const s of summary.filter((cell) => cell.cacheAnomalyRuns > 0)) {
+  lines.push(`> ⚠ ${s.task} / ${s.harness}: ${s.cacheAnomalyRuns} run(s) reported cached > inclusive input; their cache figure is treated as unknown.`)
+}
+const excluded = summary.flatMap((s) => s.excluded.map((e) => `- ${s.task} / ${s.harness} / rep${e.rep}: ${e.reason}`))
+if (excluded.length > 0) {
+  lines.push('Excluded from medians (still counted in the success rate):')
+  lines.push(...excluded)
+  lines.push('')
+}
 lines.push('## Per-run detail')
 lines.push('')
 lines.push('| Task | Harness | Rep | Steps | Tools | Wall s | In | Out | Cached | Success |')
 lines.push('|---|---|---|---|---|---|---|---|---|---|')
 for (const r of records) {
-  const m = r.metrics ?? {}
-  lines.push(`| ${r.task} | ${r.harness} | ${r.rep} | ${m.steps ?? '?'} | ${m.toolCalls ?? '?'} | ${(r.wallMs / 1000).toFixed(1)} | ${m.inputTokens ?? '?'} | ${m.outputTokens ?? '?'} | ${(m.cachedTokens ?? m.cachedInputTokens) ?? '?'} | ${r.verdict.success} |`)
+  const n = normalizeMetrics(r.metrics, r.harness)
+  lines.push(`| ${r.task} | ${r.harness} | ${r.rep} | ${show(n.steps)} | ${show(n.toolCalls)} | ${(r.wallMs / 1000).toFixed(1)} | ${show(n.inputTokens)} | ${show(n.outputTokens)} | ${show(n.cachedTokens)} | ${r.verdict.success} |`)
 }
 lines.push('')
 lines.push(`Raw artifacts: \`${BENCH_DIR}\``)

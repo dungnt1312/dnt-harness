@@ -94,14 +94,25 @@ const toolUses = byType('tool_use')
 const stepFinishes = byType('step_finish')
 const texts = byType('text')
 
-let inputTokens = 0, outputTokens = 0, reasoningTokens = 0, cachedTokens = 0
-for (const e of stepFinishes) {
-  const t = e.part?.tokens ?? {}
-  inputTokens += t.input ?? 0
-  outputTokens += t.output ?? 0
-  reasoningTokens += t.reasoning ?? 0
-  cachedTokens += t.cache?.read ?? 0
+// A field not reported by every step stays undefined ("unknown"), never 0.
+const measured = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined)
+const sumField = (pick) => {
+  if (stepFinishes.length === 0) return undefined
+  let acc = 0
+  for (const e of stepFinishes) {
+    const v = measured(pick(e.part?.tokens ?? {}))
+    if (v === undefined) return undefined
+    acc += v
+  }
+  return acc
 }
+// opencode's `tokens.input` EXCLUDES cache reads (non-cached input); cache
+// reads are reported separately under `tokens.cache.read`.
+const inputTokens = sumField((t) => t.input)
+const outputTokens = sumField((t) => t.output)
+const reasoningTokens = sumField((t) => t.reasoning)
+const cachedTokens = sumField((t) => t.cache?.read)
+const inputInclusiveTokens = inputTokens !== undefined && cachedTokens !== undefined ? inputTokens + cachedTokens : undefined
 
 const metrics = {
   harness: 'opencode',
@@ -114,9 +125,12 @@ const metrics = {
   toolCalls: toolUses.length,
   failedToolResults: toolUses.filter((e) => e.part?.state?.status !== 'completed').length,
   toolSequence: toolUses.map((e) => e.part?.tool),
-  inputTokens, outputTokens, reasoningTokens, cachedTokens,
-  totalTokens: inputTokens + outputTokens,
-  firstRequestInputTokens: stepFinishes[0]?.part?.tokens?.input ?? 0,
+  inputSemantics: 'non-cached',
+  inputTokens, outputTokens, reasoningTokens, cachedTokens, inputInclusiveTokens,
+  // Inclusive total: non-cached input + cache reads (once) + output.
+  totalTokens: inputInclusiveTokens !== undefined && outputTokens !== undefined ? inputInclusiveTokens + outputTokens : undefined,
+  // Non-cached first-request input (comparable only via inclusive semantics).
+  firstRequestInputTokens: measured(stepFinishes[0]?.part?.tokens?.input),
   finalText: texts.at(-1)?.part?.text ?? '',
   errors: byType('error').map((e) => e.error?.data?.message ?? e.error?.name ?? 'error'),
   stderrTail: stderr.slice(-500),

@@ -140,6 +140,30 @@ markers and the exit/termination suffix. Existing files need an observation
 (Read, or a prior successful Write/Edit/ApplyPatch) before they are changed;
 reading through Bash creates none and new files need none.
 
+## Research and verification discipline
+
+`DEFAULT_BASE_SYSTEM` bounds research without forbidding useful refinement:
+
+- **No unchanged repetition.** Do not repeat the same hypothesis or the same
+  search parameters without new information. An empty or identical result is
+  evidence. Refining a search is allowed when that evidence points somewhere new
+  (a corrected spelling, an alias, a different path). When repeated
+  evidence-based searches still find nothing, report the thing as absent and
+  stop. The earlier absolute ban ("never retry it with a slightly different
+  pattern") was removed because it blocked the right move for misspelled
+  symbols and wrong aliases/paths.
+- **Reverify on change.** Do not re-read or re-run something already observed
+  just to be sure. Verify again after code or data changed, after an error, or
+  while a concern is still unresolved. The blanket "verify once" was removed.
+- Scope, concision, language mirroring and tool selection are unchanged. No new
+  step cap or automatic limit was added.
+
+Tests: `tests/harness/base-prompt-guidance.spec.ts` pins the clauses and adds
+string-level behavioral fixtures (misspelled symbol, wrong alias/path, true
+absence, re-run after edit). They check that the guidance is present, not live
+model behaviour. A live recall/tool-count eval is a manual follow-up
+(`scripts/bench` `nonexistent-api` covers true absence).
+
 ## System prompt overrides
 
 `system-prompts.json` per workspace (`src/harness/prompts/store.ts`) can
