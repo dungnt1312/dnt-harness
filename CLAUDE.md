@@ -13,5 +13,9 @@ scope, or changing harness onboarding. It is the agent-facing documentation entr
 - Use Bun (package manager and runtime). Run affected tests first, then `bun run test`
   for behavior changes and `bun run typecheck`; run `bun run build:web` when the web
   surface is affected. `bun test` is Bun's own runner, not this suite; use `bun run test`.
+- Runtimes: Bun 1.4.3 for the product and runtime probes (`bun run probe:runtime`);
+  Node >= 22.19 (22.20 or 24) first on PATH for Vitest/Vite (`bun run preflight:node`
+  fails fast otherwise). Do not claim macOS terminal support without evidence.
+  The Linux runtime/PTY gate (`runtime-probes` CI) is pending its first green CI run.
 - Keep changes scoped; preserve user-owned files and report verification failures.
 - Store plans and reports in `plans/`, and documentation in `docs/`.

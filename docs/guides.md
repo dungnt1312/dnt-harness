@@ -24,7 +24,10 @@ failed, so the server is never left down. Without a pm2 process it only
 upgrades the package. `dnt-harness --version` prints the installed version.
 
 On Windows `pm2` is a `.cmd` shim, so the launcher runs it through
-a shell with quoted arguments; the same commands work on macOS and Linux.
+a shell with quoted arguments. The same commands are meant to work on Linux and
+macOS, but the release evidence covers Windows and Linux only (see
+[release-checklist.md](release-checklist.md)); the Linux CI gate is pending its
+first green run.
 
 `dnt-harness start pm2 [--name N] [web flags]` requires `pm2` on PATH (it prints
 `bun add -g pm2` otherwise). It deletes any pm2 process with the same name, starts
@@ -42,15 +45,39 @@ The published tarball (`files` in `package.json`) holds
 `vite build`, so `web-dist/` is always fresh. Flags and behavior match the
 `bun run web` / `bun run chat` / `bun run pair` scripts below.
 
-Releasing: `npm version <patch|minor>`, then `npm publish` (needs npm login and
-2FA/OTP). Check the contents first with `npm pack --dry-run`.
+Releasing: tag-triggered publish through `.github/workflows/release.yml`. The
+publish job needs every gate job (typecheck + `build:web`, deterministic
+suites, Linux runtime/PTY probes) and approval in the protected `release`
+environment. These gates are wired but pending their first green CI run.
+A separate `pack` job (no OIDC token) builds the tarball; `publish` only
+uploads it with `npm publish --ignore-scripts`. Follow [release-checklist.md](release-checklist.md); the manual
+Windows launcher/PM2 and macOS evidence steps are listed there. Check the
+contents first with `npm pack --dry-run`.
+
+## Runtimes
+
+| Purpose | Runtime | Check |
+|---|---|---|
+| Product (CLI, web, PM2 launcher), runtime probes | Bun **1.4.3** (`engines.bun >=1.4.3`) | `bun run probe:runtime` |
+| Vitest suite, Vite build | Node **>= 22.19** (22.20 LTS or 24; dev-only, so not in `engines`) | `bun run preflight:node` |
+
+`bun run test` runs `scripts/node-preflight.mjs` first. It refuses Bun and any
+Node older than 22.19 (Vitest 3 + Undici 7). Put a supported Node first on PATH
+(e.g. `C:\laragon\bin\nodejs\node-v22.20.0-win-x64`). `bun run probe:runtime`
+(`scripts/runtime-probes.mjs`) checks that the Bun runtime is 1.4.3, that the
+resolved real Undici honors a custom dispatcher (bare `undici` under Bun is a
+native shim and does not), and that DNS lookup works. On Linux,
+`bun scripts/pty-probes.mjs --require` exercises real bash PTY teardown. Off
+Linux it skips, and `--require` makes it fail instead.
 
 ## Getting started (from source)
 
 ```sh
-bun install        # install dependencies (Bun >= 1.3)
-bun run test       # vitest run (not `bun test`, Bun's own runner)
-bun run typecheck  # tsc --noEmit for both tsconfig.json and tsconfig.web.json
+bun install             # install dependencies (Bun 1.4.3)
+bun run preflight:node  # Node >= 22.19 first on PATH
+bun run test            # vitest run under Node (not `bun test`, Bun's own runner)
+bun run typecheck       # tsc --noEmit for both tsconfig.json and tsconfig.web.json
+bun run probe:runtime   # Bun runtime probes
 ```
 
 `bun run test` runs the whole vitest suite (kernel, harness, capabilities, web, and a
@@ -207,7 +234,7 @@ Everything is re-exported from the package entry (`src/index.ts`), and the
 
 ## Testing
 
-The suite runs under Vitest in a Node environment (`tests/**/*.spec.ts`), with
+The suite runs under Vitest on Node >= 22.19 (`tests/**/*.spec.ts`), with
 the `dnt-harness` alias pointing at `src/index.ts`. There are no fake timers —
 deterministic effect-teardown tests rely on real microtask ordering.
 

@@ -24,6 +24,8 @@ This documentation is organized so each layer can be read independently:
 | [sources.md](sources.md) | Workspace Sources: which folder layers skills, agents, hooks and commands load from |
 | [plugins.md](plugins.md) | Claude Code slash commands, plugins, marketplaces and enable scopes |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
+| [migration-runtime-hardening.md](migration-runtime-hardening.md) | Runtime/provider hardening: runtimes, output caps, reasoning replay, terminal teardown, outbound policy, benchmark safety |
+| [release-checklist.md](release-checklist.md) | Release gates, protected environment, manual Windows/macOS evidence |
 | [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |
 | [decisions/mcp-production-boundaries.md](decisions/mcp-production-boundaries.md) | MCP protocol pin, outcomes, receipts, deployment boundary |
 

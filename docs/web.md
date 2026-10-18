@@ -810,6 +810,35 @@ node-pty's addon starts processes under Bun but never delivers their output.
 Elsewhere (Windows) `node-pty` is imported lazily. Without it the routes answer
 `501` with the install hint and the rest of the product is untouched.
 
+**Platform support (this release).** Windows (node-pty/ConPTY) has local
+smoke evidence. Linux (Bun 1.4.3 built-in PTY) is gated by
+`bun scripts/pty-probes.mjs --require` in the `runtime-probes` CI job (pending
+its first green CI run; no Linux evidence is recorded until then). **macOS
+is unverified.** The `ps`/tty session inspector exists, but no zsh/Bash
+teardown evidence has been recorded, so macOS terminal support is not claimed.
+See [release-checklist.md](release-checklist.md).
+
+### Teardown semantics
+
+- A terminal moves `running → closing → exited | failedTeardown`. Delete, idle
+  reap, natural exit and shutdown all share one idempotent teardown. On POSIX
+  it closes the PTY, sends HUP to the shell and its session members, escalates
+  to KILL after 1 s, and then reports an explicit failure. Windows keeps the
+  node-pty kill path.
+- `DELETE …/terminals/:tid` **awaits** teardown. It answers `200 {killed:true}`
+  only after exit is confirmed, `500 {killed:false,error}` when teardown fails,
+  and `409` while another close is in progress. A failed terminal keeps its
+  record, refuses input/resize (`closing`), and is retried by another DELETE,
+  the reaper, or shutdown.
+- Host shutdown awaits `disposeAll()` (4 s terminal budget, concurrent). The
+  whole close is bounded by `SHUTDOWN_DEADLINE_MS` (13.5 s, under PM2's 15 s
+  `kill_timeout`). A teardown failure is logged with the remaining PIDs, never
+  sent in an HTTP response.
+- **Limitation:** an external SIGKILL or host crash during teardown can leave
+  the shell and its jobs running. No orphan reaping is persisted. Intentionally
+  detached daemons (`setsid`, `nohup … & disown`) leave the PTY session and are
+  never cleaned up.
+
 ## The approval bridge
 
 Approval questions must reach the *right* human. `attachApproval`'s `askUser`

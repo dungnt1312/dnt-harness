@@ -35,9 +35,26 @@ Full docs live in [`docs/`](docs/README.md):
 ## Install
 
 ```sh
-bun add -g dnt-harness   # Bun >= 1.3
+bun add -g dnt-harness   # Bun >= 1.4.3 (the verified runtime for this release)
 dnt-harness              # web UI at http://127.0.0.1:3082
 ```
+
+**Runtimes.** The runtime is Bun **1.4.3** (`engines.bun >=1.4.3`). That is
+the version verified for outbound policy (real Undici under Bun) and PTY
+teardown; older Bun is unsupported. Developing from source also needs Node
+**>= 22.19** (22.20 LTS or 24): Vitest and Vite run under Node, and
+`bun run test` fails fast through `scripts/node-preflight.mjs` on older Node.
+`bun run probe:runtime` checks the installed Bun (Undici dispatcher honored,
+DNS policy). See [docs/migration-runtime-hardening.md](docs/migration-runtime-hardening.md)
+for behaviour changes in this release.
+
+**Platform support.** Terminal (PTY) support is claimed only where it has
+been verified. Windows (node-pty/ConPTY) has local smoke evidence. Linux
+(Bun built-in PTY) is gated by the `runtime-probes` CI job
+(`bun scripts/pty-probes.mjs --require`); that gate is wired but pending
+its first green CI run, so Linux evidence is not yet recorded. **macOS terminal support is
+unverified** and is not claimed until zsh/Bash smoke evidence exists. See
+[docs/release-checklist.md](docs/release-checklist.md).
 
 `dnt-harness` has three subcommands; everything after the subcommand is passed
 to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
@@ -68,7 +85,7 @@ client is prebuilt, so no build step is needed after installing.
 that cannot start without Bun. Move over once, by hand:
 
 ```sh
-# install Bun >= 1.3 first: https://bun.sh
+# install Bun >= 1.4.3 first: https://bun.sh
 npm rm -g dnt-harness
 bun add -g dnt-harness
 dnt-harness restart      # only if it runs under pm2
@@ -81,12 +98,16 @@ so pm2 launches it through Bun.
 ## Getting started (from source)
 
 ```sh
-bun install
-bun run test     # vitest run (not `bun test`, Bun's own runner)
+bun install             # Bun 1.4.3
+bun run preflight:node  # Node >= 22.19 must be first on PATH for Vitest/Vite
+bun run test            # vitest run under Node (not `bun test`, Bun's own runner)
 bun run typecheck
+bun run build:web
+bun run probe:runtime   # Bun runtime probes (Undici dispatcher, DNS policy)
 ```
 
-The Workbench terminal uses Bun's built-in PTY on macOS and Linux. On Windows
+The Workbench terminal uses Bun's built-in PTY on POSIX (Linux gated in CI,
+pending its first green run; macOS unverified, see above). On Windows
 it needs `node-pty`, which places a prebuilt binary and a bundled ConPTY DLL
 from its install script; `trustedDependencies` in `package.json` allows that
 script. Everything else runs normally without it — a missing PTY backend
