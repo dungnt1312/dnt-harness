@@ -8,16 +8,6 @@ name: Windows smoke
 # See docs/release-checklist.md.
 on:
   pull_request:
-    paths:
-      - .github/workflows/windows-smoke.yml
-      - bin/**
-      - scripts/pm2-smoke-windows.mjs
-      - scripts/pty-smoke-windows.mjs
-      - scripts/e2e/fake-gateway.mjs
-      - src/web/terminals.ts
-      - src/capabilities/shell/**
-      - package.json
-      - bun.lock
   workflow_dispatch:
   workflow_call:
 

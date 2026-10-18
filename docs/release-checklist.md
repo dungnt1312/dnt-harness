@@ -14,6 +14,8 @@ only when all of these hold:
      1.4.3 runtime/Undici/DNS probes and `bun scripts/pty-probes.mjs --require`
      (real bash PTY teardown) on Linux, plus the `macos-pty-probes` job:
      the same probes with `--shell zsh` and `--shell bash` on macos-15.
+   - `windows-smoke` (`windows-smoke.yml` via `workflow_call`): the Windows
+     launcher / PM2 smoke below, on windows-2025 with Bun 1.4.3.
    - `pack` (no OIDC token): tag equals version, `bun install
      --frozen-lockfile`, `npm pack` (prepack = `vite build`), tarball uploaded
      as an artifact.
@@ -73,28 +75,46 @@ on tag-triggered publish:
 
 ## Manual evidence (attach links/logs to the environment approval)
 
-### Windows launcher / PM2 smoke (required)
+### Windows launcher / PM2 smoke (required, automated)
 
-Run on Windows with Bun 1.4.3 using an **absolute** Bun path for PM2:
+`.github/workflows/windows-smoke.yml` (windows-2025, Bun 1.4.3, pm2 7.0.4)
+runs on every pull request, on `workflow_dispatch`, and as the `windows-smoke`
+gate of `release.yml`. It packs the repo and checks:
 
-- [ ] `bun add -g <packed tarball>`; `dnt-harness --version` prints the new
-      version.
-- [ ] `dnt-harness start pm2 --name dnt-smoke`. Then `pm2 describe dnt-smoke`
-      shows interpreter `bun` (absolute path) and `/api/health` answers 200.
-- [ ] From the repo checkout (`scripts/` is not in the tarball):
-      `bun scripts/pty-smoke-windows.mjs --require` passes (I/O, resize,
-      natural exit, kill with background-job cleanup, no console-host leak,
-      16 terminals).
-- [ ] The installed bun-pty DLL matches the reviewed one (bun-pty 0.5.1):
-      `rust_pty.dll` SHA-256 `6F45D637E26365BD72A16964453047E2D563F2E3FD0D374A9182C0F38C6F5CFC`,
-      `rust_pty_arm64.dll` SHA-256 `CA64B48DBC617DD5684D405DDE4A605470F05B952153C36EF08A2E39B1D15E76`.
-      Any bun-pty version bump needs a new review and new hashes.
-- [ ] Workbench terminal (bun-pty/ConPTY): open bash/PowerShell/cmd,
-      input → output, resize, close (DELETE answers 200), natural `exit`.
-- [ ] `pm2 restart dnt-smoke` and `pm2 stop dnt-smoke` complete within PM2's
-      `kill_timeout` (15 s), with no leftover shell processes.
-- [ ] `dnt-harness chat --message "hello"` (headless) works against a
-      configured provider.
+- `npm pack`, `bun add -g <tarball>`; `dnt-harness --version` equals the
+  `package.json` version.
+- `dnt-harness start pm2 --name dnt-smoke`; pm2 reports the app online with
+  an **absolute** `bun.exe` interpreter (`pm2 describe` is printed) and
+  `/api/health` answers 200 (`scripts/pm2-smoke-windows.mjs`).
+- From the checkout: `bun scripts/pty-smoke-windows.mjs --require` (I/O,
+  resize, natural exit, kill with background-job cleanup, no console-host
+  leak, 16 terminals).
+- The globally installed bun-pty DLLs match the reviewed ones (bun-pty 0.5.1);
+  any other or unreviewed DLL fails the job:
+  `rust_pty.dll` SHA-256 `6F45D637E26365BD72A16964453047E2D563F2E3FD0D374A9182C0F38C6F5CFC`,
+  `rust_pty_arm64.dll` SHA-256 `CA64B48DBC617DD5684D405DDE4A605470F05B952153C36EF08A2E39B1D15E76`.
+  Any bun-pty version bump needs a new review and new hashes (in this file
+  and in the workflow).
+- Workbench terminals through the running server's HTTP API, for bash,
+  PowerShell and cmd: input → output, resize, close (DELETE answers 200),
+  natural `exit` with exactly one exit event.
+- `pm2 restart dnt-smoke` and `pm2 stop dnt-smoke` each finish within 15 s
+  while a cmd terminal runs a background job, and no shell process of the
+  old server survives; the server is healthy again after the restart.
+- Headless `dnt-harness chat --message "hello"` against a local fake
+  OpenAI-compatible gateway (`scripts/e2e/fake-gateway.mjs`) through a
+  temporary `--config`; no provider secret.
+
+- [ ] `windows-smoke` green on the release tag (link the run).
+
+Still manual (not covered by the job):
+
+- [ ] Workbench terminal in the browser UI (xterm rendering, keyboard input,
+      the shell picker); the job drives the same server routes without a page.
+- [ ] Windows on ARM64: the job runs on x64, so `rust_pty_arm64.dll` is
+      hash-checked but never loaded.
+- [ ] Headless chat against a real configured provider (optional; the fake
+      gateway proves the CLI path, not a provider).
 
 ### Linux (required, automated)
 

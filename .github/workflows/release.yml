@@ -12,9 +12,8 @@ name: Release
 #      deletion to maintainers (tag protection).
 #   3. npm trusted publisher bound to this repo + `release.yml` + environment
 #      `release`.
-# Manual evidence (Windows launcher/PM2 smoke; macOS terminal evidence only if
-# macOS support is claimed) is attached to the approval per
-# docs/release-checklist.md. Typecheck alone is not a security gate.
+# The Windows launcher/PM2 smoke is the `windows-smoke` gate; remaining manual
+# evidence is attached to the approval per docs/release-checklist.md. Typecheck alone is not a security gate.
 #
 # All actions are pinned to full commit SHAs (version in the trailing comment).
 on:
@@ -88,12 +87,22 @@ jobs:
     permissions:
       contents: read
 
+  windows-smoke:
+    name: Gate · Windows launcher / PM2 smoke
+    # The packed tarball installed with Bun 1.4.3 on Windows: version, PM2
+    # launch with an absolute Bun interpreter, /api/health, workbench terminals,
+    # ConPTY smoke, reviewed bun-pty DLL hashes, pm2 restart/stop budget, and a
+    # headless chat against a local fake gateway (no provider secret).
+    uses: ./.github/workflows/windows-smoke.yml
+    permissions:
+      contents: read
+
   # Build the tarball WITHOUT the OIDC token: `bun install` and `npm pack`
   # (prepack runs `vite build`) execute dependency code.
   # None of that code ever sees `id-token: write`.
   pack:
     name: Pack tarball (no OIDC)
-    needs: [typecheck-build, deterministic-suites, linux-runtime-probes]
+    needs: [typecheck-build, deterministic-suites, linux-runtime-probes, windows-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: read

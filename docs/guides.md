@@ -47,11 +47,12 @@ The published tarball (`files` in `package.json`) holds
 
 Releasing: tag-triggered publish through `.github/workflows/release.yml`. The
 publish job needs every gate job (typecheck + `build:web`, deterministic
-suites, Linux and macOS runtime/PTY probes) and approval in the protected `release`
+suites, Linux and macOS runtime/PTY probes, the Windows launcher/PM2 smoke)
+and approval in the protected `release`
 environment. These gates are wired but pending their first green CI run.
 A separate `pack` job (no OIDC token) builds the tarball; `publish` only
-uploads it with `npm publish --ignore-scripts`. Follow [release-checklist.md](release-checklist.md); the manual
-Windows launcher/PM2 and macOS evidence steps are listed there. Check the
+uploads it with `npm publish --ignore-scripts`. Follow [release-checklist.md](release-checklist.md); what each
+gate covers and the remaining manual evidence are listed there. Check the
 contents first with `npm pack --dry-run`.
 
 ## Runtimes
