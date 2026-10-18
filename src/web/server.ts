@@ -2994,9 +2994,14 @@ ${entry.description}`.toLowerCase().includes(query))
     }
     let lastToken: string | undefined
     const tokenSource = async (rejected?: string): Promise<string | undefined> => {
+      // Once shutdown begins, no refresh/rotation may persist a token: a
+      // connect left pending past the bounded cleanup must not write the
+      // OAuth store after close() resolved.
+      if (mcpHostClosing) throw new McpTransportError(`MCP server '${serverName}' unavailable: host is closing`)
       const token = rejected !== undefined
         ? await oauth.replaceRejected(workspaceId, serverName, rejected)
         : await oauth.accessToken(workspaceId, serverName)
+      if (mcpHostClosing) throw new McpTransportError(`MCP server '${serverName}' unavailable: host is closing`)
       if (token === undefined) throw new McpTransportError(`MCP server '${serverName}' auth_required: requires managed OAuth authorization`)
       lastToken = token
       return token
@@ -3007,6 +3012,7 @@ ${entry.description}`.toLowerCase().includes(query))
       tokenSource,
       replaceRejected: () => tokenSource(lastToken),
       onInsufficientScope: async (scope: string | undefined): Promise<void> => {
+        if (mcpHostClosing) return
         await oauth.markScopeRequired(workspaceId, serverName, scope).catch((error: unknown) => {
           console.warn(`web: could not record missing OAuth scope for '${serverName}': ${error instanceof Error ? error.message : String(error)}`)
         })
@@ -4773,6 +4779,10 @@ ${entry.description}`.toLowerCase().includes(query))
     auth: deps.auth,
     close: () => closePromise ??= (async () => {
       shuttingDown = true
+      // First: from here no MCP connect may start and no OAuth token may be
+      // refreshed or saved (resolveMcpAuth's tokenSource refuses).
+      mcpHostClosing = true
+      oauth.close()
       scheduler.stop()
       compactionClosing = true
       candidateLifetime.abort(new Error('server closing'))
@@ -4780,7 +4790,6 @@ ${entry.description}`.toLowerCase().includes(query))
       processes.closeAdmission()
       kernel.ctx.agents.closeAdmission()
       for (const entry of sessions.values()) entry.agent.stop()
-      mcpHostClosing = true
       const agentDrivers = kernel.ctx.agents
       let teardownSafe = true
       // Worst-case budget, all inside bins/web.ts SHUTDOWN_DEADLINE_MS (13.5s,
@@ -4819,7 +4828,16 @@ ${entry.description}`.toLowerCase().includes(query))
         async () => { await boundedCleanup(async () => { await retireOperatorChannel?.() }, 500) },
         async () => {
           for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
-          await boundedCleanup(async () => { await Promise.allSettled([...mcpConnecting.values()]) }, 500)
+          // A connect still pending after this bound is not retained ownership:
+          // it is marked cancelled (re-checked before it can publish), and any
+          // client it created is already in `mcpClients`, which the HTTP‖MCP
+          // disconnect step below tears down. A slow initialize must not fail
+          // shutdown (regression from 7059b43; server-g5 close race).
+          await boundedCleanup(async () => { await Promise.allSettled([...mcpConnecting.values()]) }, 500).catch(() => {
+            // Keys are `${workspaceId}:${serverName}` — no secrets.
+            const pending = [...mcpConnecting.keys()]
+            if (pending.length > 0) console.warn(`web: shutdown left ${pending.length} MCP connect(s) pending (cancelled): ${pending.join(', ')}`)
+          })
         },
         () => agentDrivers.stopAll({ timeoutMs: 1_000 }),
         async () => { await boundedCleanup(() => backgroundHooks.closeAll()) },

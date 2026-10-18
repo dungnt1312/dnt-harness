@@ -97,6 +97,18 @@ export class ManagedOAuth {
     private readonly currentConfig?: (workspaceId: string, server: string) => Promise<string | undefined>,
   ) {}
 
+  private closed = false
+
+  /**
+   * Host shutdown: refuse new token reads/refreshes and drop the writes of any
+   * refresh already in flight, so nothing persists after the host closed.
+   */
+  close(): void { this.closed = true }
+
+  private assertOpen(): void {
+    if (this.closed) throw new OAuthTemporaryError('OAuth is unavailable: host is closing')
+  }
+
   /** Read-only view of the stored grant (phase, missing scope); never sent to a browser as is. */
   async tokenState(workspaceId: string, server: string): Promise<OAuthTokens | undefined> {
     return this.store.readTokens(workspaceId, server)
@@ -262,6 +274,7 @@ export class ManagedOAuth {
    * {@link OAuthTemporaryError} means try later with the same grant.
    */
   async accessToken(workspaceId: string, server: string): Promise<string | undefined> {
+    this.assertOpen()
     const fence = grantFence(this.store, workspaceId, server)
     if (fence.revoked) return undefined
     const stored = await this.store.readTokens(workspaceId, server)
@@ -282,6 +295,7 @@ export class ManagedOAuth {
    * callers report the same token; a token already replaced is returned as is.
    */
   async replaceRejected(workspaceId: string, server: string, rejected: string | undefined): Promise<string | undefined> {
+    this.assertOpen()
     const refreshed = await this.refresh(workspaceId, server, rejected)
     return refreshed?.accessToken
   }
@@ -289,7 +303,7 @@ export class ManagedOAuth {
   async refresh(workspaceId: string, server: string, rejected?: string): Promise<OAuthTokens | undefined> {
     const fence = grantFence(this.store, workspaceId, server)
     const generation = fence.generation
-    const fenced = (): boolean => fence.revoked || fence.generation !== generation
+    const fenced = (): boolean => this.closed || fence.revoked || fence.generation !== generation
     const save = (tokens: OAuthTokens): Promise<boolean> => serializeWrite(fence, async () => {
       if (fenced()) return false
       await this.store.saveTokens(workspaceId, server, tokens)
