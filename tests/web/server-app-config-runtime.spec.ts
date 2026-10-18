@@ -32,7 +32,9 @@ async function tempDir(prefix = 'dnt-harness-app-config-'): Promise<string> {
 }
 
 async function start(options: WebServerOptions): Promise<WebServer> {
-  const server = await createWebServer(options)
+  // A temp provider store by default keeps every host off the user's real providers.json.
+  const configFile = options.configFile ?? path.join(await tempDir('dnt-harness-providers-'), 'providers.json')
+  const server = await createWebServer({ ...options, configFile })
   servers.push(server)
   return server
 }
@@ -201,6 +203,7 @@ describe('host composition', () => {
     let seen = ''
     await expect(createWebServer({
       providers: [],
+      configFile: path.join(await tempDir('dnt-harness-providers-'), 'providers.json'),
       appConfigIo: { read: async (file) => { seen = file; return '{"v":1,"limits":{"bogus":1}}' } },
     })).rejects.toThrow(/unknown limit key: bogus/)
     expect(path.basename(seen)).toBe('app-config.json')
