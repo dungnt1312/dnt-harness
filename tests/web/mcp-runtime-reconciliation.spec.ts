@@ -312,3 +312,40 @@ describe('retired MCP runtimes', () => {
     expect(offered).toContain('mcp__saved__query')
   }, 60_000)
 })
+
+describe('MCP workspace isolation', () => {
+  it('one global tool name carries each workspace its own schema, runtime and lifecycle', async () => {
+    const { ws, first: a, stdio, requests } = await boot()
+    const created = await fetch(`${web!.url}/api/workspaces`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Second' }) })
+    const b = ws(((await created.json()) as { id: string }).id)
+    for (const [side, prop] of [[a, 'alpha'], [b, 'beta']] as const) {
+      expect((await side.api('/mode', { modeId: 'full-access' }, 'PUT')).ok).toBe(true)
+      expect((await side.api('/mcp/fx', stdio({ QUERY_PROP: prop, SIDE_EFFECT_FILE: path.join(home, `${prop}-effects.log`) }))).status).toBe(201)
+      expect((await side.api('/mcp/fx/enable')).status).toBe(200)
+    }
+    /** The `mcp__fx__query` schemas the model was offered on the last request. */
+    const offered = () => (requests.at(-1)?.tools ?? []).filter((tool) => tool.name === 'mcp__fx__query')
+
+    const aSession = await a.session()
+    const bSession = await b.session()
+    await a.say(aSession, 'hello')
+    expect(offered()).toHaveLength(1)
+    expect(Object.keys(offered()[0]!.parameters.properties)).toEqual(['alpha'])
+    await b.say(bSession, 'hello')
+    expect(offered()).toHaveLength(1)
+    expect(Object.keys(offered()[0]!.parameters.properties)).toEqual(['beta'])
+
+    // A call made in B runs on B's process only.
+    await b.say(bSession, 'call mcp__fx__query {"beta":"x"}')
+    expect(await lines(path.join(home, 'beta-effects.log'))).toEqual(['query'])
+    expect(await lines(path.join(home, 'alpha-effects.log'))).toEqual([])
+
+    // Disabling A's server leaves B's schema and runtime alone.
+    expect((await a.api('/mcp/fx/disable')).status).toBe(200)
+    await a.say(aSession, 'hello')
+    expect(offered()).toEqual([])
+    await b.say(bSession, 'hello')
+    expect(Object.keys(offered()[0]!.parameters.properties)).toEqual(['beta'])
+    expect((await b.row('fx'))?.status).toBe('ready')
+  }, 60_000)
+})
