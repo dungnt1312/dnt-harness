@@ -1,0 +1,89 @@
+$ opencode run --model ocproxy/deepseek-v4.1-flash-free "<prompt>"
+exit: 0
+
+Reviewed `src/cart.js` (modified) and `src/sync.js` (untracked). No files modified.
+
+## High
+
+- **`src/sync.js:3`** — Hardcoded live secret `sk_live_9f4d177ab31c` committed to source. Fix: read from `process.env.SYNC_TOKEN` and fail fast if unset.
+- **`src/sync.js:24`** — Same secret re-exported in `module.exports`, leaking it to every importer. Fix: remove `SYNC_TOKEN` from exports.
+- **`src/cart.js:26`** — `topItems` calls `.sort()` directly on `cart.items`, mutating the caller's cart as a side effect. Fix: `return [...cart.items].sort((a, b) => b.price - a.price).slice(0, count)`.
+- **`src/cart.js:20`** — `slice(0, items.length - 1)` silently excludes the last item from discount eligibility (off-by-one; items aren't ordered so this drops an arbitrary line). Fix: use `cart.items.slice()` for all items, or document/reorder the intended exclusion.
+
+## Medium
+
+- **`src/sync.js:14`** — `persist` calls async `pushOrder` without `await`/`return`/`.catch`, causing fire-and-forget unhandled rejections. Fix: `return pushOrder(order)` or make `persist` async and await it.
+- **`src/sync.js:20-21`** — Empty `catch` block swallows all errors silently, masking network failures. Fix: log/rethrow, e.g. `catch (error) { console.error(error) }`.
+- **`src/sync.js:6-10`** — `pushOrder` never checks `response.ok`, so HTTP failures resolve as success. Fix: `if (!res.ok) throw new Error(...)` before returning.
+
+## Low
+
+- **`src/cart.js:22`** — `percent` is unvalidated; values >100 or non-numeric yield negative/NaN totals. Fix: clamp to `[0, 100]` and validate `typeof percent === 'number'`.
+- **`src/cart.js:21`** — Discount logic duplicates `subtotal`'s reduce instead of reusing it, risking drift. Fix: compute from a shared helper.
+- **`src/sync.js:17-22`** — `refreshCatalog` ignores the response and has no return value. Fix: return the parsed catalog or the response.
+
+----- stderr (opencode prints tool activity here) -----
+
+> build · deepseek-v4.1-flash-free
+
+$ git status
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/cart.js
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	src/sync.js
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+src/cart.js | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+$ git diff
+diff --git a/src/cart.js b/src/cart.js
+index e2e02ce..0ec474d 100644
+--- a/src/cart.js
++++ b/src/cart.js
+@@ -1,6 +1,6 @@
+ 'use strict'
+ 
+-/** Minimal shopping cart with line totals. */
++/** Minimal shopping cart with line totals and discounts. */
+ 
+ function createCart() {
+   return { items: [] }
+@@ -16,4 +16,14 @@ function subtotal(cart) {
+   return total
+ }
+ 
+-module.exports = { createCart, addItem, subtotal }
++function applyDiscount(cart, percent) {
++  const eligible = cart.items.slice(0, cart.items.length - 1)
++  const total = eligible.reduce((sum, item) => sum + item.price * item.qty, 0)
++  return total * (1 - percent / 100)
++}
++
++function topItems(cart, count) {
++  return cart.items.sort((a, b) => b.price - a.price).slice(0, count)
++}
++
++module.exports = { createCart, addItem, subtotal, applyDiscount, topItems }
+
+$ git diff --cached
+→ Read src\cart.js
+→ Read src\sync.js
+
+$ ls -la; git log --oneline -10
+total 9
+drwxr-xr-x 1 devdu 197609  0 Oct 17 01:33 .
+drwxr-xr-x 1 devdu 197609  0 Oct 17 01:33 ..
+drwxr-xr-x 1 devdu 197609  0 Oct 17 01:34 .git
+-rw-r--r-- 1 devdu 197609 57 Oct 17 01:33 README.md
+drwxr-xr-x 1 devdu 197609  0 Oct 17 01:33 src
+7d18c08 base cart module
+
+→ Read README.md

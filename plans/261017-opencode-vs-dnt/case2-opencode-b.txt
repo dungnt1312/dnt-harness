@@ -1,0 +1,2574 @@
+$ opencode run --model ocproxy/deepseek-v4.1-flash-free "<prompt>"
+exit: 0
+
+I'll start by getting the branch state and comparing to main.
+Reviewed both the committed diff (`main..HEAD`) and the uncommitted worktree across `src/`, `tests/`, and `scripts/`. Findings below, ordered by severity. No files were modified.
+
+## High
+
+1. **Caller cancellation stops working mid-stream when `headerTimeoutMs` is set** — `src/harness/llm/openai.ts:403`. The `finally` on the fetch removes the `forwardAbort` listener and clears the timer as soon as headers arrive, so `attemptController` is never aborted again; the body reader (`openai.ts:434`) is bound to the per-attempt signal, not the caller's. A turn can no longer be stopped once the stream starts. *Fix: keep forwarding in an outer `finally` that runs after streaming, or race the reader against `signal`.*
+2. **New default `maxStepsPerTurn: 48` silently truncates legitimate long turns and misfiles them** — `src/harness/limits.ts:116`, `src/harness/agent/agent.ts:513`. A turn past the ceiling closes as `limit`; `run()` then sets `stopped` (`agent.ts:316`), so queued user input is stranded, and `src/web/server.ts:4452` records automations as `failed: run ended: limit`. *Fix: raise/opt-in the default and treat `limit` as a soft stop (advance the queue, don't report a failure).*
+
+## Medium
+
+3. **Most new provider options are never wired by the host** — `src/web/server.ts:933-940`, `src/bins/headless.ts:319-327`. `supportsPromptCacheKey`, `supportsStore`, `maxTokensField`, `headerTimeoutMs`, `wire`, and `providerOptions` are only ever set in tests, so those code paths are dead in production. *Fix: source them from `ProviderConfig` or delete the unused options.*
+4. **Adding `'medium'` silently changes DeepSeek's default thinking level from `high` to `medium`** — `src/harness/llm/model-catalog.ts:212` via `defaultThinkingLevel` at `model-catalog.ts:316-318`; untested (`model-catalog.spec.ts` asserts levels but not the default). *Fix: pin the intended default explicitly and assert it.*
+5. **`x-session-affinity` is sent unconditionally to every provider on every dispatched request** — `src/web/server.ts:3964`, `src/harness/llm/openai.ts:389`. This is a new non-standard header on all deployments (the gated body field `prompt_cache_key` is never enabled, see #3). *Fix: gate the header on declared support.*
+6. **`applyProviderOptions` forwards a caller-supplied `response_format` object verbatim, contradicting its contract** — `src/harness/llm/openai.ts:208` vs the docstring at `openai.ts:188-193` ("anything else is dropped"). *Fix: validate the object shape or update the contract.*
+7. **Rename/copy handling in the review harness restores the wrong file** — `scripts/e2e/compare-opencode-dnt.mjs:146`. In `git status --porcelain -z`, `item.slice(3)` is the *new* path and the next NUL field is the origin; the code overwrites `file` with the origin, so snapshot/restore target a nonexistent path. *Fix: keep the first field and only consume the origin field.*
+8. **`curl-api-suite.mjs` defaults to the legacy providers path** — `scripts/e2e/curl-api-suite.mjs:23` uses `~/.mini-dsh/providers.json`, so on a current install it backs up and compares the wrong file while mutating the live store via the API. *Fix: default to `resolveAppHome()/providers.json` (`.dnt-harness`).*
+
+## Low
+
+9. **Spurious lockfile churn** — `package-lock.json` drops 66 `libc` entries with no dependency change, and the project uses pnpm (`pnpm-lock.yaml`). *Fix: revert `package-lock.json`.*
+10. **Dead fallback makes the cache metric always 0 for the dnt rows** — `scripts/bench/run-bench.mjs:191`: `m('cachedTokens') ?? m('cachedInputTokens')` never falls through because `m(...)` always returns an array. *Fix: `median(m('cachedTokens').length ? m('cachedTokens') : m('cachedInputTokens'))`.*
+11. **E2E hardcodes the step-ceiling default** — `scripts/e2e/run-fake-e2e.mjs:174` asserts `log.length === 49`, coupled to `DEFAULT_LIMITS.maxStepsPerTurn`. *Fix: derive the expected count from the limit.*
+12. **`run()` helper has no `'error'` handler** — `scripts/e2e/compare-opencode-dnt.mjs:223`; a spawn failure becomes an unhandled `'error'` and the promise never resolves. *Fix: add `child.on('error', …)` that resolves.*
+13. **Stale doc on the output-cap field** — `src/web/provider-store.ts:10` still says "sent as `max_tokens`", but the field is now detection-dependent. *Fix: update the comment.*
+14. **Unused diagnostic surface** — `src/harness/llm/openai.ts:181-186`: `toolCallIdReissueCount`/counter are only read in tests and never logged or metered. *Fix: wire it into diagnostics or remove it.*
+15. **`--provider` is not validated against enabled providers** — `src/bins/headless.ts:194-234`. A typo or disabled id registers nothing and only fails at request time. *Fix: error out when the resolved provider id is not in the enabled set.*
+16. **Non-portable defaults and repo-writing reports in dev scripts** — `scripts/bench/run-bench.mjs:19` (hardcoded Windows `OC_BIN`), `scripts/bench/ab-prompt.mjs:20-21`, `scripts/e2e/ab-wire-compat.mjs:19`; both bench scripts write markdown into `plans/` (`run-bench.mjs:226`, `ab-prompt.mjs:70`). *Fix: require env vars and write reports outside the repo.*
+
+Notes on things that are *not* issues: the committed Windows `windowsHide` changes (`shell/bash.ts`, `shell/detect.ts`) and the prompt-discipline text are correct; the `EFFORT_6`/`applyThinkingOverride` change at `model-catalog.ts:544` is consistent with its tests.
+
+Unresolved questions: Is the intent for a step-ceiling stop to also halt queued input, or should it advance like a normal completion? And are the new provider options (header deadline, store/prompt-cache control, `wire.toolCallIdReuse`) meant to be configurable from the provider store, or are they test-only seams for now?
+
+----- stderr (opencode prints tool activity here) -----
+
+> build · deepseek-v4.1-flash-free
+
+$ git status --porcelain=v1 -b && echo "---LOG---" && git log --oneline -15 && echo "---BRANCHES---" && git branch -a
+## HEAD (no branch)
+ M package-lock.json
+ M src/bins/headless.ts
+ M src/harness/agent/agent.ts
+ M src/harness/limits.ts
+ M src/harness/llm/openai.ts
+ M src/harness/llm/types.ts
+ M src/web/server.ts
+ M tests/bins/headless.spec.ts
+ M tests/harness/agent-loop.spec.ts
+ M tests/harness/llm-openai.spec.ts
+ M tests/harness/request-lifecycle.spec.ts
+ M tests/harness/stream-completion.spec.ts
+?? bash.exe.stackdump
+?? plans/261016-bench-report.md
+?? plans/261016-branch-verify.md
+?? plans/261016-gap-vs-opencode.md
+?? plans/261016-implementation-report.md
+?? plans/261016-opencode-wire-review.md
+?? plans/261016-spec-harness-core-hardening.md
+?? plans/261016-spec-provider-resilience-cli.md
+?? plans/261017-0018-harness-core-hardening/
+?? plans/261017-opencode-vs-dnt-review.md
+?? plans/261017-opencode-vs-dnt/
+?? plans/ab-prompt-2026-10-16T15-35-04-929Z.md
+?? plans/bench-2026-10-16T15-19-06-901Z.md
+?? scripts/bench/
+?? scripts/e2e/
+?? scripts/tailscale-proxy.mjs
+---LOG---
+c44486d fix(context): bound scope and say when to stop in the base prompt
+a74d70c fix(llm): accept the full effort vocabulary for DeepSeek
+e6ad35b Merge branch 'main' of github.com:dungnt1312/dnt-harness
+ec98d06 ci(release): https repository URL for provenance, verbose publish log
+3cbb9c6 ci(release): publish with npm trusted publishing (OIDC) instead of NPM_TOKEN
+9297b77 chore(release): 0.2.0
+a7033c8 docs(plans): core review reports 2026-10-15 and fix reports
+fba6b88 test(web): wait on real conditions instead of fixed sleeps in grant, lease, g2/g4/g5 tests
+68ee39a fix(web): root principal for child approvals, per-workspace MCP audit faults, grant re-check before persist, pending-input re-read
+ca8cae7 fix(mcp): DNS-pinned outbound dispatcher, no loopback OAuth endpoints from public metadata, journal and secret hygiene
+29bb93e fix(guard): close ${IFS}, brace/glob and git global-option bypasses; fail closed on unanalyzable expansion
+b72b6be fix(context): cap max_tokens at the remaining window for known caps, safe CJK estimation and truncation, adoption proof
+4745935 fix(agent): keep claimed and injected input across pre-step failures; commit forked history
+1740907 test(web): steer tests wait for the hanging provider call, not step/start
+a09db97 test(web): align manifest short_name and model-switch test with current behavior
+---BRANCHES---
+* (no branch)
++ fix/effort-vocabulary-and-prompt-discipline
++ main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/fix/effort-vocabulary-and-prompt-discipline
+  remotes/origin/main
+
+$ git rev-parse --abbrev-ref HEAD && echo "---MERGEBASE---" && git merge-base HEAD main 2>/dev/null || git merge-base HEAD origin/main
+HEAD
+---MERGEBASE---
+ec98d067c267405b12232d52a856741613ee3146
+
+$ git diff --stat main && echo "=== WORKTREE STAT ===" && git diff --stat
+ecosystem.config.cjs                       |   8 +-
+ package-lock.json                          |  66 -------
+ src/bins/headless.ts                       | 125 ++++++++++++-
+ src/capabilities/shell/bash.ts             |   8 +-
+ src/capabilities/shell/detect.ts           |   2 +-
+ src/harness/agent/agent.ts                 |  43 ++++-
+ src/harness/context/builder.ts             |   4 +-
+ src/harness/limits.ts                      |  11 +-
+ src/harness/llm/model-catalog.ts           |   9 +-
+ src/harness/llm/openai.ts                  | 228 +++++++++++++++++++++--
+ src/harness/llm/types.ts                   |  12 ++
+ src/web/server.ts                          |   4 +
+ tests/bins/headless.spec.ts                | 109 ++++++++++-
+ tests/harness/agent-loop.spec.ts           |  78 +++++++-
+ tests/harness/base-prompt-guidance.spec.ts |  13 ++
+ tests/harness/g3-compaction.spec.ts        |   6 +-
+ tests/harness/llm-openai.spec.ts           | 283 ++++++++++++++++++++++++++++-
+ tests/harness/model-catalog.spec.ts        |  30 ++-
+ tests/harness/request-lifecycle.spec.ts    |   9 +
+ tests/harness/stream-completion.spec.ts    |  41 +++++
+ tests/web/server-models.spec.ts            |  25 +++
+ 21 files changed, 999 insertions(+), 115 deletions(-)
+=== WORKTREE STAT ===
+ package-lock.json                       |  66 --------
+ src/bins/headless.ts                    | 125 ++++++++++++--
+ src/harness/agent/agent.ts              |  43 ++++-
+ src/harness/limits.ts                   |  11 +-
+ src/harness/llm/openai.ts               | 228 +++++++++++++++++++++++--
+ src/harness/llm/types.ts                |  12 ++
+ src/web/server.ts                       |   4 +
+ tests/bins/headless.spec.ts             | 109 +++++++++++-
+ tests/harness/agent-loop.spec.ts        |  78 ++++++++-
+ tests/harness/llm-openai.spec.ts        | 283 +++++++++++++++++++++++++++++++-
+ tests/harness/request-lifecycle.spec.ts |   9 +
+ tests/harness/stream-completion.spec.ts |  41 +++++
+ 12 files changed, 906 insertions(+), 103 deletions(-)
+
+$ git diff main -- src tests scripts package.json | head -c 3000
+diff --git a/src/bins/headless.ts b/src/bins/headless.ts
+index 0cbbbac..6f4391e 100644
+--- a/src/bins/headless.ts
++++ b/src/bins/headless.ts
+@@ -15,7 +15,14 @@
+  *
+  * Usage:
+  *   tsx src/bins/headless.ts --message "hello"
++ *   tsx src/bins/headless.ts --provider ocproxy --model deepseek-v4.1-flash-free --message "hello"
+  *   tsx src/bins/headless.ts            # interactive REPL, 'exit' quits
++ *
++ * Model selection: `--provider`/`--model` (`--model provider/model` is
++ * accepted too), else the same `providers.json` store the web host uses
++ * (`--config` points at a different file), else the legacy
++ * `DEEPSEEK_API_KEY` provider. `--thinking <level>` is validated against the
++ * selected model before it reaches the wire.
+  */
+ import { createInterface } from 'node:readline/promises'
+ import path from 'node:path'
+@@ -25,14 +32,18 @@ import {
+   DeepSeekProvider,
+   Kernel,
+   LlmService,
++  OpenAiCompletionsProvider,
+   ToolsService,
+   attachApproval,
+   bashTool,
+   bashOutputTool,
++  expressibleThinkingLevel,
++  isThinkingLevel,
+   killShellTool,
+   fileSessions,
+   fsTools,
+   newInputId,
++  THINKING_LEVELS,
+   WorkspaceService,
+   type ApprovalOptions,
+   type Agent,
+@@ -63,6 +74,7 @@ import { DangerousCommandsStore } from '../harness/guard/store.ts'
+ import { liftsReadOnlyBash, riskyBashMatch } from '../harness/modes/bash-policy.ts'
+ import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
+ import { homedir } from 'node:os'
++import { loadProviderStore, maxOutputTokenOverrides, repairDefaults } from '../web/provider-store.ts'
+ 
+ loadRepoEnv()
+ 
+@@ -71,6 +83,11 @@ interface CliOptions {
+   readonly root: string
+   readonly dataDir: string
+   readonly message: string | undefined
++  /** Provider store consulted for the effective provider/model selection. */
++  readonly config: string
++  readonly provider: string | undefined
++  readonly model: string | undefined
++  readonly thinking: string | undefined
+ }
+ 
+ function parseArgs(argv: readonly string[]): CliOptions {
+@@ -78,14 +95,24 @@ function parseArgs(argv: readonly string[]): CliOptions {
+   let root = process.cwd()
+   let dataDir = path.join(resolveAppHome(process.cwd()), 'data')
+   let message: string | undefined
++  // Mirrors the web host's provider store, so the CLI and the UI select from
++  // the same file unless `--config` points somewhere else.
++  let config = path.join(resolveAppHome(), 'providers.json')
++  let provider: string | undefined
++  let model: string | undefined
++  let thinking: string | undefined
+   for (let i = 0; i < argv.length; i++) {
+     const arg = argv[i]
+     if (arg === '--yolo') yolo = true
+     else if (arg === '--root') root = argv[i + 1] ?? root
+     else if (arg === '--data-dir') dataDir = argv[i + 1] ?? dataDir
+     else if (arg === '--message') message = argv[i + 1]
++    else if (arg === '--config') config = argv[i + 1] ?? config
++    else if (arg === '--provider') provider = argv[i + 1]
++    else if (arg === '--model') model = argv[i
+
+$ git log main --oneline -3 && echo "=== COMMITTED (main..HEAD) STAT ===" && git diff --stat main HEAD && echo "=== UNCOMMITTED STAT ===" && git diff --stat HEAD
+ec98d06 ci(release): https repository URL for provenance, verbose publish log
+3cbb9c6 ci(release): publish with npm trusted publishing (OIDC) instead of NPM_TOKEN
+9297b77 chore(release): 0.2.0
+=== COMMITTED (main..HEAD) STAT ===
+ ecosystem.config.cjs                       |  8 ++++++--
+ src/capabilities/shell/bash.ts             |  8 ++++++--
+ src/capabilities/shell/detect.ts           |  2 +-
+ src/harness/context/builder.ts             |  4 +++-
+ src/harness/llm/model-catalog.ts           |  9 +++++++--
+ tests/harness/base-prompt-guidance.spec.ts | 13 +++++++++++++
+ tests/harness/g3-compaction.spec.ts        |  6 +++++-
+ tests/harness/model-catalog.spec.ts        | 30 +++++++++++++++++++++++++++---
+ tests/web/server-models.spec.ts            | 25 +++++++++++++++++++++++++
+ 9 files changed, 93 insertions(+), 12 deletions(-)
+=== UNCOMMITTED STAT ===
+ package-lock.json                       |  66 --------
+ src/bins/headless.ts                    | 125 ++++++++++++--
+ src/harness/agent/agent.ts              |  43 ++++-
+ src/harness/limits.ts                   |  11 +-
+ src/harness/llm/openai.ts               | 228 +++++++++++++++++++++++--
+ src/harness/llm/types.ts                |  12 ++
+ src/web/server.ts                       |   4 +
+ tests/bins/headless.spec.ts             | 109 +++++++++++-
+ tests/harness/agent-loop.spec.ts        |  78 ++++++++-
+ tests/harness/llm-openai.spec.ts        | 283 +++++++++++++++++++++++++++++++-
+ tests/harness/request-lifecycle.spec.ts |   9 +
+ tests/harness/stream-completion.spec.ts |  41 +++++
+ 12 files changed, 906 insertions(+), 103 deletions(-)
+
+$ git diff main HEAD -- src tests scripts ecosystem.config.cjs
+diff --git a/ecosystem.config.cjs b/ecosystem.config.cjs
+index d80ca0e..7e9e0e6 100644
+--- a/ecosystem.config.cjs
++++ b/ecosystem.config.cjs
+@@ -34,8 +34,12 @@ module.exports = {
+     {
+       name: 'dnt-harness',
+       cwd: __dirname,
+-      script: 'node_modules/tsx/dist/cli.mjs',
+-      args: `src/bins/web.ts --port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
++      // Load tsx in-process (--import) instead of running the tsx CLI: the CLI
++      // spawns a child node with stdio:inherit and no windowsHide, which pops
++      // up a visible console window on Windows.
++      script: 'src/bins/web.ts',
++      node_args: '--import tsx',
++      args: `--port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
+       interpreter: 'node',
+       exec_mode: 'fork',
+       instances: 1,
+diff --git a/src/capabilities/shell/bash.ts b/src/capabilities/shell/bash.ts
+index 9c1468d..6dff4ec 100644
+--- a/src/capabilities/shell/bash.ts
++++ b/src/capabilities/shell/bash.ts
+@@ -81,7 +81,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
+     // Windows has no process groups; taskkill /T takes the tree down. A
+     // second pass reaps MSYS children that were mid-spawn during the first
+     // tree walk (taskkill's parent walk races Git Bash's fork chain).
+-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
++    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+     killer.on('error', () => {
+       child.kill('SIGKILL')
+     })
+@@ -90,7 +90,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
+     // environment: sweep MSYS processes by that tag until none remain.
+     spawn(shell, ['-c', sweepByTag(treeTag)], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
+     setTimeout(() => {
+-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {})
++      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
+       child.kill('SIGKILL')
+     }, 250).unref?.()
+     return
+@@ -165,6 +165,9 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
+         const cwd = exec.root !== '' ? exec.root : fallbackCwd()
+         const child = spawn(detection.executable, ['-lc', command], {
+           cwd, detached: true,
++          // Without windowsHide, detached bash.exe on Windows allocates a
++          // visible console window for every command the agent runs.
++          windowsHide: true,
+           env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
+         })
+         // Even rejected registration must observe spawn errors and reap its tree.
+@@ -264,6 +267,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
+             // requiresRoot tool. The fallback retains direct-call compatibility.
+             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
+             detached: true,
++            windowsHide: true,
+             env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
+           })
+         } catch (error) {
+diff --git a/src/capabilities/shell/detect.ts b/src/capabilities/shell/detect.ts
+index 9aab923..9937646 100644
+--- a/src/capabilities/shell/detect.ts
++++ b/src/capabilities/shell/detect.ts
+@@ -65,7 +65,7 @@ export function detectShell(explicit?: string): ShellDetection {
+     // to the git.exe on PATH. WSL launchers (System32, WindowsApps) are
+     // deliberately skipped — Bash means Git Bash here, not a remote VM.
+     for (const locator of [['where', 'git'], ['where', 'bash']]) {
+-      const lookup = spawnSync(locator[0] as string, locator.slice(1) as string[], { encoding: 'utf8' })
++      const lookup = spawnSync(locator[0] as string, locator.slice(1) as string[], { encoding: 'utf8', windowsHide: true })
+       if (lookup.status !== 0) continue
+       for (const raw of lookup.stdout.split('\n')) {
+         const found = raw.trim()
+diff --git a/src/harness/context/builder.ts b/src/harness/context/builder.ts
+index ed27c99..258034d 100644
+--- a/src/harness/context/builder.ts
++++ b/src/harness/context/builder.ts
+@@ -372,7 +372,9 @@ ${safe}
+ export const DEFAULT_BASE_SYSTEM = [
+   'You are dnt-harness, a local coding assistant. Answer helpfully and precisely.',
+   'An <environment_context> block in this message states the current date, platform, and workspace: treat it as ground truth for date and platform questions instead of guessing. Each message the user typed starts with a [sent YYYY-MM-DD HH:MM zone] line: the time it was sent, added by the host, not text the user wrote. For the exact current time later in a long task, check the clock with a tool.',
+-  'Ground every claim in what you actually observed: files you read, commands you ran, or results a tool returned. When you are unsure or lack a fact, say so plainly rather than inventing it; verify with a tool when verification is cheap.',
++  'Ground every claim in what you actually observed: files you read, commands you ran, or results a tool returned. When you are unsure or lack a fact, say so plainly rather than inventing it. Do not re-read or re-run something you already have just to be sure.',
++  'Answer the question that was asked and stop there: keep the reply as short as the question allows, do not widen the scope, and do not pad it with a summary of your own steps.',
++  'Stop researching once you can answer. A search that returns nothing, or the same thing as the previous one, means change approach or answer with what you already have — never retry it with a slightly different pattern. Report what you could not find instead of searching on.',
+   TOOL_SELECTION,
+   'Restate exact paths, identifiers, and errors in your answers so they stay actionable.',
+   'Reply in the user\'s language; keep code, identifiers, and file paths verbatim.',
+diff --git a/src/harness/llm/model-catalog.ts b/src/harness/llm/model-catalog.ts
+index a065bdd..58b66f3 100644
+--- a/src/harness/llm/model-catalog.ts
++++ b/src/harness/llm/model-catalog.ts
+@@ -30,6 +30,11 @@ export interface ReasoningCapability {
+ export type ThinkingLevel = 'off' | ReasoningLevel
+ 
+ const EFFORT_5: readonly ReasoningLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
++// DeepSeek accepts the whole effort vocabulary, `minimal` included. Omitting a
++// level here is NOT harmless: an undeclared level is dropped from the wire and
++// the provider then runs its own default (for DeepSeek that is the heaviest
++// tier), so a user picking `medium` would silently get MORE thinking than `max`.
++const EFFORT_6: readonly ReasoningLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+ const GEMINI_STANDARD: readonly ReasoningLevel[] = ['low', 'medium', 'high']
+ 
+ /** Every level a settings field or REST body may carry. */
+@@ -204,7 +209,7 @@ function resolveCatalogValue<T>(
+ 
+ const FALLBACK_REASONING: Readonly<Record<string, ReasoningCapability>> = {
+   openai: { levels: EFFORT_5, canDisable: true, transportSupported: true },
+-  deepseek: { levels: ['low', 'high', 'xhigh', 'max'], canDisable: true, transportSupported: true },
++  deepseek: { levels: EFFORT_6, canDisable: true, transportSupported: true },
+   grok: { levels: ['low', 'medium', 'high', 'xhigh'], canDisable: true, transportSupported: true },
+   glm: { levels: ['high', 'max'], canDisable: true, transportSupported: true },
+   kimi: { levels: ['low', 'high', 'max'], canDisable: false, transportSupported: true },
+@@ -536,7 +541,7 @@ export function applyThinkingOverride(body: Record<string, unknown>, model: stri
+     else if (QWEN_LEVELS.includes(level)) body['enable_thinking'] = true
+   } else if (id.includes('deepseek')) {
+     if (level === 'off') setThinking('disabled')
+-    else if (level === 'low' || level === 'high' || level === 'xhigh' || level === 'max') setEffort(level)
++    else if ((EFFORT_6 as readonly string[]).includes(level)) setEffort(level)
+   } else if (id.includes('claude') || id.includes('kiro-claude')) {
+     // Gateway Claude variants forward Anthropic extended_thinking fields;
+     // map effort levels to budget_tokens that approximate them. Checked
+diff --git a/tests/harness/base-prompt-guidance.spec.ts b/tests/harness/base-prompt-guidance.spec.ts
+index 356ca29..61b012d 100644
+--- a/tests/harness/base-prompt-guidance.spec.ts
++++ b/tests/harness/base-prompt-guidance.spec.ts
+@@ -20,6 +20,19 @@ describe('default base prompt', () => {
+     expect(DEFAULT_BASE_SYSTEM).toMatch(/user's language/)
+   })
+ 
++  it('bounds scope and says when to stop, so a high effort level cannot loop on search', () => {
++    // Measured: without these the same model on the same task spent 37 steps /
++    // 69 tool calls at effort `max` — repeatedly grepping one file for an API
++    // that did not exist — against 12 steps / 21 calls for the same request
++    // driven by a prompt that carried the discipline below. Verification is
++    // still owed; re-verifying ground already covered is not.
++    expect(DEFAULT_BASE_SYSTEM).toContain('Answer the question that was asked and stop there')
++    expect(DEFAULT_BASE_SYSTEM).toContain('Stop researching once you can answer')
++    expect(DEFAULT_BASE_SYSTEM).toMatch(/never retry it with a slightly different pattern/)
++    expect(DEFAULT_BASE_SYSTEM).toMatch(/Do not re-read or re-run something you already have/)
++    expect(DEFAULT_BASE_SYSTEM).not.toContain('verify with a tool when verification is cheap')
++  })
++
+   it('selects tools by task, not semantic-search-first, and shares the principle with the child prompt', () => {
+     expect(DEFAULT_BASE_SYSTEM).toContain('prefer the dedicated file and search tools over shell commands')
+     expect(DEFAULT_BASE_SYSTEM).toContain('any line range of them, with Read')
+diff --git a/tests/harness/g3-compaction.spec.ts b/tests/harness/g3-compaction.spec.ts
+index 5175260..ec21cd8 100644
+--- a/tests/harness/g3-compaction.spec.ts
++++ b/tests/harness/g3-compaction.spec.ts
+@@ -471,11 +471,15 @@ describe('compact history window', () => {
+   })
+ 
+   it('budget pressure still drops whole uncovered turns explicitly and preserves the open task', () => {
++    // The window is deliberately just above the irreducible floor (system prompt
++    // + compaction summary + the open task) so pressure keeps forcing whole
++    // completed turns out. It is sized to the current base prompt: lengthening
++    // or shortening that prompt moves the floor, so this number moves with it.
+     const assembled = buildContext(compactWindowBase({
+       events: uncoveredLog(),
+       compaction: { summary: 'covered first turn', coversSeq: 4 },
+       compactionRetainTokens: 0,
+-      budget: { contextLimitTokens: 1100, outputReserveTokens: 100, marginTokens: 100 },
++      budget: { contextLimitTokens: 1220, outputReserveTokens: 100, marginTokens: 100 },
+     }))
+     expect(historyText(assembled)).toContain('OPEN TASK: finish compatibility tests')
+     expect(historyText(assembled)).not.toContain('DECISION: keep the compatibility API')
+diff --git a/tests/harness/model-catalog.spec.ts b/tests/harness/model-catalog.spec.ts
+index 37ba335..c0f3c99 100644
+--- a/tests/harness/model-catalog.spec.ts
++++ b/tests/harness/model-catalog.spec.ts
+@@ -8,6 +8,7 @@ import {
+   applyThinkingOverride,
+   bareModelId,
+   defaultThinkingLevel,
++  expressibleThinkingLevel,
+   formatContextLimit,
+   getModelInfo,
+   getReasoningCapability,
+@@ -102,6 +103,17 @@ describe('reasoning capability', () => {
+     expect(isThinkingLevel(3)).toBe(false)
+     expect(getReasoningCapability('grok-4.3')?.canDisable).toBe(true)
+   })
++
++  it('deepseek declares the whole effort range so no pick degrades to the provider default', () => {
++    // The upstream honours minimal…max. A level missing from the list is
++    // dropped from the wire, and the provider then runs its own default —
++    // for DeepSeek the heaviest tier — so `medium` used to think MORE than
++    // `max` did. Keep every level declared.
++    expect(getReasoningCapability('deepseek-v4.1-flash-free')?.levels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
++    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'medium')).toBe('medium')
++    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'minimal')).toBe('minimal')
++    expect(expressibleThinkingLevel('custom-deepseek-v4-mini', 'medium')).toBe('medium')
++  })
+ })
+ 
+ describe('applyThinkingOverride', () => {
+@@ -146,10 +158,22 @@ describe('applyThinkingOverride', () => {
+     expect(off).toEqual({ thinking: { type: 'disabled' } })
+   })
+ 
++  it('deepseek forwards every declared effort level and disables on off', () => {
++    const medium = body()
++    applyThinkingOverride(medium, 'deepseek-v4.1-flash-free', 'medium')
++    expect(medium).toEqual({ reasoning_effort: 'medium' })
++    const minimal = body()
++    applyThinkingOverride(minimal, 'custom-deepseek-v4-mini', 'minimal')
++    expect(minimal).toEqual({ reasoning_effort: 'minimal' })
++    const low = body()
++    applyThinkingOverride(low, 'custom-deepseek-v4-mini', 'low')
++    expect(low).toEqual({ reasoning_effort: 'low' })
++    const off = body()
++    applyThinkingOverride(off, 'deepseek-v4.1-flash-free', 'off')
++    expect(off).toEqual({ thinking: { type: 'disabled' } })
++  })
++
+   it('family fallbacks cover gateway aliases; unsupported pairs stay silent', () => {
+-    const deep = body()
+-    applyThinkingOverride(deep, 'custom-deepseek-v4-mini', 'low')
+-    expect(deep).toEqual({ reasoning_effort: 'low' })
+     const grok = body()
+     applyThinkingOverride(grok, 'my-grok-4.3-turbo', 'off')
+     expect(grok).toEqual({ reasoning_effort: 'none' })
+diff --git a/tests/web/server-models.spec.ts b/tests/web/server-models.spec.ts
+index 5b44401..80b23dd 100644
+--- a/tests/web/server-models.spec.ts
++++ b/tests/web/server-models.spec.ts
+@@ -183,6 +183,31 @@ describe('workspace thinking control', () => {
+     expect(endpoint.bodies[1]?.['reasoning_effort']).toBe('max')
+   }, 30_000)
+ 
++  it('a level the model documents now reaches the wire instead of falling back to the provider default', async () => {
++    const endpoint = await startStubEndpoint()
++    const { base } = await start()
++    const wsId = await firstWorkspace(base)
++    await post(base, '/api/providers', {
++      name: 'deepseek-gw',
++      baseUrl: endpoint.url,
++      apiKey: '',
++      models: ['deepseek-v4.1-flash-free'],
++    })
++    await put(base, `/api/workspaces/${wsId}/model`, { model: 'deepseek-v4.1-flash-free', provider: 'deepseek-gw' })
++    // `medium` is a real upstream tier. Before the catalog listed it, this PUT
++    // was rejected and a session already carrying `medium` silently sent no
++    // reasoning_effort at all — so the provider ran its own default, which for
++    // DeepSeek is the heaviest tier (more thinking than `max`).
++    expect((await put(base, `/api/workspaces/${wsId}/thinking`, { level: 'medium' })).status).toBe(200)
++
++    const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
++    await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hi' })
++    await settle(base, wsId, id)
++
++    expect(endpoint.bodies[0]?.['reasoning_effort']).toBe('medium')
++    expect(endpoint.bodies[0]?.['thinking']).toBeUndefined()
++  }, 30_000)
++
+   it('modelSettings ride the public provider projection and patch replaces the map', async () => {
+     const { base } = await start()
+     await post(base, '/api/providers', {
+
+$ git diff HEAD -- src/harness/llm/openai.ts src/harness/llm/types.ts
+diff --git a/src/harness/llm/openai.ts b/src/harness/llm/openai.ts
+index 67f41e0..f90cb19 100644
+--- a/src/harness/llm/openai.ts
++++ b/src/harness/llm/openai.ts
+@@ -101,6 +101,116 @@ export interface OpenAiCompletionsOptions {
+   readonly completionPolicy?: 'strict' | 'finish-eof'
+   /** Operator per-model output-token caps; they win over the catalog value. */
+   readonly maxOutputTokens?: Readonly<Record<string, number>>
++  /**
++   * Body field carrying the output cap. Unset means detect it from
++   * `name`/`baseUrl`; unrecognized endpoints keep the historical `max_tokens`.
++   */
++  readonly maxTokensField?: 'max_tokens' | 'max_completion_tokens'
++  /**
++   * Whether this endpoint accepts `prompt_cache_key`. Off unless declared:
++   * strict relays reject unknown body fields. The affinity headers still flow
++   * whenever a request stamps `sessionAffinity`.
++   */
++  readonly supportsPromptCacheKey?: boolean
++  /** Whether this endpoint understands `store`. Only then is `store: false` sent. */
++  readonly supportsStore?: boolean
++  /** Whether the final stream chunk carries `usage` (default true). */
++  readonly supportsUsageInStreaming?: boolean
++  /**
++   * Wait for response headers before giving up on one physical attempt.
++   * Unset means no separate deadline: the existing stream timers apply.
++   */
++  readonly headerTimeoutMs?: number
++  /**
++   * Wire-contract expectations. `'expect'` reads a repeated tool-call index
++   * that arrives with a fresh id as a re-sent header (see the adapter's
++   * tool-call assembly); `'tolerate'` is the default.
++   */
++  readonly wire?: {
++    readonly toolCallIdReuse?: 'tolerate' | 'expect'
++  }
++}
++
++const isOpenAiNative = (name: string, baseUrl: string): boolean =>
++  name.toLowerCase() === 'openai' || baseUrl.toLowerCase().includes('api.openai.com')
++
++/**
++ * Providers documented to take the legacy `max_tokens` field even though
++ * their endpoint is not OpenAI's; mirrors opencode's `openai-chat` list.
++ */
++const LEGACY_MAX_TOKENS_PROVIDERS: ReadonlySet<string> = new Set([
++  'deepseek', 'moonshotai', 'togetherai', 'together', 'zai', 'zai-coding-plan',
++  'zhipuai', 'zhipuai-coding-plan', 'nvidia', 'cerebras', 'chutes',
++  'cloudflare-ai-gateway', 'cloudflare-workers-ai',
++])
++const LEGACY_MAX_TOKENS_HOSTS: readonly string[] = [
++  'deepseek.com', 'api.moonshot.', 'api.together.', 'api.z.ai', 'open.bigmodel.cn',
++  'integrate.api.nvidia.com', 'cerebras.ai', 'llm.chutes.ai',
++  'gateway.ai.cloudflare.com', 'api.cloudflare.com',
++]
++
++/**
++ * Which body field carries the output cap. OpenAI-native endpoints take
++ * `max_completion_tokens` — the field their newer models require — while the
++ * documented compatible families above keep `max_tokens`. An endpoint that
++ * cannot be recognized keeps `max_tokens` too: an arbitrarily named gateway is
++ * far more likely to be a compatible relay than OpenAI itself, so shipping
++ * SR-0 must not change what existing deployments receive.
++ */
++export function detectMaxTokensField(name: string, baseUrl: string): 'max_tokens' | 'max_completion_tokens' {
++  if (LEGACY_MAX_TOKENS_PROVIDERS.has(name.toLowerCase())) return 'max_tokens'
++  const url = baseUrl.toLowerCase()
++  if (LEGACY_MAX_TOKENS_HOSTS.some((host) => url.includes(host))) return 'max_tokens'
++  return isOpenAiNative(name, baseUrl) ? 'max_completion_tokens' : 'max_tokens'
++}
++
++/** Only OpenAI-native endpoints are known to accept an explicit `store`. */
++export function detectSupportsStore(name: string, baseUrl: string): boolean {
++  return isOpenAiNative(name, baseUrl)
++}
++
++/** `prompt_cache_key` is documented at 64 characters. */
++const OPENAI_PROMPT_CACHE_KEY_MAX = 64
++
++/**
++ * Diagnostics: how many times a re-sent tool-call header (a fresh id at an
++ * index that already carried this call's id) was tolerated instead of failing
++ * the turn. Non-zero means the endpoint's wire contract is looser than the
++ * standard one.
++ */
++let toolCallIdReissues = 0
++
++/** Read the process-wide count of tolerated tool-call id re-sends. */
++export function toolCallIdReissueCount(): number {
++  return toolCallIdReissues
++}
++
++/**
++ * Lower the host-approved subset of `providerOptions` onto the body. Only
++ * fields with a documented chat-completions meaning are serialized; anything
++ * else is dropped rather than forwarded, because one unknown field makes a
++ * strict gateway reject the whole request.
++ */
++export function applyProviderOptions(body: Record<string, unknown>, options: Readonly<Record<string, unknown>> | undefined, hasTools: boolean): void {
++  if (options === undefined) return
++  // A tool choice without tools is meaningless; sending it would be rejected.
++  const choice = options['toolChoice']
++  if (hasTools) {
++    if (choice === 'auto' || choice === 'none' || choice === 'required') body['tool_choice'] = choice
++    else if (choice !== null && typeof choice === 'object' && !Array.isArray(choice) && typeof (choice as { name?: unknown }).name === 'string') {
++      body['tool_choice'] = { type: 'function', function: { name: (choice as { name: string }).name } }
++    }
++  }
++  const parallel = options['parallelToolCalls']
++  if (typeof parallel === 'boolean') body['parallel_tool_calls'] = parallel
++  const format = options['responseFormat']
++  if (format === 'text' || format === 'json_object') body['response_format'] = { type: format }
++  else if (format !== null && typeof format === 'object' && !Array.isArray(format)) body['response_format'] = format
++  const stop = options['stop']
++  if (Array.isArray(stop)) {
++    const sequences = stop.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
++    if (sequences.length > 0) body['stop'] = sequences
++  }
+ }
+ 
+ /**
+@@ -210,20 +320,36 @@ export class OpenAiCompletionsProvider implements LlmProvider {
+     // thinking override can patch it; unsupported (model, level) pairs
+     // leave it untouched rather than risking an undocumented field.
+     const model = request.model ?? this.fallbackModel
++    const tools = request.tools ?? []
++    const hasTools = tools.length > 0
++    const affinity = request.sessionAffinity
++    // Every knob below resolves once, before the body is written: no magic
++    // values scattered through the assembly, and `compatibility ?? detect`.
++    const maxTokensField = this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
++    const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
+     const body: Record<string, unknown> = {
+       model,
+       messages: toWireMessages(request.messages),
+-      ...(request.tools !== undefined && request.tools.length > 0
+-        ? { tools: request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
++      ...(hasTools
++        ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
+         : {}),
+       stream: true,
+       // The final chunk then carries `usage` (real prompt/cached counts),
+       // which the context meter shows instead of a raw estimate.
+-      stream_options: { include_usage: true },
++      ...(this.options.supportsUsageInStreaming !== false ? { stream_options: { include_usage: true } } : {}),
++      // Stateless by default where the flag exists; every other endpoint omits
++      // the field entirely rather than risk rejecting an unknown one.
++      ...(supportsStore ? { store: false } : {}),
+     }
+     const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens)
+-    if (maxTokens !== undefined) body['max_tokens'] = maxTokens
++    if (maxTokens !== undefined) body[maxTokensField] = maxTokens
+     applyThinkingOverride(body, model, request.thinkingLevel, maxTokens)
++    applyProviderOptions(body, request.providerOptions, hasTools)
++    // Off unless the endpoint declares support: strict relays reject unknown
++    // body fields. The affinity headers below flow regardless.
++    if (this.options.supportsPromptCacheKey === true && affinity !== undefined && affinity !== '') {
++      body['prompt_cache_key'] = affinity.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX)
++    }
+     const payload = JSON.stringify(body)
+     const signal = options?.signal
+     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
+@@ -235,23 +361,46 @@ export class OpenAiCompletionsProvider implements LlmProvider {
+     // (auth, bad request, a mid-stream failure) surfaces at once.
+     for (let attempt = 1; ; attempt++) {
+       let wait: number | undefined
++      // A header deadline is opt-in: without one this loop behaves exactly as
++      // before. Each physical attempt gets its own timer and controller.
++      const headerTimeout = this.options.headerTimeoutMs
++      const attemptController = headerTimeout === undefined ? undefined : new AbortController()
++      const forwardAbort = (): void => attemptController?.abort(signal?.reason)
++      const headerTimer = attemptController === undefined || headerTimeout === undefined
++        ? undefined
++        : setTimeout(() => attemptController.abort(new ProviderError(`provider sent no response headers within ${headerTimeout}ms`, { reason: 'first_progress_timeout', phase: 'headers', transient: true })), headerTimeout)
++      if (attemptController !== undefined) {
++        if (signal?.aborted === true) attemptController.abort(signal.reason)
++        else signal?.addEventListener('abort', forwardAbort, { once: true })
++      }
++      const wireSignal = attemptController?.signal ?? signal
+       try {
+         response = await fetch(`${this.options.baseUrl}/chat/completions`, {
+           method: 'POST',
+-          ...(signal !== undefined ? { signal } : {}),
++          ...(wireSignal !== undefined ? { signal: wireSignal } : {}),
+           headers: {
+             'content-type': 'application/json',
+             // Local gateways often accept no credential at all; sending an empty
+             // Bearer makes some of them reject the call outright.
+             ...(this.options.apiKey === '' ? {} : { authorization: `Bearer ${this.options.apiKey}` }),
++            // Provider-side prompt-cache affinity: every request of one session
++            // reaches the same shard, so its prefix cache stays reusable. Only
++            // sent when the host stamped an identity.
++            ...(affinity !== undefined && affinity !== '' ? { 'x-session-affinity': affinity } : {}),
+           },
+           body: payload,
+         })
+       } catch (error) {
+-        const classified = signal?.aborted ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' }) : classifyTransport(error, 'connect')
++        const deadline = attemptController?.signal.reason instanceof ProviderError ? attemptController.signal.reason : undefined
++        const classified = signal?.aborted
++          ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' })
++          : deadline ?? classifyTransport(error, 'connect')
+         if (!classified.retryable || attempt >= maxAttempts) throw classified
+         await sleep(backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS), signal)
+         continue
++      } finally {
++        if (headerTimer !== undefined) clearTimeout(headerTimer)
++        signal?.removeEventListener('abort', forwardAbort)
+       }
+       if (response.ok) break
+       let cleanupSettled = true
+@@ -261,7 +410,8 @@ export class OpenAiCompletionsProvider implements LlmProvider {
+       const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
+       if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
+         const retryAfter = retryAfterMs(response.headers.get('retry-after'))
+-        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
++        const excerpt = httpErrorExcerpt(detail)
++        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
+         error.transportSettled = cleanupSettled
+         throw error
+       }
+@@ -337,14 +487,38 @@ export class OpenAiCompletionsProvider implements LlmProvider {
+             const index = fragment.index
+             if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= WIRE_LIMITS.calls) throw protocolError('invalid_tool_input', 'invalid tool index')
+             const slot = calls[index] ?? { id: '', name: '', argsString: '' }
+-            if (fragment.id !== undefined) {
+-              if (typeof fragment.id !== 'string' || !fragment.id.trim() || (slot.id && slot.id !== fragment.id)) throw protocolError('invalid_tool_input', 'conflicting tool ID')
+-              slot.id = fragment.id
++            if (fragment.id !== undefined && fragment.id !== null) {
++              const id = fragment.id
++              // A continuation fragment may repeat the header with no usable
++              // id (`null` / `""` — the live opencode-relayed DeepSeek stream
++              // does). That is "no id in this fragment", not a new call, so the
++              // slot keeps the id its header established; a call that never
++              // gets one fails the batch at finish, where identity is checked.
++              if (typeof id !== 'string') throw protocolError('invalid_tool_input', 'invalid tool ID')
++              if (id.trim() !== '') {
++                if (slot.id && slot.id !== id) {
++                  // A gateway may re-send the tool-call header with a fresh id at
++                  // the same index. While no arguments accumulated the slot still
++                  // describes one call, so the last header wins. Once arguments
++                  // exist the two ids would merge different calls into one
++                  // executable batch: a hard failure, unless the endpoint is
++                  // declared to re-send headers (`wire.toolCallIdReuse: 'expect'`,
++                  // where the accumulated arguments and name are kept).
++                  if (slot.argsString !== '' && this.options.wire?.toolCallIdReuse !== 'expect') throw protocolError('invalid_tool_input', 'conflicting tool ID')
++                  toolCallIdReissues += 1
++                }
++                slot.id = id
++              }
+             }
+-            if (fragment.function?.name !== undefined) {
++            if (fragment.function?.name !== undefined && fragment.function.name !== null) {
+               const name = fragment.function.name
+-              if (typeof name !== 'string' || !name.trim() || (slot.name && slot.name !== name)) throw protocolError('invalid_tool_input', 'conflicting tool name')
+-              slot.name = name
++              // Same rule as the id: a repeated header may blank the name out.
++              // Only a usable name participates, so `""` leaves the slot alone.
++              if (typeof name !== 'string') throw protocolError('invalid_tool_input', 'conflicting tool name')
++              if (name.trim() !== '') {
++                if (slot.name && slot.name !== name) throw protocolError('invalid_tool_input', 'conflicting tool name')
++                slot.name = name
++              }
+             }
+             const args = fragment.function?.arguments ?? ''
+             if (typeof args !== 'string') throw protocolError('invalid_tool_input', 'invalid argument fragment')
+@@ -429,6 +603,34 @@ function gatewayErrorText(error: unknown): string {
+   return JSON.stringify(error)
+ }
+ 
++/**
++ * A compact excerpt of an HTTP error body for the surfaced message. Only
++ * structured JSON error payloads qualify (OpenAI `error` shape or a top-level
++ * `message` string), whitespace-collapsed and capped: a proxy's HTML page or a
++ * bare blob must never be pasted into the visible error, and an opaque status
++ * like `400: unknown` must still tell the operator what the relay complained
++ * about.
++ */
++function httpErrorExcerpt(detail: string): string {
++  const trimmed = detail.trim()
++  if (trimmed === '' || trimmed.length > 8_000) return ''
++  let parsed: unknown
++  try {
++    parsed = JSON.parse(trimmed)
++  } catch {
++    return ''
++  }
++  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return ''
++  const record = parsed as Record<string, unknown>
++  let text: string | undefined
++  if (record['error'] !== undefined && record['error'] !== null) text = gatewayErrorText(record['error'])
++  else if (typeof record['message'] === 'string' && record['message'] !== '') text = record['message']
++  if (text === undefined) return ''
++  const flat = text.replace(/\s+/g, ' ').trim()
++  if (flat === '') return ''
++  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
++}
++
+ /** The `usage` object of a completions chunk; cache fields vary by server. */
+ interface WireUsage {
+   prompt_tokens?: number
+diff --git a/src/harness/llm/types.ts b/src/harness/llm/types.ts
+index e41c459..36acf79 100644
+--- a/src/harness/llm/types.ts
++++ b/src/harness/llm/types.ts
+@@ -147,6 +147,18 @@ export interface ModelRequest {
+    * model with no known output limit keeps the gateway default.
+    */
+   readonly outputCeilingTokens?: number
++  /**
++   * Host-stamped provider request options. Each adapter lowers only the fields
++   * it has a documented wire meaning for (an unknown key is dropped, never
++   * forwarded); nothing reaches the wire blind.
++   */
++  readonly providerOptions?: Readonly<Record<string, unknown>>
++  /**
++   * Host-stamped stable identity of the conversation for provider-side cache
++   * affinity. Folded into affinity headers, and — only where the endpoint
++   * declares support — into `prompt_cache_key`. Never serialized as itself.
++   */
++  readonly sessionAffinity?: string
+ }
+ 
+ export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'
+
+$ git diff HEAD -- src/harness/agent/agent.ts src/harness/limits.ts src/web/server.ts src/bins/headless.ts
+diff --git a/src/bins/headless.ts b/src/bins/headless.ts
+index 0cbbbac..6f4391e 100644
+--- a/src/bins/headless.ts
++++ b/src/bins/headless.ts
+@@ -15,7 +15,14 @@
+  *
+  * Usage:
+  *   tsx src/bins/headless.ts --message "hello"
++ *   tsx src/bins/headless.ts --provider ocproxy --model deepseek-v4.1-flash-free --message "hello"
+  *   tsx src/bins/headless.ts            # interactive REPL, 'exit' quits
++ *
++ * Model selection: `--provider`/`--model` (`--model provider/model` is
++ * accepted too), else the same `providers.json` store the web host uses
++ * (`--config` points at a different file), else the legacy
++ * `DEEPSEEK_API_KEY` provider. `--thinking <level>` is validated against the
++ * selected model before it reaches the wire.
+  */
+ import { createInterface } from 'node:readline/promises'
+ import path from 'node:path'
+@@ -25,14 +32,18 @@ import {
+   DeepSeekProvider,
+   Kernel,
+   LlmService,
++  OpenAiCompletionsProvider,
+   ToolsService,
+   attachApproval,
+   bashTool,
+   bashOutputTool,
++  expressibleThinkingLevel,
++  isThinkingLevel,
+   killShellTool,
+   fileSessions,
+   fsTools,
+   newInputId,
++  THINKING_LEVELS,
+   WorkspaceService,
+   type ApprovalOptions,
+   type Agent,
+@@ -63,6 +74,7 @@ import { DangerousCommandsStore } from '../harness/guard/store.ts'
+ import { liftsReadOnlyBash, riskyBashMatch } from '../harness/modes/bash-policy.ts'
+ import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
+ import { homedir } from 'node:os'
++import { loadProviderStore, maxOutputTokenOverrides, repairDefaults } from '../web/provider-store.ts'
+ 
+ loadRepoEnv()
+ 
+@@ -71,6 +83,11 @@ interface CliOptions {
+   readonly root: string
+   readonly dataDir: string
+   readonly message: string | undefined
++  /** Provider store consulted for the effective provider/model selection. */
++  readonly config: string
++  readonly provider: string | undefined
++  readonly model: string | undefined
++  readonly thinking: string | undefined
+ }
+ 
+ function parseArgs(argv: readonly string[]): CliOptions {
+@@ -78,14 +95,24 @@ function parseArgs(argv: readonly string[]): CliOptions {
+   let root = process.cwd()
+   let dataDir = path.join(resolveAppHome(process.cwd()), 'data')
+   let message: string | undefined
++  // Mirrors the web host's provider store, so the CLI and the UI select from
++  // the same file unless `--config` points somewhere else.
++  let config = path.join(resolveAppHome(), 'providers.json')
++  let provider: string | undefined
++  let model: string | undefined
++  let thinking: string | undefined
+   for (let i = 0; i < argv.length; i++) {
+     const arg = argv[i]
+     if (arg === '--yolo') yolo = true
+     else if (arg === '--root') root = argv[i + 1] ?? root
+     else if (arg === '--data-dir') dataDir = argv[i + 1] ?? dataDir
+     else if (arg === '--message') message = argv[i + 1]
++    else if (arg === '--config') config = argv[i + 1] ?? config
++    else if (arg === '--provider') provider = argv[i + 1]
++    else if (arg === '--model') model = argv[i + 1]
++    else if (arg === '--thinking') thinking = argv[i + 1]
+   }
+-  return { yolo, root, dataDir, message }
++  return { yolo, root, dataDir, message, config, provider, model, thinking }
+ }
+ 
+ /** Render one session's durable stream to stdout as events arrive. */
+@@ -146,8 +173,65 @@ async function askUser(call: { name: string; args: Record<string, unknown> }): P
+ }
+ 
+ async function main(): Promise<void> {
+-  const { yolo, root, dataDir, message } = parseArgs(process.argv.slice(2))
++  const { yolo, root, dataDir, message, config, provider: flagProvider, model: flagModel, thinking: flagThinking } = parseArgs(process.argv.slice(2))
+   const apiKey = readApiKey()
++  // Providers come from the same store the web host edits, plus the legacy env
++  // key — never from an implicit mock. Loaded before any resource is taken so
++  // a bad flag exits without holding the data home.
++  const store = loadProviderStore(config)
++  const enabled = store.providers.filter((entry) => entry.enabled)
++  const legacyKey = apiKey !== undefined && enabled.some((entry) => entry.id === 'deepseek') ? undefined : apiKey
++  if (enabled.length === 0 && legacyKey === undefined) {
++    process.stderr.write(`no provider configured (${config}) and no DEEPSEEK_API_KEY; model calls fail until one is registered.\n`)
++  }
++
++  // The one effective selection, resolved once: explicit flags, then the
++  // store's defaults, then the legacy env provider. It is stamped on every
++  // request, so a run never depends on whichever model the provider happens
++  // to advertise first.
++  const storedDefaults = repairDefaults(store.defaults, store.providers)
++  const byId = new Map(store.providers.map((entry) => [entry.id, entry]))
++  let selectedProvider = flagProvider
++  let selectedModel = flagModel
++  if (selectedProvider === undefined && selectedModel !== undefined) {
++    // `--model <provider>/<model>` sugar, resolved only against a configured
++    // provider id: real model ids may contain slashes of their own.
++    const cut = selectedModel.indexOf('/')
++    if (cut > 0 && byId.has(selectedModel.slice(0, cut))) {
++      selectedProvider = selectedModel.slice(0, cut)
++      selectedModel = selectedModel.slice(cut + 1)
++    }
++  }
++  if (selectedModel !== undefined) {
++    // A bare model still needs a provider; prefer the one that advertises it.
++    selectedProvider = selectedProvider ?? enabled.find((entry) => entry.models.includes(selectedModel!))?.id
++  }
++  selectedProvider = selectedProvider ?? storedDefaults.provider ?? (legacyKey !== undefined ? 'deepseek' : undefined)
++  selectedModel = selectedModel ?? (storedDefaults.provider === selectedProvider ? storedDefaults.model ?? undefined : byId.get(selectedProvider ?? '')?.models[0])
++  let selectedThinking = storedDefaults.thinkingLevel ?? (selectedProvider !== undefined && selectedModel !== undefined ? byId.get(selectedProvider)?.modelSettings?.[selectedModel]?.thinkingLevel : undefined)
++  if (flagThinking !== undefined) {
++    if (!isThinkingLevel(flagThinking)) {
++      process.stderr.write(`dnt-harness: --thinking must be one of ${THINKING_LEVELS.join(', ')}.\n`)
++      process.exitCode = 1
++      return
++    }
++    const accepted = expressibleThinkingLevel(selectedModel, flagThinking)
++    if (accepted === undefined) {
++      process.stderr.write(`dnt-harness: model '${selectedModel ?? '(none)'}' cannot express thinking level '${flagThinking}'.\n`)
++      process.exitCode = 1
++      return
++    }
++    selectedThinking = accepted
++  } else if (selectedThinking !== undefined) {
++    // A stored level is a preference, not a contract: an unsupported one is
++    // simply not carried, exactly as the web host resolves it.
++    selectedThinking = expressibleThinkingLevel(selectedModel, selectedThinking)
++  }
++  if (selectedProvider === undefined) {
++    process.stderr.write(`no provider selected: pass --provider or configure ${config}.\n`)
++  } else if (selectedModel === undefined) {
++    process.stderr.write(`no model selected for provider '${selectedProvider}': pass --model; requests fall back to its first model.\n`)
++  }
+   // One writer per data home: a web host (or another CLI) on the same
+   // directory would append independent sequence numbers to shared logs.
+   let ownerLock: DataHomeLock
+@@ -230,10 +314,19 @@ async function main(): Promise<void> {
+   kernel.ctx.tools.register(killShellTool({ processes }))
+   kernel.ctx.tools.register(todoWriteTool())
+   kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir), ...defaultSecretRoots(homedir())], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
+-  if (apiKey !== undefined) {
+-    kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+-  } else {
+-    process.stderr.write('no DEEPSEEK_API_KEY; model calls fail until a provider is registered.\n')
++  // Providers come from the same store the web host edits, plus the legacy
++  // env key — never from an implicit mock.
++  for (const entry of enabled) {
++    kernel.ctx.llm.register(new OpenAiCompletionsProvider({
++      name: entry.id,
++      apiKey: entry.apiKey,
++      baseUrl: entry.baseUrl,
++      ...(entry.models.length > 0 ? { models: entry.models } : {}),
++      maxOutputTokens: maxOutputTokenOverrides(entry),
++    }))
++  }
++  if (legacyKey !== undefined) {
++    kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+   }
+ 
+   const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
+@@ -257,11 +350,11 @@ async function main(): Promise<void> {
+       workspacePath: canonicalRoot,
+     })
+     // The provider's last report calibrates the budget, as in the web host.
+-    const calibration = latestCalibration(session.events, { model: projected.model, provider: projected.providerName })
++    const calibration = latestCalibration(session.events, { model: selectedModel, provider: selectedProvider })
+     const assembled = buildContext({
+       events: session.events, mode, modeRevision: 0,
+-      model: projected.model, providerName: projected.providerName,
+-      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(projected.model === undefined ? {} : { model: projected.model }),
++      model: selectedModel, providerName: selectedProvider,
++      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(selectedModel === undefined ? {} : { model: selectedModel }),
+       ...(environment !== undefined ? { environment } : {}),
+       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+       ...(calibration !== undefined ? { calibration } : {}),
+@@ -271,7 +364,19 @@ async function main(): Promise<void> {
+     const contextId = randomUUID()
+     const turnId = agentScope.getStore()?.turnId
+     if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
+-    return next({ ...projected, contextId, messages: assembled.messages, tools: schemas, outputCeilingTokens: assembled.maxOutputTokens })
++    return next({
++      ...projected,
++      ...(selectedProvider !== undefined ? { providerName: selectedProvider } : {}),
++      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
++      ...(selectedThinking !== undefined ? { thinkingLevel: selectedThinking } : {}),
++      // Stable per conversation: every request of this session carries the
++      // same affinity, so provider-side prefix caches stay reusable.
++      sessionAffinity: session.id,
++      contextId,
++      messages: assembled.messages,
++      tools: schemas,
++      outputCeilingTokens: assembled.maxOutputTokens,
++    })
+   }, true)
+ 
+   /** Durably accept one input, adopt anything still pending, then run. */
+diff --git a/src/harness/agent/agent.ts b/src/harness/agent/agent.ts
+index 5fdea50..bacee1b 100644
+--- a/src/harness/agent/agent.ts
++++ b/src/harness/agent/agent.ts
+@@ -61,6 +61,18 @@ export const TRUNCATION_NOTICE = [
+   'one section per call, and keep each reply well under the limit. Do not restart work that already succeeded.',
+ ].join(' ')
+ 
++/**
++ * Host notice after a turn reached its model-step ceiling while still calling
++ * tools. It rides a user message marked `origin: 'context'` — model-visible,
++ * never shown as something the user typed — and asks for one final answer
++ * instead of another round of tools.
++ */
++export const STEP_LIMIT_NOTICE = [
++  'Host notice (not from the user): this turn reached its limit of model steps while you were still calling tools.',
++  'Do not start new work. Answer with what you have now: summarize what was completed, what remains, and any blocker,',
++  'in one final message without further tool calls.',
++].join(' ')
++
+ /** Thrown inside a step when the user asks the loop to stop; closes the turn, not a failure. */
+ class StopRequested extends Error {
+   constructor() {
+@@ -358,7 +370,7 @@ export class Agent {
+    * reason so `run()` knows which outcomes end the run (a stop leaves queued
+    * input queued).
+    */
+-  private async turn(): Promise<'completed' | 'cancelled' | 'steered' | 'failed' | 'rejected' | 'empty'> {
++  private async turn(): Promise<'completed' | 'cancelled' | 'steered' | 'failed' | 'rejected' | 'empty' | 'limit'> {
+     const turnId = newTurnId()
+     return agentScope.run({ ...this.identity, turnId }, async () => {
+       this.session.append({ type: 'turn/start', turnId })
+@@ -453,9 +465,16 @@ export class Agent {
+       // answered with a host notice and another step; past the budget the
+       // model is evidently not splitting its output, and the turn fails.
+       let truncations = 0
++      // Model-calling steps this turn has spent. The ceiling ends a runaway
++      // tool loop; host notices and delegated-work reports ride their own step
++      // (so the model always gets its last word) but do not count themselves.
++      let steps = 0
++      const maxSteps = this.limits().maxStepsPerTurn
++      let stepLimitNoticeSent = false
+       // A turn keeps spending steps while tools owe the model their results —
+       // and while delegated work it left running still owes it a report.
+       for (;;) {
++        const hostStep = nextOrigin !== undefined
+         let step: { stepId: StepId; toolCalls: readonly ToolCall[]; truncated?: true }
+         try {
+           step = await this.step(turnId, nextContents, nextClaimed, nextOrigin, nextContext, nextExpansions)
+@@ -471,6 +490,7 @@ export class Agent {
+           throw error
+         }
+         lastStep = step.stepId
++        if (!hostStep) steps += 1
+         nextContents = undefined
+         nextContext = undefined
+         nextExpansions = undefined
+@@ -486,7 +506,20 @@ export class Agent {
+           nextOrigin = 'context'
+           continue
+         }
+-        if (step.toolCalls.length > 0) continue
++        if (step.toolCalls.length > 0) {
++          // Past the ceiling the model is told, exactly once, to answer with
++          // what it has; still calling tools after that ends the turn as
++          // `limit` — a stop, not a failure, with the work so far kept.
++          if (maxSteps > 0 && steps >= maxSteps) {
++            if (stepLimitNoticeSent) break
++            stepLimitNoticeSent = true
++            if (stopRequested()) break
++            nextContents = [STEP_LIMIT_NOTICE]
++            nextOrigin = 'context'
++            continue
++          }
++          continue
++        }
+         // The model is done asking. Work it delegated and left running would be
+         // cancelled by closing the turn, and everything the children did lost:
+         // the host joins them and hands the reports back for one more step.
+@@ -507,6 +540,10 @@ export class Agent {
+         await this.recordTurnEnd(turnId, reason)
+         return reason
+       }
++      if (stepLimitNoticeSent) {
++        await this.recordTurnEnd(turnId, 'limit')
++        return 'limit'
++      }
+       await this.recordTurnEnd(turnId, 'completed')
+       return 'completed'
+     } catch (error) {
+@@ -578,7 +615,7 @@ export class Agent {
+   }
+ 
+   /** Append and durably flush a turn end, then release per-Turn holders. */
+-  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'steered' | 'failed'): Promise<void> {
++  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'steered' | 'failed' | 'limit'): Promise<void> {
+     this.session.append({ type: 'turn/end', turnId, reason })
+     try {
+       await this.session.durable()
+diff --git a/src/harness/limits.ts b/src/harness/limits.ts
+index 26c0e4b..46ea882 100644
+--- a/src/harness/limits.ts
++++ b/src/harness/limits.ts
+@@ -79,6 +79,12 @@ export interface HarnessLimits {
+   readonly compactionOutputTokens: number
+   /** How long an explicit compaction waits for a pending background summary before taking over; 0 never waits. */
+   readonly compactionCandidateWaitMs: number
++  /**
++   * Most model-calling steps one turn may spend. A runaway turn (a model that
++   * keeps calling tools and never answers) is cut off rather than looping
++   * forever. 0 disables the ceiling — the historical behavior.
++   */
++  readonly maxStepsPerTurn: number
+ }
+ 
+ export const DEFAULT_LIMITS: HarnessLimits = {
+@@ -107,14 +113,15 @@ export const DEFAULT_LIMITS: HarnessLimits = {
+   compactionDeadlineMs: 180_000,
+   compactionOutputTokens: 8_000,
+   compactionCandidateWaitMs: 15_000,
++  maxStepsPerTurn: 48,
+ }
+ 
+ const BOOLEAN_LIMITS: ReadonlySet<keyof HarnessLimits> = new Set(['compactionEffectiveEnabled', 'compactionPrecomputeEnabled'])
+ const INTEGER_LIMITS: ReadonlySet<string> = new Set([
+   'streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency',
+-  'compactionDeadlineMs', 'compactionOutputTokens', 'compactionCandidateWaitMs',
++  'compactionDeadlineMs', 'compactionOutputTokens', 'compactionCandidateWaitMs', 'maxStepsPerTurn',
+ ])
+-const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs', 'approvalExpiryMs'])
++const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs', 'approvalExpiryMs', 'maxStepsPerTurn'])
+ 
+ /** Merge overrides; invalid request durations/counts (including fractions) use defaults. */
+ export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 067f9ed..e3f3e45 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -3958,6 +3958,10 @@ ${entry.description}`.toLowerCase().includes(query))
+         ...(effective.provider != null ? { providerName: effective.provider } : {}),
+         ...(thinkingLevel != null ? { thinkingLevel } : {}),
+         contextId,
++        // Stable per conversation: the provider can route every request of this
++        // session to the same shard, keeping its prefix cache warm. Only a
++        // dispatched root/child request is stamped, never a preview.
++        ...(scope !== undefined ? { sessionAffinity: scope.sessionId } : {}),
+       }),
+       messages: assembled.messages,
+       outputCeilingTokens: assembled.maxOutputTokens,
+
+$ git diff HEAD -- tests/ | head -c 20000
+diff --git a/tests/bins/headless.spec.ts b/tests/bins/headless.spec.ts
+index 86ab4b3..ac452cf 100644
+--- a/tests/bins/headless.spec.ts
++++ b/tests/bins/headless.spec.ts
+@@ -69,7 +69,7 @@ describe('headless CLI', () => {
+     const address = provider.address() as { port: number }
+     const env = { DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}` }
+     try {
+-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'remember'], env)
++      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'remember'], env)
+       expect(result.code).toBe(0)
+       const context = requests[0]!.messages.map((message) => message.content).join('\n')
+       expect(context).toContain(wsRoot)
+@@ -83,7 +83,7 @@ describe('headless CLI', () => {
+       await mkdir(modes, { recursive: true })
+       await writeFile(path.join(modes, 'no-memory.md'), '---\nname: No memory\nmemoryPinned: false\nmemoryRetrieval: false\n---\n\nMemory disabled.\n')
+       await writeFile(path.join(modes, '.selected.json'), JSON.stringify({ selected: 'no-memory' }))
+-      const disabled = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'again'], env)
++      const disabled = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'again'], env)
+       expect(disabled.code).toBe(0)
+       expect(requests[2]!.messages.map((message) => message.content).join('\n')).not.toContain('CLI index marker')
+       await expect(readFile(path.join(projectRoot, 'disabled.md'))).rejects.toThrow()
+@@ -112,7 +112,7 @@ describe('headless CLI', () => {
+     await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+     const address = provider.address() as { port: number }
+     try {
+-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'look'], {
++      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'look'], {
+         DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+       })
+       expect(result.code).toBe(0)
+@@ -149,7 +149,7 @@ describe('headless CLI', () => {
+     await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+     const address = provider.address() as { port: number }
+     try {
+-      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'clean up'], {
++      const result = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', root, '--yolo', '--message', 'clean up'], {
+         DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+       })
+       expect(result.code).toBe(0)
+@@ -162,7 +162,7 @@ describe('headless CLI', () => {
+ 
+   it('starts without DEEPSEEK_API_KEY and does not fall back to a mock provider', async () => {
+     dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-'))
+-    const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--message', 'hello'])
++    const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--message', 'hello'])
+ 
+     expect(code).toBe(0)
+     expect(stderr).toContain('no DEEPSEEK_API_KEY')
+@@ -170,4 +170,103 @@ describe('headless CLI', () => {
+     expect(stdout).toContain('no provider registered')
+     expect(stdout).not.toContain('mock')
+   }, 30_000)
++
++  describe('model selection', () => {
++    /** A store entry pointing at a fake OpenAI-compatible gateway. */
++    async function writeStore(configFile: string, baseUrl: string, options: { model?: string; defaults?: boolean } = {}): Promise<void> {
++      const model = options.model ?? 'deepseek-v4.1-flash-free'
++      await writeFile(configFile, JSON.stringify({
++        version: 2,
++        defaults: options.defaults === true ? { provider: 'fake', model, thinkingLevel: null } : { provider: null, model: null, thinkingLevel: null },
++        providers: [{ id: 'fake', name: 'fake', baseUrl: `${baseUrl}/v1`, apiKey: '', models: [model], enabled: true }],
++        aliases: [],
++        aliasGeneration: 0,
++      }))
++    }
++
++    async function sessionEvents(dir: string): Promise<Record<string, any>[]> {
++      const logs = (await readdir(dir, { recursive: true })).filter((file) => file.endsWith('events.jsonl') && file.includes(`${path.sep}sessions${path.sep}`))
++      return (await readFile(path.join(dir, logs[0]!), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>)
++    }
++
++    it('--provider/--model/--thinking reach the wire and the durable log', async () => {
++      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-select-'))
++      const root = fileURLToPath(new URL('../../', import.meta.url))
++      const bodies: Record<string, unknown>[] = []
++      const headers: Record<string, unknown>[] = []
++      const provider = createServer(async (req, res) => {
++        let raw = ''
++        for await (const chunk of req) raw += chunk
++        bodies.push(JSON.parse(raw) as Record<string, unknown>)
++        headers.push(req.headers)
++        res.writeHead(200, { 'content-type': 'text/event-stream' })
++        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
++      })
++      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
++      const address = provider.address() as { port: number }
++      const config = path.join(dataDir, 'providers.json')
++      await writeStore(config, `http://127.0.0.1:${address.port}`)
++      try {
++        const result = await runCli([
++          '--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'hi',
++          '--provider', 'fake', '--model', 'deepseek-v4.1-flash-free', '--thinking', 'high',
++        ])
++        expect(result.code).toBe(0)
++        expect(bodies[0]?.['model']).toBe('deepseek-v4.1-flash-free')
++        // The level must reach the wire, not stop at the settings layer.
++        expect(bodies[0]?.['reasoning_effort']).toBe('high')
++        // One stable affinity for the conversation.
++        expect(headers[0]?.['x-session-affinity']).toBeTypeOf('string')
++        const events = await sessionEvents(dataDir)
++        expect(events.find((event) => event.type === 'assistant/message')?.controls).toEqual({ model: 'deepseek-v4.1-flash-free', provider: 'fake' })
++      } finally {
++        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
++      }
++    }, 30_000)
++
++    it('without flags the provider store decides the pair, and provider/model sugar works', async () => {
++      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-defaults-'))
++      const root = fileURLToPath(new URL('../../', import.meta.url))
++      const models: unknown[] = []
++      const provider = createServer(async (req, res) => {
++        let raw = ''
++        for await (const chunk of req) raw += chunk
++        models.push((JSON.parse(raw) as Record<string, unknown>)['model'])
++        res.writeHead(200, { 'content-type': 'text/event-stream' })
++        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
++      })
++      await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
++      const address = provider.address() as { port: number }
++      const config = path.join(dataDir, 'providers.json')
++      await writeStore(config, `http://127.0.0.1:${address.port}`, { model: 'stored-model', defaults: true })
++      try {
++        const stored = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'one'])
++        expect(stored.code).toBe(0)
++        expect(models[0]).toBe('stored-model')
++        // `--model <provider>/<model>` is resolved against the store.
++        const sugar = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--yolo', '--message', 'two', '--model', 'fake/stored-model'])
++        expect(sugar.code).toBe(0)
++        expect(models[1]).toBe('stored-model')
++        expect(sugar.stderr).not.toContain('no provider selected')
++      } finally {
++        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
++      }
++    }, 30_000)
++
++    it('refuses a thinking level the selected model cannot express', async () => {
++      dataDir = await mkdtemp(path.join(tmpdir(), 'cli-thinking-'))
++      const root = fileURLToPath(new URL('../../', import.meta.url))
++      const config = path.join(dataDir, 'providers.json')
++      await writeStore(config, 'http://127.0.0.1:1', { model: 'mystery-model' })
++      const unknown = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--thinking', 'bogus'])
++      expect(unknown.code).toBe(1)
++      expect(unknown.stderr).toContain('--thinking must be one of')
++
++      const unsupported = await runCli(['--data-dir', dataDir, '--config', config, '--root', root, '--message', 'hi', '--model', 'mystery-model', '--thinking', 'high'])
++      expect(unsupported.code).toBe(1)
++      expect(unsupported.stderr).toContain("cannot express thinking level 'high'")
++      // The rejected flag never opened a session or touched the data home.
++      expect((await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl'))).toHaveLength(0)
++    }, 30_000)
++  })
+ })
+diff --git a/tests/harness/agent-loop.spec.ts b/tests/harness/agent-loop.spec.ts
+index d05e536..dece2ed 100644
+--- a/tests/harness/agent-loop.spec.ts
++++ b/tests/harness/agent-loop.spec.ts
+@@ -17,8 +17,9 @@ import {
+   type LlmProvider,
+   type ModelRequest,
+   type Session,
++  type StreamEvent,
+ } from 'dnt-harness'
+-import { FakeScriptedLlm } from '../support/fake-llm.ts'
++import { FakeScriptedLlm, type ScriptStep } from '../support/fake-llm.ts'
+ 
+ interface Harness {
+   kernel: Kernel
+@@ -28,7 +29,7 @@ interface Harness {
+ }
+ 
+ /** Boot the full harness with a scripted provider and one agent. */
+-function harness(replies: readonly string[], provider?: LlmProvider): Harness {
++function harness(replies: readonly ScriptStep[], provider?: LlmProvider): Harness {
+   const kernel = new Kernel()
+   kernel.ctx.plugin(SessionsService)
+   kernel.ctx.plugin(LlmService)
+@@ -1013,4 +1014,77 @@ describe('agent loop', () => {
+     expect(agent.status).toBe('idle')
+     void kernel.stop()
+   })
++
++  describe('step ceiling', () => {
++    /** Boot with the tools service so scripted tool calls can actually run. */
++    function toolHarness(replies: readonly ScriptStep[]): Harness {
++      const boot = harness(replies)
++      boot.kernel.ctx.plugin(ToolsService)
++      boot.kernel.ctx.tools.register({ name: 'Glob', description: 'test', parameters: { type: 'object', properties: {} }, execute: async () => 'ok' })
++      return boot
++    }
++
++    it('ends a runaway turn at the ceiling with reason limit, after exactly one wrap-up notice', async () => {
++      const kernel = new Kernel()
++      kernel.ctx.plugin(SessionsService)
++      kernel.ctx.plugin(LlmService)
++      kernel.ctx.plugin(ToolsService)
++      kernel.ctx.plugin(AgentsService)
++      kernel.ctx.provide('limits', { maxStepsPerTurn: 3, stepRetryBaseMs: 1 })
++      kernel.ctx.tools.register({ name: 'Glob', description: 'test', parameters: { type: 'object', properties: {} }, execute: async () => 'ok' })
++      let calls = 0
++      // A model that never stops calling tools: only the ceiling ends this turn.
++      kernel.ctx.llm.register({
++        name: 'runaway',
++        models: ['runaway'],
++        async *stream(): AsyncIterable<StreamEvent> {
++          calls += 1
++          yield { type: 'delta', delta: 'working ' } as const
++          yield { type: 'toolCalls', calls: [{ id: `c${calls}`, name: 'Glob', args: {} }] } as const
++          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true } as const
++        },
++      })
++      const session = kernel.ctx.sessions.create()
++      const agent = kernel.ctx.agents.create(session)
++      agent.send('go')
++      agent.send('again')
++      await agent.run()
++
++      expect(session.events.findLast(event => event.type === 'turn/end')).toMatchObject({ reason: 'limit' })
++      // Three counted model steps, plus the one wrap-up step that is exempt.
++      expect(calls).toBe(4)
++      const notices = session.events.filter(event => event.type === 'user/message' && String(event.content).includes('reached its limit of model steps'))
++      expect(notices).toHaveLength(1)
++      // The partial answer survives, and a limit stops the run: the queued
++      // message never opens a second turn.
++      expect(session.events.some(event => event.type === 'assistant/message' && event.content === 'working ')).toBe(true)
++      expect(session.events.filter(event => event.type === 'turn/start')).toHaveLength(1)
++      await kernel.stop()
++    })
++
++    it('a turn under the ceiling is untouched, and 0 keeps the historical behavior', async () => {
++      const bounded = toolHarness([
++        { toolCalls: [{ name: 'Glob', args: {} }] },
++        { toolCalls: [{ name: 'Glob', args: {} }] },
++        'done',
++      ])
++      bounded.kernel.ctx.provide('limits', { maxStepsPerTurn: 5 })
++      bounded.agent.send('go')
++      await bounded.agent.run()
++      expect(bounded.session.events.findLast(event => event.type === 'turn/end')).toMatchObject({ reason: 'completed' })
++      await bounded.kernel.stop()
++
++      const unbounded = toolHarness([
++        { toolCalls: [{ name: 'Glob', args: {} }] },
++        { toolCalls: [{ name: 'Glob', args: {} }] },
++        'done',
++      ])
++      unbounded.kernel.ctx.provide('limits', { maxStepsPerTurn: 0 })
++      unbounded.agent.send('go')
++      await unbounded.agent.run()
++      expect(unbounded.session.events.findLast(event => event.type === 'turn/end')).toMatchObject({ reason: 'completed' })
++      expect(unbounded.session.events.some(event => event.type === 'user/message' && String(event.content).includes('reached its limit'))).toBe(false)
++      await unbounded.kernel.stop()
++    })
++  })
+ })
+diff --git a/tests/harness/llm-openai.spec.ts b/tests/harness/llm-openai.spec.ts
+index 6510c58..48f2425 100644
+--- a/tests/harness/llm-openai.spec.ts
++++ b/tests/harness/llm-openai.spec.ts
+@@ -5,6 +5,7 @@
+  */
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
++import { detectMaxTokensField, detectSupportsStore, toolCallIdReissueCount } from '../../src/harness/llm/openai.ts'
+ import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
+ import { buildContext, wrapUntrusted } from '../../src/harness/context/builder.ts'
+ import { resolveModelBudget } from '../../src/harness/context/budget.ts'
+@@ -13,13 +14,14 @@ import { BUNDLED_MODES, DEFAULT_MODE_ID } from '../../src/harness/modes/bundled.
+ interface CapturedRequest {
+   url: string
+   body: Record<string, unknown>
++  headers: Record<string, string>
+ }
+ 
+ /** Stub global fetch with an SSE chat-completions responder. */
+ function stubFetch(chunks: readonly string[] = ['{"choices":[{"delta":{"content":"ok"}}]}']): CapturedRequest[] {
+   const captured: CapturedRequest[] = []
+-  const fake = vi.fn(async (input: string | URL, init?: { body?: string }) => {
+-    captured.push({ url: String(input), body: JSON.parse(init?.body ?? '{}') as Record<string, unknown> })
++  const fake = vi.fn(async (input: string | URL, init?: { body?: string; headers?: Record<string, string> }) => {
++    captured.push({ url: String(input), body: JSON.parse(init?.body ?? '{}') as Record<string, unknown>, headers: init?.headers ?? {} })
+     const encoder = new TextEncoder()
+     const stream = new ReadableStream<Uint8Array>({
+       start(controller) {
+@@ -429,4 +431,281 @@ describe('openai completions adapter: retry before the stream starts', () => {
+     expect((error as Error).message.length).toBeLessThan(5_000)
+     expect((error as Error).message).not.toContain('x'.repeat(100))
+   })
++
++  it('surfaces a bounded excerpt for structured HTTP error bodies', async () => {
++    scripted([() => new Response('{"error":{"type":"unknown","message":"relay says: bad tool sequence detected"}}', { status: 400 })])
++    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
++    expect((error as Error).message).toContain('HTTP 400: unknown')
++    expect((error as Error).message).toContain('bad tool sequence detected')
++  })
++
++  it('caps the surfaced excerpt at 200 characters', async () => {
++    scripted([() => new Response(JSON.stringify({ error: { message: 'y'.repeat(1_000) } }), { status: 400 })])
++    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
++    expect((error as Error).message).toContain('…')
++    expect((error as Error).message.length).toBeLessThan(300)
++  })
++
++  it('falls back to a top-level message and stays silent for huge JSON bodies', async () => {
++    scripted([() => new Response('{"message":"line one\\n\\n  line two"}', { status: 400 })])
++    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
++    expect((error as Error).message).toContain('line one line two')
++
++    scripted([() => new Response(JSON.stringify({ error: { message: 'z'.repeat(9_000) } }), { status: 400 })])
++    const big = await collect(fast()).catch((caught: unknown) => caught as Error)
++    expect((big as Error).message).not.toContain('z'.repeat(100))
++  })
++})
++
++/** One raw SSE response assembled from records, with no extra finish appended. */
++function stubRecords(records: readonly string[]): void {
++  vi.stubGlobal('fetch', vi.fn(async () => new Response(
++    `${records.map((record) => `data: ${record}\n\n`).join('')}data: [DONE]\n\n`,
++    { status: 200, headers: { 'content-type': 'text/event-stream' } },
++  )))
++}
++
++async function collectEvents(p: OpenAiCompletionsProvider, request: Parameters<OpenAiCompletionsProvider['stream']>[0], signal?: AbortSignal): Promise<unknown[]> {
++  const events: unknown[] = []
++  for await (const event of p.stream(request, signal !== undefined ? { signal } : undefined)) events.push(event)
++  return events
++}
++
++describe('openai completions adapter: compatibility layer', () => {
++  it('detects the output-cap field, keeping the historical one for unrecognized endpoints', () => {
++    expect(detectMaxTokensField('deepseek', 'https://api.deepseek.com')).toBe('max_tokens')
++    expect(detectMaxTokensField('ocproxy', 'http://127.0.0.1:6536/v1')).toBe('max_tokens')
++    expect(detectMaxTokensField('zai', 'https://anything.example/v1')).toBe('max_tokens')
++    expect(detectMaxTokensField('openai', 'https://api.openai.com/v1')).toBe('max_completion_tokens')
++    // A gateway that merely relays OpenAI keeps the modern field by URL.
++    expect(detectMaxTokensField('my-relay', 'https://api.openai.com/v1')).toBe('max_completion_tokens')
++    // An arbitrarily named local gateway must not change wire behavior.
++    expect(detectMaxTokensField('cliproxy1', 'http://127.0.0.1:6536/v1')).toBe('max_tokens')
++    expect(detectSupportsStore('openai', 'https://api.openai.com/v1')).toBe(true)
++    expect(detectSupportsStore('cliproxy1', 'http://127.0.0.1:6536/v1')).toBe(false)
++  })
++
++  it('writes the cap into the detected field and sends no other field of its own', async () => {
++    const cases: readonly { name: string; baseUrl: string; field: 'max_tokens' | 'max_completion_tokens' }[] = [
++      { name: 'deepseek', baseUrl: 'https://api.deepseek
+
+$ git diff HEAD -- tests/harness/llm-openai.spec.ts tests/harness/request-lifecycle.spec.ts tests/harness/stream-completion.spec.ts | tail -c 16000
+await run({ model: 'gpt-5.6', messages: [], providerOptions: {} })
++    expect(after[0]!.body).toEqual(historical)
++  })
++
++  it('sends store:false only where the flag is declared or detected, and honors usage opt-out', async () => {
++    const native = stubFetch()
++    await collectEvents(new OpenAiCompletionsProvider({ name: 'openai', apiKey: '', baseUrl: 'https://api.openai.com/v1' }), { messages: [] })
++    expect(native[0]!.body['store']).toBe(false)
++
++    const declared = stubFetch()
++    await collectEvents(new OpenAiCompletionsProvider({ name: 'cliproxy1', apiKey: '', baseUrl: 'http://127.0.0.1:6536/v1', supportsStore: true }), { messages: [] })
++    expect(declared[0]!.body['store']).toBe(false)
++
++    const withoutUsage = stubFetch()
++    await collectEvents(new OpenAiCompletionsProvider({ name: 'cliproxy1', apiKey: '', baseUrl: 'http://127.0.0.1:6536/v1', supportsUsageInStreaming: false }), { messages: [] })
++    expect('stream_options' in withoutUsage[0]!.body).toBe(false)
++  })
++
++  it('fails a physical attempt that never sends headers when a deadline is configured', async () => {
++    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => {
++      await new Promise((_resolve, reject) => {
++        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
++      })
++      return new Response('')
++    }))
++    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', headerTimeoutMs: 20, maxRetries: 0 })
++    await expect(collectEvents(p, { messages: [] })).rejects.toMatchObject({ reason: 'first_progress_timeout', phase: 'headers', transient: true })
++  })
++
++  it('a caller stop during the header wait stays a cancellation, not a deadline', async () => {
++    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => {
++      await new Promise((_resolve, reject) => {
++        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
++      })
++      return new Response('')
++    }))
++    const controller = new AbortController()
++    setTimeout(() => controller.abort(new Error('stopped')), 10)
++    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', headerTimeoutMs: 60_000, maxRetries: 0 })
++    await expect(collectEvents(p, { messages: [] }, controller.signal)).rejects.toMatchObject({ reason: 'cancelled' })
++  })
++})
++
++describe('openai completions adapter: provider options', () => {
++  const tools = [{ name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }]
++
++  it('lowers only whitelisted fields and drops the rest', async () => {
++    const captured = stubFetch()
++    await run({
++      messages: [],
++      tools,
++      providerOptions: {
++        toolChoice: 'required',
++        parallelToolCalls: false,
++        responseFormat: 'json_object',
++        stop: ['STOP', ''],
++        temperature: 0.2,
++        seed: 7,
++      },
++    })
++    const body = captured[0]!.body
++    expect(body['tool_choice']).toBe('required')
++    expect(body['parallel_tool_calls']).toBe(false)
++    expect(body['response_format']).toEqual({ type: 'json_object' })
++    expect(body['stop']).toEqual(['STOP'])
++    expect('temperature' in body).toBe(false)
++    expect('seed' in body).toBe(false)
++  })
++
++  it('maps a named tool choice and passes a full response_format object through', async () => {
++    const captured = stubFetch()
++    const schema = { type: 'json_schema', json_schema: { name: 'answer' } }
++    await run({ messages: [], tools, providerOptions: { toolChoice: { name: 'Read' }, responseFormat: schema } })
++    expect(captured[0]!.body['tool_choice']).toEqual({ type: 'function', function: { name: 'Read' } })
++    expect(captured[0]!.body['response_format']).toEqual(schema)
++  })
++
++  it('never sends a tool choice when the request exposes no tools', async () => {
++    const captured = stubFetch()
++    await run({ messages: [], providerOptions: { toolChoice: 'required' } })
++    expect('tool_choice' in captured[0]!.body).toBe(false)
++  })
++
++  it('ignores malformed option values instead of forwarding them', async () => {
++    const captured = stubFetch()
++    await run({
++      messages: [],
++      tools,
++      providerOptions: { toolChoice: { nope: true }, parallelToolCalls: 'yes', responseFormat: 'xml', stop: 'STOP' },
++    })
++    const body = captured[0]!.body
++    expect('tool_choice' in body).toBe(false)
++    expect('parallel_tool_calls' in body).toBe(false)
++    expect('response_format' in body).toBe(false)
++    expect('stop' in body).toBe(false)
++  })
++})
++
++describe('openai completions adapter: session affinity', () => {
++  it('always sends the affinity header but gates prompt_cache_key on declared support', async () => {
++    const declared = stubFetch()
++    await collectEvents(
++      new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', supportsPromptCacheKey: true }),
++      { messages: [], sessionAffinity: 'sess-1' },
++    )
++    expect(declared[0]!.headers['x-session-affinity']).toBe('sess-1')
++    expect(declared[0]!.body['prompt_cache_key']).toBe('sess-1')
++
++    // Undeclared endpoints still get the header, never the body field: a strict
++    // relay must not receive an unknown key.
++    const gated = stubFetch()
++    await run({ messages: [], sessionAffinity: 'sess-2' })
++    expect(gated[0]!.headers['x-session-affinity']).toBe('sess-2')
++    expect('prompt_cache_key' in gated[0]!.body).toBe(false)
++
++    const absent = stubFetch()
++    await run({ messages: [] })
++    expect('x-session-affinity' in absent[0]!.headers).toBe(false)
++    expect('prompt_cache_key' in absent[0]!.body).toBe(false)
++  })
++
++  it('keeps one stable affinity across a session and truncates an oversized key', async () => {
++    const captured = stubFetch()
++    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', supportsPromptCacheKey: true })
++    const session = 's'.repeat(120)
++    await collectEvents(p, { messages: [], sessionAffinity: session })
++    await collectEvents(p, { messages: [], sessionAffinity: session })
++    expect(captured.map((request) => request.headers['x-session-affinity'])).toEqual([session, session])
++    expect(captured[0]!.body['prompt_cache_key']).toHaveLength(64)
++    expect(captured[0]!.body['prompt_cache_key']).toBe(captured[1]!.body['prompt_cache_key'])
++  })
++})
++
++describe('openai completions adapter: re-sent tool-call headers', () => {
++  it('accepts a fresh id before arguments accumulated and executes one call', async () => {
++    const before = toolCallIdReissueCount()
++    stubRecords([
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob"}}]}}]}',
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"name":"Glob"}}]}}]}',
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}',
++      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
++    ])
++    const events = await collectEvents(provider(), { messages: [] })
++    expect(events).toContainEqual({ type: 'toolCalls', calls: [{ id: 'B', name: 'Glob', args: {} }] })
++    expect(toolCallIdReissueCount()).toBe(before + 1)
++  })
++
++  it('still fails when the id changes after arguments accumulated', async () => {
++    stubRecords([
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob","arguments":"{\\"p\\":1}"}}]}}]}',
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"arguments":"{}"}}]}}]}',
++      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
++    ])
++    await expect(collectEvents(provider(), { messages: [] })).rejects.toThrow(/conflicting tool ID/)
++  })
++
++  it('wire.toolCallIdReuse expect keeps accumulated arguments and takes the newest id', async () => {
++    stubRecords([
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"name":"Glob","arguments":"{\\"p\\":"}}]}}]}',
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"B","function":{"arguments":"1}"}}]}}]}',
++      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
++    ])
++    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', wire: { toolCallIdReuse: 'expect' } })
++    expect(await collectEvents(p, { messages: [] })).toContainEqual({ type: 'toolCalls', calls: [{ id: 'B', name: 'Glob', args: { p: 1 } }] })
++  })
++
++  it('treats a blank id as a placeholder, rejects a non-string id without echoing it', async () => {
++    // Blank means "no id in this fragment": the slot waits for the real header.
++    stubRecords([
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"  ","function":{"name":"Glob"}}]}}]}',
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"A","function":{"arguments":"{}"}}]}}]}',
++      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
++    ])
++    expect(await collectEvents(provider(), { messages: [] })).toContainEqual({ type: 'toolCalls', calls: [{ id: 'A', name: 'Glob', args: {} }] })
++    // A call that never gets an identity still fails at the batch boundary.
++    stubRecords([
++      '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"Glob","arguments":"{}"}}]}}]}',
++      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
++    ])
++    await expect(collectEvents(provider(), { messages: [] })).rejects.toMatchObject({ reason: 'invalid_tool_input' })
++    // A non-string id is malformed data: fail without echoing the value.
++    stubRecords(['{"choices":[{"delta":{"tool_calls":[{"index":0,"id":12345,"function":{"name":"Glob"}}]}}]}'])
++    await expect(collectEvents(provider(), { messages: [] })).rejects.toMatchObject({ reason: 'invalid_tool_input' })
++    await expect(collectEvents(provider(), { messages: [] })).rejects.not.toThrow('12345')
++  })
+ })
+diff --git a/tests/harness/request-lifecycle.spec.ts b/tests/harness/request-lifecycle.spec.ts
+index c96744c..3ff41b6 100644
+--- a/tests/harness/request-lifecycle.spec.ts
++++ b/tests/harness/request-lifecycle.spec.ts
+@@ -432,6 +432,15 @@ describe('aggregate request lifecycle', () => {
+   it('rejects fractional request limits centrally using documented defaults', () => {
+     expect(resolveLimits({ streamIdleMs: 1.5, logicalRequestMs: 2.5, stepRetries: 1.5, stepRetryBaseMs: 1.5 })).toMatchObject({ streamIdleMs: DEFAULT_LIMITS.streamIdleMs, logicalRequestMs: DEFAULT_LIMITS.logicalRequestMs, stepRetries: DEFAULT_LIMITS.stepRetries, stepRetryBaseMs: DEFAULT_LIMITS.stepRetryBaseMs })
+   })
++  it('keeps the per-turn step ceiling a validated, zero-capable integer', () => {
++    expect(DEFAULT_LIMITS.maxStepsPerTurn).toBe(48)
++    expect(resolveLimits({ maxStepsPerTurn: 0 }).maxStepsPerTurn).toBe(0)
++    expect(resolveLimits({ maxStepsPerTurn: 12 }).maxStepsPerTurn).toBe(12)
++    // Fractions, negatives, and junk fall back to the documented default.
++    expect(resolveLimits({ maxStepsPerTurn: 1.5 }).maxStepsPerTurn).toBe(48)
++    expect(resolveLimits({ maxStepsPerTurn: -1 }).maxStepsPerTurn).toBe(48)
++    expect(resolveLimits({ maxStepsPerTurn: Number.NaN }).maxStepsPerTurn).toBe(48)
++  })
+   it('ships effective compaction off by default with the approved precompute numbers', () => {
+     expect(DEFAULT_LIMITS).toMatchObject({
+       compactionEffectiveEnabled: false,
+diff --git a/tests/harness/stream-completion.spec.ts b/tests/harness/stream-completion.spec.ts
+index b8862b4..715ac54 100644
+--- a/tests/harness/stream-completion.spec.ts
++++ b/tests/harness/stream-completion.spec.ts
+@@ -105,6 +105,47 @@ describe('explicit stream completion', () => {
+     const events = await collect(call(0, 'a', 'Glob', '{') + call(1, 'b', 'Read', '{}') + record({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '}' } }] } }] }) + finish('tool_calls') + 'data: [DONE]\n\n')
+     expect(events.find(e => e.type === 'toolCalls')).toMatchObject({ calls: [{ id: 'a', args: {} }, { id: 'b', args: {} }] })
+   })
++  it('A11 tolerates a gateway re-sending the tool-call header before arguments', async () => {
++    const header = (id: string) => record({ choices: [{ delta: { tool_calls: [{ index: 0, id, function: { name: 'Glob' } }] } }] })
++    const args = record({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } }] })
++    const events = await collect(header('c') + header('d') + args + finish('tool_calls') + 'data: [DONE]\n\n')
++    // One executable call, carrying the newest id the gateway sent.
++    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'd', name: 'Glob', args: {} }] }])
++  })
++  it('A11 tolerates header repeats with no usable identity (`id: null`, blank name)', async () => {
++    // The live opencode-relayed DeepSeek stream repeats the header on every
++    // continuation fragment as `{"id":null,"type":null,"function":{"name":"",...}}`.
++    // Those fragments carry no identity and must not kill the turn.
++    const header = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'Glob', arguments: '' } }] } }] })
++    const noise = (args: string) => record({ choices: [{ delta: { tool_calls: [{ index: 0, id: null, type: null, function: { name: '', arguments: args } }] } }] })
++    const events = await collect(header + noise('{') + noise('}') + finish('tool_calls') + 'data: [DONE]\n\n')
++    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'call_1', name: 'Glob', args: {} }] }])
++  })
++  it('A11 lets identity arrive after blank placeholders', async () => {
++    const placeholder = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: '', function: { name: '', arguments: '' } }] } }] })
++    const header = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_9', function: { name: 'Glob', arguments: '{}' } }] } }] })
++    const events = await collect(placeholder + header + finish('tool_calls') + 'data: [DONE]\n\n')
++    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [{ id: 'call_9', name: 'Glob', args: {} }] }])
++  })
++  it('A11 still rejects a non-string tool id', async () => {
++    const wire = record({ choices: [{ delta: { tool_calls: [{ index: 0, id: 42, function: { name: 'Glob', arguments: '{}' } }] } }] })
++    await expect(collect(wire + finish('tool_calls') + 'data: [DONE]\n\n')).rejects.toMatchObject({ reason: 'invalid_tool_input' })
++  })
++  it('A11 keeps parallel calls apart through null-id continuations', async () => {
++    // Interleaved, out-of-order indexes — the shape the live relay emits for
++    // parallel tool calls.
++    const frag = (f: unknown) => record({ choices: [{ delta: { tool_calls: [f] } }] })
++    const wire = frag({ index: 1, id: 'b', function: { name: 'Glob', arguments: '' } })
++      + frag({ index: 0, id: 'a', function: { name: 'Glob', arguments: '' } })
++      + frag({ index: 1, id: null, type: null, function: { name: '', arguments: '{"pattern":"b"}' } })
++      + frag({ index: 0, id: null, type: null, function: { name: '', arguments: '{"pattern":"a"}' } })
++      + finish('tool_calls') + 'data: [DONE]\n\n'
++    const events = await collect(wire)
++    expect(events.filter(e => e.type === 'toolCalls')).toEqual([{ type: 'toolCalls', calls: [
++      { id: 'a', name: 'Glob', args: { pattern: 'a' } },
++      { id: 'b', name: 'Glob', args: { pattern: 'b' } },
++    ] }])
++  })
+   it.each([call(128), call(1), call() + call(0, 'different'), call() + call(0, 'c', 'Read'), call(0, 'c', 'Glob', '{'), call() + call(1)])('A11 rejects invalid whole batch', async wire => {
+     await expect(collect(wire + finish('tool_calls') + 'data: [DONE]\n\n')).rejects.toBeInstanceOf(Error)
+   })
+
+$ git diff HEAD -- package-lock.json
+diff --git a/package-lock.json b/package-lock.json
+index ebae747..6b50515 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1606,9 +1606,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2604,9 +2601,6 @@
+         "arm"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2621,9 +2615,6 @@
+         "arm"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2638,9 +2629,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2655,9 +2643,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2672,9 +2657,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2689,9 +2671,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2706,9 +2685,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2723,9 +2699,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2740,9 +2713,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2757,9 +2727,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2774,9 +2741,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2791,9 +2755,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2808,9 +2769,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3034,9 +2992,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3054,9 +3009,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3074,9 +3026,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3094,9 +3043,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -4664,9 +4610,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -4688,9 +4631,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -4712,9 +4652,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -4736,9 +4673,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+
+$ ls -la scripts scripts/bench scripts/e2e 2>/dev/null
+scripts:
+total 84
+drwxr-xr-x 1 devdu 197609    0 Oct 17 07:35 .
+drwxr-xr-x 1 devdu 197609    0 Oct 17 07:35 ..
+-rw-r--r-- 1 devdu 197609 3681 Oct 17 07:35 _spawn-explore.mts
+drwxr-xr-x 1 devdu 197609    0 Oct 17 07:35 bench
+-rwxr-xr-x 1 devdu 197609  844 Oct 17 07:35 compress-image.sh
+drwxr-xr-x 1 devdu 197609    0 Oct 17 07:35 e2e
+-rw-r--r-- 1 devdu 197609 5016 Oct 17 07:35 env-ended-shot.mjs
+-rw-r--r-- 1 devdu 197609 5177 Oct 17 07:35 env-panel-flow-shot.mjs
+-rw-r--r-- 1 devdu 197609 5325 Oct 17 07:35 env-panel-shot.mjs
+-rwxr-xr-x 1 devdu 197609 3755 Oct 17 07:35 live-ui-smoke.mjs
+-rw-r--r-- 1 devdu 197609 2216 Oct 17 07:35 measure-toolcards.mjs
+-rwxr-xr-x 1 devdu 197609 6173 Oct 17 07:35 process-logo-icons.mjs
+-rw-r--r-- 1 devdu 197609 1246 Oct 17 07:35 shoot-toolcards.mjs
+-rw-r--r-- 1 devdu 197609 2691 Oct 17 07:35 smoke-model-ui.mjs
+-rw-r--r-- 1 devdu 197609 2261 Oct  2 23:34 tailscale-proxy.mjs
+-rwxr-xr-x 1 devdu 197609 3666 Oct 17 07:35 tool-health.mjs
+
+scripts/bench:
+total 64
+drwxr-xr-x 1 devdu 197609     0 Oct 17 07:35 .
+drwxr-xr-x 1 devdu 197609     0 Oct 17 07:35 ..
+-rw-r--r-- 1 devdu 197609  2711 Oct 16 22:19 README.md
+-rw-r--r-- 1 devdu 197609  5001 Oct 16 22:29 ab-prompt.mjs
+-rw-r--r-- 1 devdu 197609 12882 Oct 16 22:10 harness-agent.mts
+-rw-r--r-- 1 devdu 197609  2483 Oct 16 21:54 log-proxy.mjs
+-rw-r--r-- 1 devdu 197609  4664 Oct 16 22:06 opencode-run.mjs
+-rw-r--r-- 1 devdu 197609 12770 Oct 16 22:45 run-bench.mjs
+drwxr-xr-x 1 devdu 197609     0 Oct 17 07:35 tasks
+
+scripts/e2e:
+total 140
+drwxr-xr-x 1 devdu 197609     0 Oct 17 07:35 .
+drwxr-xr-x 1 devdu 197609     0 Oct 17 07:35 ..
+-rw-r--r-- 1 devdu 197609  6202 Oct 17 00:17 ab-wire-compat.mjs
+-rw-r--r-- 1 devdu 197609 16185 Oct 17 07:34 compare-opencode-dnt.mjs
+-rwxr-xr-x 1 devdu 197609 48368 Oct 17 01:21 curl-api-suite.mjs
+-rw-r--r-- 1 devdu 197609 10368 Oct 17 00:40 fake-gateway.mjs
+-rw-r--r-- 1 devdu 197609  4166 Oct 17 00:43 log-proxy.mjs
+-rw-r--r-- 1 devdu 197609  2451 Oct 17 00:51 probe-gateway.mjs
+-rw-r--r-- 1 devdu 197609  5618 Oct 17 00:45 repro-toolid.mjs
+-rw-r--r-- 1 devdu 197609 13395 Oct 17 00:40 run-fake-e2e.mjs
+-rw-r--r-- 1 devdu 197609 11522 Oct 17 00:46 run-real-e2e.mjs
+
+→ Read src\harness\agent\agent.ts [offset=380, limit=240]
+→ Read src\harness\agent\agent.ts [limit=140, offset=220]
+
+$ rg -n "expressibleThinkingLevel|export function isThinkingLevel|THINKING_LEVELS" src/harness/llm/model-catalog.ts
+41:export const THINKING_LEVELS: readonly ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+43:export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+44:  return typeof value === 'string' && (THINKING_LEVELS as readonly string[]).includes(value)
+346:export function expressibleThinkingLevel(
+
+$ rg -n "'turn/end'|reason.*'completed'.*'rejected'|turn/end" src/harness/session src/harness/agent --glob '*.ts' | head -50
+src/harness/agent\types.ts:92:     * Serial listeners run once a turn's work has settled, before `turn/end`
+src/harness/session\service.ts:474:        case 'turn/end':
+src/harness/session\service.ts:552:      session.append({ type: 'turn/end', turnId: turnId as never, reason: 'interrupted' })
+src/harness/session\events.ts:70:  | ({ readonly type: 'turn/end'; readonly turnId: TurnId; readonly reason: TurnEndReason } & SessionEventStamp)
+src/harness/session\events.ts:476:      case 'turn/end':
+src/harness/agent\agent.ts:346:   * Append `turn/end` for the newest still-open turn, if any: a failed step
+src/harness/agent\agent.ts:357:      if (event.type === 'turn/end') return
+src/harness/agent\agent.ts:359:        this.session.append({ type: 'turn/end', turnId: event.turnId, reason: 'failed' })
+src/harness/agent\agent.ts:566:          this.session.append({ type: 'turn/end', turnId, reason })
+src/harness/agent\agent.ts:618:  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'steered' | 'failed' | 'limit'): Promise<void> {
+src/harness/agent\agent.ts:619:    this.session.append({ type: 'turn/end', turnId, reason })
+
+$ rg -n "TurnEndReason" src --glob '*.ts'
+src\index.ts:52:  type TurnEndReason,
+src\harness\agents\executor.ts:24:import type { SessionEvent, TurnEndReason } from '../session/events.ts'
+src\harness\agents\executor.ts:593:  private async terminalizeManualTurn(parent: StoredSession, turnId: string, reason: TurnEndReason): Promise<void> {
+src\harness\agents\executor.ts:1698:function terminalTurnReason(events: readonly SessionEvent[]): TurnEndReason | undefined {
+src\harness\session\events.ts:70:  | ({ readonly type: 'turn/end'; readonly turnId: TurnId; readonly reason: TurnEndReason } & SessionEventStamp)
+src\harness\session\events.ts:257:export type TurnEndReason =
+
+→ Read src\harness\llm\model-catalog.ts [offset=336, limit=40]
+→ Read src\harness\session\events.ts [limit=22, offset=255]
+→ Read src\harness\session\service.ts [limit=30, offset=466]
+
+$ rg -n "reason === 'limit'|=== 'limit'|'limit'\)" src --glob '*.ts' | head -40
+src\bins\headless.ts:157:      if (event.reason === 'limit') process.stdout.write('[turn hit a limit]\n')
+src\harness\agent\agent.ts:544:        await this.recordTurnEnd(turnId, 'limit')
+src\harness\agent\agent.ts:618:  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'steered' | 'failed' | 'limit'): Promise<void> {
+src\capabilities\fs\tools.ts:184:      const limit = positiveInteger(args, 'limit') ?? READ_DEFAULT_LINES
+src\web\server.ts:7945:          const rawLimit = Number.parseInt(query.get('limit') ?? '', 10)
+
+$ rg -n "reason === 'completed'|reason === 'interrupted'|turn/end" src/web src/harness/agents --glob '*.ts' | head -40
+src/harness/agents\executor.ts:285:   * Entries leave once the turn's `turn/end` is durable (releaseTurns) or the
+src/harness/agents\executor.ts:303:      const boundary = parent?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+src/harness/agents\executor.ts:313:    const boundary = sessions?.get?.(root)?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+src/harness/agents\executor.ts:538:      const open = [...parent.events].reverse().find((event) => event.type === 'turn/start' || event.type === 'turn/end')
+src/harness/agents\executor.ts:564:          parent.append({ type: 'turn/end', turnId, reason: 'failed' })
+src/harness/agents\executor.ts:597:      const alreadyEnded = parent.events.some((event) => event.type === 'turn/end' && event.turnId === turnId)
+src/harness/agents\executor.ts:599:        parent.append({ type: 'turn/end', turnId, reason: terminalReason })
+src/harness/agents\executor.ts:677:      (event.type === 'turn/closing' || event.type === 'turn/end') && event.turnId === request.parentTurnId)) {
+src/harness/agents\executor.ts:1163:      const boundary = parent?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+src/harness/agents\executor.ts:1227:      // durable turn/end then refuses late spawns), or with the root itself.
+src/harness/agents\executor.ts:1228:      // A turn still between closing and its turn/end keeps its guard.
+src/harness/agents\executor.ts:1236:          if (parent === undefined || parent.events.some((event) => event.type === 'turn/end' && event.turnId === turnId)) {
+src/harness/agents\executor.ts:1701:    if (event?.type === 'turn/end') return event.reason
+src/web\compaction-host.ts:62:    else if (event.type === 'turn/end') open = false
+src/web\compaction-capture.ts:102:/** The completed cutoff of a turn: its `turn/end` with reason `completed`, and nothing unresolved inside it. */
+src/web\compaction-capture.ts:106:  const end = events.find((event) => event.type === 'turn/end' && event.turnId === turnId && event.seq > start.seq)
+src/web\compaction-capture.ts:107:  if (end === undefined || end.type !== 'turn/end' || end.reason !== 'completed') return undefined
+src/web\compaction-capture.ts:205:    if (end.type !== 'turn/end' || end.reason !== 'completed') continue
+src/web\compaction-source.ts:30:/** Newest turn/end of a log whose turns are all closed, or why there is none. */
+src/web\compaction-source.ts:36:    else if (event.type === 'turn/end') { open = false; cutoff = event.seq }
+src/web\server.ts:246:     * broadcast so the UI can surface it instead of a bare `turn/end: failed`.
+src/web\server.ts:1930:  // after `turn/end` is durable (agent/turn-settled), never on stream EOF.
+src/web\server.ts:1977:    const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
+src/web\server.ts:2233:  // `turn/end: completed` never hides active work.
+src/web\server.ts:3298:      if (event?.type === 'turn/end' || event?.type === 'turn/closing') return true
+src/web\server.ts:4360:   * driver is in flight counts: a conversation with no `turn/end` whose driver
+src/web\server.ts:4440:      const end = events.findIndex((event) => event.type === 'turn/end')
+src/web\server.ts:4446:      const ended = events[end] as Extract<SessionEvent, { type: 'turn/end' }>
+src/web\server.ts:4447:      if (ended.reason === 'completed') {
+src/web\server.ts:4466:    if (event.type !== 'turn/end') return
+src/web\server.ts:4470:    if (event.reason === 'completed') {
+src/web\server.ts:4493:  // A run whose driver crashed before `turn/end` must not stay "busy" forever.
+src/web\server.ts:4498:    if (session !== undefined && !turnTerminal(session)) return // the turn/end watcher settles it
+src/web\server.ts:5775:            // turn/end must consult the events, not just the busy flag.
+src/web\server.ts:10146:  const end = events.findLast((event) => event.type === 'turn/end')
+src/web\server.ts:10147:  if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
+
+→ Read src\web\server.ts [limit=70, offset=4435]
+
+$ rg -n "'limit'" src/web --glob '*.{ts,js,tsx,html}' | head -40
+src/web\server.ts:2402:        const requestedLimit = typeof args['limit'] === 'number' && Number.isFinite(args['limit']) ? Math.floor(args['limit']) : 20
+src/web\server.ts:7945:          const rawLimit = Number.parseInt(query.get('limit') ?? '', 10)
+
+$ rg -n "steered|'interrupted'|reason" src/web/client --glob '*.{ts,js,tsx}' 2>/dev/null | head -30; echo ---; ls src/web
+---
+agent-delegation.ts
+automations.ts
+background-hooks.ts
+child-reports.ts
+claude-hooks.ts
+compaction-capture.ts
+compaction-condense.ts
+compaction-generator.ts
+compaction-host.ts
+compaction-precompute.ts
+compaction-restart.ts
+compaction-restoration.ts
+compaction-source.ts
+compaction-wiring.ts
+control-plane-auth.ts
+csrf.ts
+execution-authority.ts
+folder-grants.ts
+git-askpass-client.mjs
+git-askpass.ts
+git-commit-message-prompt.txt
+git-commit-message.ts
+image-generation-store.ts
+image-understanding-store.ts
+llm-summarizer.ts
+mcp-oauth-connect.ts
+model-pair-store.ts
+notify-channels.ts
+operator-channel.ts
+path-scope-guard.ts
+project-files-write.ts
+project-files.ts
+project-git-branches.ts
+project-git-conflicts.ts
+project-git-hunks.ts
+project-git-ops.ts
+project-git.ts
+provider-store.ts
+push.ts
+server.ts
+slash-commands.ts
+terminals.ts
+usage-log.ts
+video-generation-store.ts
+
+→ Read src\harness\llm\openai.ts [limit=130, offset=100]
+→ Read src\harness\llm\openai.ts [limit=120, offset=300]
+→ Read src\harness\llm\openai.ts [limit=160, offset=419]
+
+$ rg -n "headerTimeoutMs|supportsPromptCacheKey|supportsStore|supportsUsageInStreaming|maxTokensField|toolCallIdReuse|maxOutputTokenOverrides" src --glob '*.ts'
+src\bins\headless.ts:77:import { loadProviderStore, maxOutputTokenOverrides, repairDefaults } from '../web/provider-store.ts'
+src\bins\headless.ts:325:      maxOutputTokens: maxOutputTokenOverrides(entry),
+src\web\server.ts:108:  maxOutputTokenOverrides,
+src\web\server.ts:939:      maxOutputTokens: maxOutputTokenOverrides(entry),
+src\web\provider-store.ts:19:export function maxOutputTokenOverrides(entry: ProviderConfig): Record<string, number> {
+src\harness\llm\openai.ts:108:  readonly maxTokensField?: 'max_tokens' | 'max_completion_tokens'
+src\harness\llm\openai.ts:114:  readonly supportsPromptCacheKey?: boolean
+src\harness\llm\openai.ts:116:  readonly supportsStore?: boolean
+src\harness\llm\openai.ts:118:  readonly supportsUsageInStreaming?: boolean
+src\harness\llm\openai.ts:123:  readonly headerTimeoutMs?: number
+src\harness\llm\openai.ts:130:    readonly toolCallIdReuse?: 'tolerate' | 'expect'
+src\harness\llm\openai.ts:328:    const maxTokensField = this.options.maxTokensField ?? detectMaxTokensField(this.name, this.options.baseUrl)
+src\harness\llm\openai.ts:329:    const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
+src\harness\llm\openai.ts:339:      ...(this.options.supportsUsageInStreaming !== false ? { stream_options: { include_usage: true } } : {}),
+src\harness\llm\openai.ts:342:      ...(supportsStore ? { store: false } : {}),
+src\harness\llm\openai.ts:345:    if (maxTokens !== undefined) body[maxTokensField] = maxTokens
+src\harness\llm\openai.ts:350:    if (this.options.supportsPromptCacheKey === true && affinity !== undefined && affinity !== '') {
+src\harness\llm\openai.ts:366:      const headerTimeout = this.options.headerTimeoutMs
+src\harness\llm\openai.ts:505:                  // declared to re-send headers (`wire.toolCallIdReuse: 'expect'`,
+src\harness\llm\openai.ts:507:                  if (slot.argsString !== '' && this.options.wire?.toolCallIdReuse !== 'expect') throw protocolError('invalid_tool_input', 'conflicting tool ID')
+
+→ Read src\web\provider-store.ts
+→ Read src\web\server.ts [limit=50, offset=915]
+→ Read src\web\server.ts [limit=60, offset=3915]
+
+$ rg -n "resolveAppHome|providers.json" src --glob '*.ts' | head -30
+src\bins\web.ts:27:import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
+src\bins\web.ts:31:const appHome = resolveAppHome()
+src\bins\web.ts:90:    // Providers live next to the data dir's parent home (see resolveAppHome).
+src\bins\web.ts:91:    configFile: path.join(appHome, 'providers.json'),
+src\web\server.ts:34:import { resolveAppHome } from '../harness/app-home.ts'
+src\web\server.ts:330:  /** Provider config file; defaults to `<homedir>/.dnt-harness/providers.json` (or the pre-rename `.mini-dsh`). */
+src\web\server.ts:644:/** The provider/model references kept beside providers.json, one file each. */
+src\web\server.ts:880:  const configFile = options.configFile ?? path.join(resolveAppHome(), 'providers.json')
+src\web\server.ts:889:  // Video generation: provider/model references beside providers.json,
+src\bins\headless.ts:22: * accepted too), else the same `providers.json` store the web host uses
+src\bins\headless.ts:29:import { loadRepoEnv, readApiKey, resolveAppHome } from './env.ts'
+src\bins\headless.ts:96:  let dataDir = path.join(resolveAppHome(process.cwd()), 'data')
+src\bins\headless.ts:100:  let config = path.join(resolveAppHome(), 'providers.json')
+src\web\model-pair-store.ts:7: * A provider/model reference persisted beside `providers.json`. Image
+src\bins\pair.ts:13:import { resolveAppHome } from '../harness/app-home.ts'
+src\bins\pair.ts:19:  return explicit ?? path.join(resolveAppHome(), 'data')
+src\bins\env.ts:5:export { resolveAppHome } from '../harness/app-home.ts'
+src\harness\app-home.ts:21:export function resolveAppHome(base: string = homedir()): string {
+
+$ rg -n "sessionAffinity|providerOptions" src --glob '*.ts'
+src\web\server.ts:3964:        ...(scope !== undefined ? { sessionAffinity: scope.sessionId } : {}),
+src\bins\headless.ts:374:      sessionAffinity: session.id,
+src\harness\llm\types.ts:155:  readonly providerOptions?: Readonly<Record<string, unknown>>
+src\harness\llm\types.ts:161:  readonly sessionAffinity?: string
+src\harness\llm\openai.ts:112:   * whenever a request stamps `sessionAffinity`.
+src\harness\llm\openai.ts:189: * Lower the host-approved subset of `providerOptions` onto the body. Only
+src\harness\llm\openai.ts:325:    const affinity = request.sessionAffinity
+src\harness\llm\openai.ts:347:    applyProviderOptions(body, request.providerOptions, hasTools)
+
+→ Read src\bins\headless.ts [limit=130, offset=170]
+→ Read scripts\bench\run-bench.mjs
+→ Read scripts\bench\opencode-run.mjs
+→ Read scripts\bench\harness-agent.mts
+✗ bash failed
+Error: RangeError: path should be a `path.relative()`d string, but got "C:////|/Users/|process.env/[.[A-Z_]*KEY|sk-|apiKey|API_KEY"
+✗ bash failed
+Error: RangeError: path should be a `path.relative()`d string, but got "C://laragon|C://Users|/Users"
+✗ grep failed
+Error: RangeError: path should be a `path.relative()`d string, but got "C://laragon|C://Users|/Users"
+✱ Grep "sk-[A-Za-z0-9]{16}|password\s*[:=]|secret\s*[:=]" in scripts · 0 matches
+✱ Grep "laragon" in scripts · 5 matches
+✱ Grep "process\.exit|catch \{|catch\(|\.kill\(" in scripts/e2e · 44 matches
+→ Read scripts\bench\ab-prompt.mjs
+→ Read scripts\e2e\compare-opencode-dnt.mjs
+→ Read scripts\e2e\repro-toolid.mjs
+→ Read scripts\e2e\ab-wire-compat.mjs
+→ Read scripts\e2e\log-proxy.mjs
+→ Read src\harness\app-home.ts
+→ Read src\bins\headless.ts [limit=80, offset=28]
+
+$ rg -n "expressibleThinkingLevel|isThinkingLevel|THINKING_LEVELS|OpenAiCompletionsProvider" src/index.ts
+108:export { OpenAiCompletionsProvider, type OpenAiCompletionsOptions } from './harness/llm/openai.ts'
+111:  THINKING_LEVELS,
+115:  expressibleThinkingLevel,
+119:  isThinkingLevel,
+
+$ rg -n "providerOptions|sessionAffinity|interface ModelRequest" src/harness/llm/types.ts
+108:export interface ModelRequest {
+155:  readonly providerOptions?: Readonly<Record<string, unknown>>
+161:  readonly sessionAffinity?: string
+
+$ rg -n "request\.|ModelRequest|append\(" src/harness/llm/service.ts 2>/dev/null | head -40; echo ---; ls src/harness/llm
+3:import { ProviderError, type LlmProvider, type ModelRequest, type StreamEvent, type StreamOptions } from './types.ts'
+17:      request: ModelRequest,
+18:      next: (replacement?: ModelRequest) => AsyncIterable<StreamEvent>,
+54:  private async *admitted(provider: LlmProvider, request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
+134:  stream(request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
+135:    const selected = request.providerName === undefined ? this.active() : this.providers.get(request.providerName)
+136:    if (!selected) throw new Error(`llm: requested provider '${request.providerName}' is not registered`)
+---
+adaptive-vision.ts
+completion.ts
+deepseek.ts
+model-catalog.ts
+openai.ts
+request-lifecycle.ts
+service.ts
+types.ts
+
+→ Read src\harness\llm\openai.ts [limit=40, offset=590]
+
+$ rg -n '"scripts"' -A 25 package.json
+25:  "scripts": {
+26-    "test": "vitest run",
+27-    "test:watch": "vitest",
+28-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
+29-    "chat": "tsx src/bins/headless.ts",
+30-    "web": "tsx src/bins/web.ts",
+31-    "pair": "tsx src/bins/pair.ts",
+32-    "migrate:mcp": "tsx src/bins/migrate-mcp.ts",
+33-    "build:web": "vite build",
+34-    "restart": "pm2 restart dnt-harness --update-env && sleep 2 && curl -fsS http://127.0.0.1:3082/api/health",
+35-    "deploy": "npm run build:web && npm run restart",
+36-    "test:browser": "playwright test",
+37-    "test:browser:mcp": "vitest run tests/web/mcp-production-stack.spec.ts",
+38-    "test:live-ui": "node scripts/live-ui-smoke.mjs",
+39-    "prepack": "vite build"
+40-  },
+41-  "dependencies": {
+42-    "@codemirror/autocomplete": "^6.20.3",
+43-    "@codemirror/commands": "^6.11.1",
+44-    "@codemirror/lang-cpp": "^6.0.3",
+45-    "@codemirror/lang-css": "^6.3.1",
+46-    "@codemirror/lang-go": "^6.0.1",
+47-    "@codemirror/lang-html": "^6.4.12",
+48-    "@codemirror/lang-java": "^6.0.2",
+49-    "@codemirror/lang-javascript": "^6.2.5",
+50-    "@codemirror/lang-json": "^6.0.2",
+
+$ rg -n "packageManager|pnpm" package.json | head
+
+$ ls pnpm-lock.yaml package-lock.json yarn.lock 2>/dev/null; git log --oneline -1 -- package-lock.json; git log --oneline -1 -- pnpm-lock.yaml
+package-lock.json
+pnpm-lock.yaml
+9297b77 chore(release): 0.2.0
+ca8cae7 fix(mcp): DNS-pinned outbound dispatcher, no loopback OAuth endpoints from public metadata, journal and secret hygiene
+
+✗ bash failed
+Error: [Scout Block] Access to 'node_modules/.bin/tsc' blocked.
+Pattern: node_modules
+
+To allow, add '!node_modules' to $HOME/.config/opencode/.ckignore
+→ Read src\harness\limits.ts [limit=70, offset=120]
+
+$ rg -rn "'steered'|\"steered\"|turn/end" --glob '*.{ts,tsx,js,jsx}' -g '!node_modules' -g '!src/harness/session/**' -g '!tests/**' | head -40
+src\web\compaction-host.ts:    else if (event.type === 'n') open = false
+src\web\server.ts:     * broadcast so the UI can surface it instead of a bare `n: failed`.
+src\web\server.ts:  // after `n` is durable (agent/turn-settled), never on stream EOF.
+src\web\server.ts:    const boundary = entry.session.events.findLast((event) => event.type === 'n' && event.turnId === turnId)
+src\web\server.ts:  // `n: completed` never hides active work.
+src\web\server.ts:      if (event?.type === 'n' || event?.type === 'turn/closing') return true
+src\web\server.ts:   * driver is in flight counts: a conversation with no `n` whose driver
+src\web\server.ts:      const end = events.findIndex((event) => event.type === 'n')
+src\web\server.ts:      const ended = events[end] as Extract<SessionEvent, { type: 'n' }>
+src\web\server.ts:    if (event.type !== 'n') return
+src\web\server.ts:  // A run whose driver crashed before `n` must not stay "busy" forever.
+src\web\server.ts:    if (session !== undefined && !turnTerminal(session)) return // the n watcher settles it
+src\web\server.ts:            // n must consult the events, not just the busy flag.
+src\web\server.ts:  const end = events.findLast((event) => event.type === 'n')
+src\web\server.ts:  if (end?.type !== 'n' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
+src\web\compaction-capture.ts:/** The completed cutoff of a turn: its `n` with reason `completed`, and nothing unresolved inside it. */
+src\web\compaction-capture.ts:  const end = events.find((event) => event.type === 'n' && event.turnId === turnId && event.seq > start.seq)
+src\web\compaction-capture.ts:  if (end === undefined || end.type !== 'n' || end.reason !== 'completed') return undefined
+src\web\compaction-capture.ts:    if (end.type !== 'n' || end.reason !== 'completed') continue
+plans\reports\context-probe-261014-1321-accounting.ts:        if (events.filter((e) => e.type === 'n').length >= expectedTurns && sessions.find((s: any) => s.id === id)?.status === 'idle') return
+web\hooks\useSessionStream.ts:    } else if (event.type === 'n') {
+web\hooks\useSessionStream.ts:        if (event.type === 'tool/result' || event.type === 'n') {
+web\hooks\useSessionStream.ts:            const next = prev.filter((q) => q.childSessionId !== undefined || (event.type === 'n' ? false : q.callId === '' || q.callId !== event.callId))
+web\hooks\useSessionStream.ts:        if (event.type === 'approval/request' || event.type === 'approval/decision' || event.type === 'tool/result' || event.type === 'n') {
+web\hooks\useSessionStream.spec.tsx:    expect(reconcileApprovals([], [request, { seq: 2, type: 'n', reason: 'stopped' }])).toEqual([])
+web\hooks\useSessionStream.spec.tsx:    expect(reconcileApprovals([], [{ seq: 2, type: 'n' }, request])).toHaveLength(1)
+web\hooks\useSessionStream.compaction.spec.ts:      { seq: 5, type: 'n', turnId: 't', reason: 'completed' },
+web\hooks\useSessionStream.compaction.spec.ts:      [{ seq: 7, type: 'n', turnId: 't', reason: 'completed' }],
+web\hooks\useSessionStream.compaction.spec.ts:      { seq: 8, type: 'n', turnId: 't', reason: 'completed' },
+src\web\compaction-source.ts:/** Newest n of a log whose turns are all closed, or why there is none. */
+src\web\compaction-source.ts:    else if (event.type === 'n') { open = false; cutoff = event.seq }
+web\lib\workflow.spec.tsx:    expect(taskPhase([queued, { type: 'turn/start', seq: 1 }, { type: 'user/message', seq: 2, inputId: 'i1' }, { type: 'n', seq: 3, reason: 'completed' }])).toBe('completed')
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 2, reason },
+web\lib\workflow.spec.tsx:    expect(taskPhase(run(n))).toBe('preparing')
+web\lib\workflow.spec.tsx:    expect(taskPhase([{ type: 'n', seq: 0, reason: 'completed' }], 1)).toBe('completed')
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 4, turnId: 't1', reason: 'rejected' },
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 5, turnId: 't1', reason: 'failed' },
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 6, turnId: 't1', reason: 'failed' },
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 11, turnId: 't2', reason: 'failed' },
+web\lib\workflow.spec.tsx:      { type: 'n', seq: 2, turnId: 't1', reason: n },
+
+$ rg -n "turn/end" web --glob '*.{ts,tsx}' | head -30
+web\hooks\useSessionStream.ts:25:    } else if (event.type === 'turn/end') {
+web\hooks\useSessionStream.ts:248:        if (event.type === 'tool/result' || event.type === 'turn/end') {
+web\hooks\useSessionStream.ts:254:            const next = prev.filter((q) => q.childSessionId !== undefined || (event.type === 'turn/end' ? false : q.callId === '' || q.callId !== event.callId))
+web\hooks\useSessionStream.ts:258:        if (event.type === 'approval/request' || event.type === 'approval/decision' || event.type === 'tool/result' || event.type === 'turn/end') {
+web\hooks\useSessionStream.spec.tsx:19:    expect(reconcileApprovals([], [request, { seq: 2, type: 'turn/end', reason: 'stopped' }])).toEqual([])
+web\hooks\useSessionStream.spec.tsx:20:    expect(reconcileApprovals([], [{ seq: 2, type: 'turn/end' }, request])).toHaveLength(1)
+web\hooks\useSessionStream.compaction.spec.ts:12:      { seq: 5, type: 'turn/end', turnId: 't', reason: 'completed' },
+web\hooks\useSessionStream.compaction.spec.ts:46:      [{ seq: 7, type: 'turn/end', turnId: 't', reason: 'completed' }],
+web\hooks\useSessionStream.compaction.spec.ts:90:      { seq: 8, type: 'turn/end', turnId: 't', reason: 'completed' },
+web\components\workbench\step-inspector.spec.tsx:40:  event({ type: 'turn/end', seq: 9, timestamp: 1_500, turnId: 't1', reason: 'completed' }),
+web\components\workbench\step-inspector.spec.tsx:116:    event({ type: 'turn/end', seq: 9, timestamp: 2_300, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory-panel.spec.tsx:17:  event({ type: 'turn/end', seq: 5, timestamp: 1_500, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory-panel.spec.tsx:62:    event({ type: 'turn/end', seq: 9, timestamp: 2_300, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory-panel.spec.tsx:88:    event({ type: 'turn/end', seq: 9, timestamp: 2_300, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.ts:131:  /** The turn/end timestamp; absent while the turn is open. */
+web\components\workbench\trajectory.ts:156:  // A turn/end whose reason the log does not name still closed; it did not succeed.
+web\components\workbench\trajectory.ts:244:    // A turn/end names its turn. One that names some other turn does not close the open one.
+web\components\workbench\trajectory.ts:438:      case 'turn/end':
+web\components\workbench\trajectory.spec.ts:25:      event({ type: 'turn/end', seq: 9, timestamp: 2_200, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.spec.ts:54:      event({ type: 'turn/end', seq: 3, timestamp: 200, turnId: 't1', reason: 'interrupted' }),
+web\components\workbench\trajectory.spec.ts:70:      event({ type: 'turn/end', seq: 6, timestamp: 70, turnId: 't1', reason: 'failed' }),
+web\components\workbench\trajectory.spec.ts:96:      event({ type: 'turn/end', seq: 6, timestamp: 5_000, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.spec.ts:110:      event({ type: 'turn/end', seq: 5, timestamp: 4, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.spec.ts:145:      event({ type: 'turn/end', seq: 9, timestamp: 1_500, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.spec.ts:172:      event({ type: 'turn/end', seq: 8, timestamp: 600, turnId: 't1', reason: 'completed' }),
+web\components\workbench\trajectory.spec.ts:193:      event({ type: 'turn/end', seq: 4, timestamp: 130, turnId: 't1', reason: 'failed' }),
+web\components\workbench\trajectory.spec.ts:203:      event({ type: 'turn/end', seq: 4, timestamp: 30, turnId: 't1', reason: 'completed' }),
+web\lib\project-sharing.spec.ts:10:  { seq: 5, type: 'turn/end', turnId: 't1', reason: 'completed' },
+web\lib\project-sharing.spec.ts:33:    shareProjectedItems(before, projectItems([...history, { seq: 8, type: 'assistant/message', content: 'final' }, { seq: 9, type: 'turn/end', turnId: 't2', reason: 'completed' }]))
+web\lib\project-sharing.spec.ts:95:      { seq: 3, type: 'turn/end', turnId: 't1', reason: 'completed' },
+
+→ Read src\harness\llm\service.ts
+
+$ rg -n "async function run|const run =|function provider|function scripted|function fast|function collect\b|function body" tests/harness/llm-openai.spec.ts
+44:function provider(): OpenAiCompletionsProvider {
+48:async function run(request: Parameters<OpenAiCompletionsProvider['stream']>[0]): Promise<void> {
+324:  function scripted(responses: (() => Response | Promise<Response>)[]): ReturnType<typeof vi.fn> {
+335:  function fast(maxRetries?: number): OpenAiCompletionsProvider {
+339:  async function collect(p: OpenAiCompletionsProvider, signal?: AbortSignal): Promise<string> {
+
+→ Read scripts\bench\log-proxy.mjs
+→ Read scripts\e2e\run-fake-e2e.mjs
+→ Read src\bins\headless.ts [limit=80, offset=312]
+
+$ rg -n "export function defaultThinkingLevel" -A 20 src/harness/llm/model-catalog.ts
+316:export function defaultThinkingLevel(capability: ReasoningCapability): ThinkingLevel {
+317-  const levels = capability.levels
+318-  if (levels.includes('medium')) return 'medium'
+319-  if (levels.includes('high')) return 'high'
+320-  if (levels.length > 0) return levels[levels.length - 1]!
+321-  return 'off'
+322-}
+323-
+324-/** Whether the composer should render a working thinking control for this model. */
+325-export function supportsReasoningControl(modelId: string | null | undefined): boolean {
+326-  const capability = getReasoningCapability(modelId)
+327-  return (
+328-    capability !== null
+329-    && capability.transportSupported === true
+330-    && capability.alwaysOn !== true
+331-    && (capability.canDisable || capability.levels.length > 0)
+332-  )
+333-}
+334-
+335-/**
+336- * The thinking level a request for THIS model may actually carry: the
+
+→ Read web\components\workbench\trajectory.ts [limit=30, offset=148]
+
+$ rg -n "reason" web/lib/workflow.tsx web/components/workbench/trajectory.ts | head -30
+rg: web/lib/workflow.tsx: The system cannot find the file specified. (os error 2)
+web/components/workbench/trajectory.ts:15:/** Why a turn's bar closed. An open turn has no reason yet. */
+web/components/workbench/trajectory.ts:54:  readonly reason?: string
+web/components/workbench/trajectory.ts:60:  readonly reason: string
+web/components/workbench/trajectory.ts:79:  /** Full streamed reasoning, folded across chunks. */
+web/components/workbench/trajectory.ts:154:function outcomeOf(reason: string | undefined): TurnOutcome {
+web/components/workbench/trajectory.ts:155:  if (reason !== undefined && KNOWN_REASONS.has(reason)) return reason as TurnOutcome
+web/components/workbench/trajectory.ts:156:  // A turn/end whose reason the log does not name still closed; it did not succeed.
+web/components/workbench/trajectory.ts:157:  return reason === undefined ? 'open' : 'failed'
+web/components/workbench/trajectory.ts:243:  const settle = (reason: string | undefined, at: number | undefined, turnId: string | undefined): void => {
+web/components/workbench/trajectory.ts:254:      outcome: outcomeOf(reason),
+web/components/workbench/trajectory.ts:346:            reason: event.reason ?? 'unknown',
+web/components/workbench/trajectory.ts:382:          ...(fact.reason !== undefined ? { reason: fact.reason } : {}),
+web/components/workbench/trajectory.ts:439:        settle(event.reason, event.timestamp, event.turnId)
+
+$ rg -n "TurnOutcome|'limit'|\"limit\"" web --glob '*.{ts,tsx}' | head -30
+web\lib\product-ui.spec.tsx:304:      { kind: 'status', reason: 'limit' },
+web\lib\project.ts:897:export type TaskPhase = 'idle' | 'preparing' | 'held' | 'running' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'steered' | 'rejected' | 'empty' | 'limit'
+web\lib\project.ts:899:const TERMINAL_PHASES: ReadonlySet<string> = new Set(['completed', 'interrupted', 'cancelled', 'steered', 'rejected', 'empty', 'limit'])
+web\lib\tool-facts.ts:434:      const window = readWindow(int(args, 'offset'), int(args, 'limit'))
+web\lib\workflow.spec.tsx:114:  it.each(['completed', 'failed', 'interrupted', 'cancelled', 'steered', 'limit', 'empty', 'rejected'] as const)('preserves durable terminal reason %s', (reason) => {
+web\components\workbench\TrajectoryPanel.tsx:7:import { projectTrajectory, trajectoryMatches, type TrajectoryCall, type TrajectoryStep, type TrajectoryTurn, type TurnOutcome } from './trajectory.ts'
+web\components\workbench\TrajectoryPanel.tsx:23:const OUTCOME_LABEL: Readonly<Record<TurnOutcome, string>> = {
+web\components\workbench\trajectory.ts:16:export type TurnOutcome = 'open' | 'completed' | 'failed' | 'cancelled' | 'steered' | 'interrupted' | 'rejected' | 'empty' | 'limit'
+web\components\workbench\trajectory.ts:125:  readonly outcome: TurnOutcome
+web\components\workbench\trajectory.ts:152:const KNOWN_REASONS: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled', 'steered', 'interrupted', 'rejected', 'empty', 'limit'])
+web\components\workbench\trajectory.ts:154:function outcomeOf(reason: string | undefined): TurnOutcome {
+web\components\workbench\trajectory.ts:155:  if (reason !== undefined && KNOWN_REASONS.has(reason)) return reason as TurnOutcome
+
+→ Read src\harness\agent\agent.ts [limit=40, offset=617]
+→ Read scripts\e2e\fake-gateway.mjs [limit=80]
+
+$ rg -n "127.0.0.1|localhost|BASE|process.env" scripts/e2e/curl-api-suite.mjs | head -20; echo '--- run-real ---'; rg -n "127.0.0.1|BASE_URL|process.env" scripts/e2e/run-real-e2e.mjs | head -20
+8: * (default http://127.0.0.1:3082). The suite creates its own scratch project /
+22:const BASE = (process.argv[2] ?? 'http://127.0.0.1:3082').replace(/\/$/, '')
+23:const PROVIDERS_FILE = process.env.DNT_PROVIDERS_FILE ?? path.join(os.homedir(), '.mini-dsh', 'providers.json')
+42:  const url = urlPath.startsWith('http') ? urlPath : BASE + urlPath
+136:console.log(`curl-api-suite against ${BASE}`)
+327:const provCreate = j('POST', '/api/providers', { name: 'Curl Suite Prov', baseUrl: 'http://127.0.0.1:9/v1', models: ['test-model'] })
+--- run-real ---
+23:const upstream = process.env['E2E_UPSTREAM'] ?? 'http://127.0.0.1:6536'
+24:const model = process.env['E2E_MODEL'] ?? 'deepseek-v4.1-flash-free'
+56:      baseUrl: `http://127.0.0.1:${proxyPort}/v1`,
+105:  env: { ...process.env, E2E_LOG: proxyLog, E2E_REQ_DIR: reqDir, E2E_SSE_DIR: sseDir },
+112:    try { healthy = (await fetch(`http://127.0.0.1:${proxyPort}/v1/models`)).ok } catch { await sleep(100) }
+
+$ rg -n "PROVIDERS_FILE" scripts/e2e/curl-api-suite.mjs
+23:const PROVIDERS_FILE = process.env.DNT_PROVIDERS_FILE ?? path.join(os.homedir(), '.mini-dsh', 'providers.json')
+122:const providersBackup = fs.existsSync(PROVIDERS_FILE) ? fs.readFileSync(PROVIDERS_FILE, 'utf8') : null
+137:console.log(providersBackup === null ? `providers.json not found at ${PROVIDERS_FILE} (skip backup)` : `providers.json backed up (${providersBackup.length} bytes)`)
+606:  const after = fs.existsSync(PROVIDERS_FILE) ? fs.readFileSync(PROVIDERS_FILE, 'utf8') : ''
+
+→ Read scripts\e2e\curl-api-suite.mjs [limit=45, offset=595]
+
+$ rg -n "reason !== 'completed'|run ended:|const error = events.slice" src/web/server.ts | head
+1932:    if (!limits.compactionEffectiveEnabled || reason !== 'completed' || compactionClosing) return
+1966:    if (limits.automaticCompactionPressure <= 0 || reason !== 'completed' || compactionClosing) return
+4451:        const error = events.slice(0, end).reverse().find((event): event is Extract<SessionEvent, { type: 'turn/error' }> => event.type === 'turn/error')
+4452:        await automations.record(workspaceId, { ...base, status: 'failed', error: error?.message ?? `run ended: ${ended.reason}`, at: ended.timestamp })
+4480:      const reason = error ?? `run ended: ${event.reason}`
+10147:  if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
+
+$ rg -n "EFFORT_6|EFFORT_5|maxStepsPerTurn: 48|DeepSeekProvider" src/harness/llm/model-catalog.ts src/harness/limits.ts src/harness/llm/deepseek.ts
+src/harness/limits.ts:116:  maxStepsPerTurn: 48,
+src/harness/llm/model-catalog.ts:32:const EFFORT_5: readonly ReasoningLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
+src/harness/llm/model-catalog.ts:37:const EFFORT_6: readonly ReasoningLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+src/harness/llm/model-catalog.ts:126:  'gpt-5.6': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:127:  'gpt-5.6-sol': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:128:  'gpt-5.6-terra': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:129:  'gpt-5.6-luna': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:145:  'claude-fable-5': { levels: EFFORT_5, canDisable: false, transportSupported: true },
+src/harness/llm/model-catalog.ts:146:  'claude-opus-5': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:147:  'claude-sonnet-5': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:151:  'kiro-claude-opus': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:152:  'kiro-claude-sonnet': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:153:  'kiro-claude-haiku': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:211:  openai: { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:212:  deepseek: { levels: EFFORT_6, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:219:  claude: { levels: EFFORT_5, canDisable: true, transportSupported: true },
+src/harness/llm/model-catalog.ts:544:    else if ((EFFORT_6 as readonly string[]).includes(level)) setEffort(level)
+src/harness/llm/deepseek.ts:9:export class DeepSeekProvider extends OpenAiCompletionsProvider {
+
+$ rg -n "defaultThinkingLevel|deepseek" tests/harness/model-catalog.spec.ts tests/web/server-models.spec.ts | head -30
+tests/harness/model-catalog.spec.ts:10:  defaultThinkingLevel,
+tests/harness/model-catalog.spec.ts:94:    expect(defaultThinkingLevel({ levels: ['low', 'medium', 'high'], canDisable: true })).toBe('medium')
+tests/harness/model-catalog.spec.ts:95:    expect(defaultThinkingLevel({ levels: ['low', 'high'], canDisable: false })).toBe('high')
+tests/harness/model-catalog.spec.ts:96:    expect(defaultThinkingLevel({ levels: ['high', 'max'], canDisable: true })).toBe('high')
+tests/harness/model-catalog.spec.ts:97:    expect(defaultThinkingLevel({ levels: [], canDisable: false })).toBe('off')
+tests/harness/model-catalog.spec.ts:107:  it('deepseek declares the whole effort range so no pick degrades to the provider default', () => {
+tests/harness/model-catalog.spec.ts:112:    expect(getReasoningCapability('deepseek-v4.1-flash-free')?.levels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+tests/harness/model-catalog.spec.ts:113:    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'medium')).toBe('medium')
+tests/harness/model-catalog.spec.ts:114:    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'minimal')).toBe('minimal')
+tests/harness/model-catalog.spec.ts:115:    expect(expressibleThinkingLevel('custom-deepseek-v4-mini', 'medium')).toBe('medium')
+tests/harness/model-catalog.spec.ts:161:  it('deepseek forwards every declared effort level and disables on off', () => {
+tests/harness/model-catalog.spec.ts:163:    applyThinkingOverride(medium, 'deepseek-v4.1-flash-free', 'medium')
+tests/harness/model-catalog.spec.ts:166:    applyThinkingOverride(minimal, 'custom-deepseek-v4-mini', 'minimal')
+tests/harness/model-catalog.spec.ts:169:    applyThinkingOverride(low, 'custom-deepseek-v4-mini', 'low')
+tests/harness/model-catalog.spec.ts:172:    applyThinkingOverride(off, 'deepseek-v4.1-flash-free', 'off')
+tests/web/server-models.spec.ts:191:      name: 'deepseek-gw',
+tests/web/server-models.spec.ts:194:      models: ['deepseek-v4.1-flash-free'],
+tests/web/server-models.spec.ts:196:    await put(base, `/api/workspaces/${wsId}/model`, { model: 'deepseek-v4.1-flash-free', provider: 'deepseek-gw' })
+
