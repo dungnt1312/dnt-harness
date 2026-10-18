@@ -18,6 +18,8 @@ it('requests a cached cursor and exposes SSE frame ids including empty resume fr
   expect(source!.close).toHaveBeenCalledOnce()
   subscribeEventsIn('w', 's', receive, undefined, -1)
   expect(urls.at(-1)).toBe('/api/workspaces/w/sessions/s/events')
+  subscribeEventsIn('w', 's', receive, undefined, 7, { delegationsOnly: true })
+  expect(urls.at(-1)).toBe('/api/workspaces/w/sessions/s/events?view=delegations&cursor=7')
 })
 
 it('resumes from the last frame id with a fresh source after a long hide or a network return', () => {

@@ -23,6 +23,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
+import { replayView } from './replay-view.ts'
 import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
@@ -10806,8 +10807,12 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
   reconcileInterruptedProcesses(entry, deps)
 
+  const streamUrl = new URL(req.url ?? '/', 'http://localhost')
+  // `view=delegations` is an opt-in wire projection for a parent the client only
+  // reads delegation facts from; canonical records and default clients stay intact.
+  const delegationsOnly = streamUrl.searchParams.get('view') === 'delegations'
   // Native reconnect headers supersede the initial cached-navigation cursor.
-  const rawCursor = req.headers['last-event-id'] ?? new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor')
+  const rawCursor = req.headers['last-event-id'] ?? streamUrl.searchParams.get('cursor')
   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1
@@ -10824,6 +10829,11 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     return 0
   }
   const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: clientEvent(event) })
+  // Live and released session frames honor the same projection as the replay.
+  const streamSessionFrame = (envelope: WebEnvelope, sequence: number | undefined): void => {
+    if (envelope.kind === 'session' && replayView([envelope.event], delegationsOnly).length === 0) return
+    streamFrame(envelope, sequence)
+  }
   const heldSeq = findHeldCompaction()
   // The replay below stops before the held success, so the success and the
   // tail already appended behind it seed the queue: they ship on commit.
@@ -10834,7 +10844,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // filtering and its own compaction keep working unchanged. A held compaction
   // success also cuts the replay tail: reconnect must not see the uncommitted
   // state either.
-  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events], held?.seq ?? 0)
+  const replay = compactReplayEvents([...replayView(resumable ? session.events.filter((event) => event.seq > cursor) : session.events, delegationsOnly)], held?.seq ?? 0)
   streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, held === undefined ? latest : (held.seq - 1))
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
@@ -10865,8 +10875,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     if (event.type === 'compaction/end' && event.error !== undefined) {
       const dropped = held
       held = undefined
-      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamFrame(envelope, sequence)
-      streamFrame(frame, event.seq)
+      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamSessionFrame(envelope, sequence)
+      streamSessionFrame(frame, event.seq)
       return
     }
     if (held !== undefined) {
@@ -10880,7 +10890,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
       held = { seq: event.seq, queue: [{ envelope: frame, sequence: event.seq }] }
       return
     }
-    streamFrame(frame, event.seq)
+    streamSessionFrame(frame, event.seq)
   })
   // The commit releases the hold: drain the queued prefix in seq order.
   const disposeDurable = deps.kernel.ctx.on('session/durable', (emitter) => {
@@ -10888,7 +10898,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     if (session.committedSeq < held.seq) return
     const draining = held
     held = undefined
-    for (const { envelope, sequence } of draining.queue) streamFrame(envelope, sequence)
+    for (const { envelope, sequence } of draining.queue) streamSessionFrame(envelope, sequence)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {

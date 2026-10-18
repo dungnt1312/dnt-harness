@@ -591,7 +591,7 @@ function AppShell() {
   // no extra route guard is needed.
   const subagentsRootId = subagentsRootSession(currentSession)
   const subagentsRootIsViewed = subagentsRootId === null || subagentsRootId === current
-  const subagentsRootStream = useSessionStream(activeWs, subagentsRootIsViewed ? null : subagentsRootId)
+  const subagentsRootStream = useSessionStream(activeWs, subagentsRootIsViewed ? null : subagentsRootId, true)
   const agentEvents = subagentsRootIsViewed ? events : subagentsRootStream.events
   // Tab strip + selected view are per conversation, and a subagent conversation
   // shares its root's record: the key is `<ws>:<root session>` (or `draft`),

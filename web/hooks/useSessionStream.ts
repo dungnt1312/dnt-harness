@@ -129,10 +129,14 @@ interface CachedStream {
   weight: number
 }
 
-export function useSessionStream(workspaceId: string | null, sessionId: string | null) {
+/**
+ * `delegationsOnly` opens the server's delegation projection: for a root the
+ * caller reads only spawn/result facts from, it skips the full history replay.
+ */
+export function useSessionStream(workspaceId: string | null, sessionId: string | null, delegationsOnly = false) {
   // Hook-owned memory only: no history persists across logout/App unmount.
   const cache = useRef(new Map<string, CachedStream>())
-  const scope = workspaceId !== null && sessionId !== null ? JSON.stringify([workspaceId, sessionId]) : null
+  const scope = workspaceId !== null && sessionId !== null ? JSON.stringify([workspaceId, sessionId, delegationsOnly]) : null
   const [loadedScope, setLoadedScope] = useState<string | null>(null)
   const [events, setEvents] = useState<readonly SseEvent[]>([])
   const [items, setItems] = useState<readonly ViewItem[]>([])
@@ -286,7 +290,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           return [...prev, next]
         })
       }
-    }, (state) => { if (!disposed) setStream(state) }, cached?.ready ? cached.cursor : undefined)
+    }, (state) => { if (!disposed) setStream(state) }, cached?.ready ? cached.cursor : undefined, { delegationsOnly })
     return () => {
       disposed = true
       dispose()
@@ -310,7 +314,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         }
       }
     }
-  }, [workspaceId, sessionId, scope])
+  }, [workspaceId, sessionId, scope, delegationsOnly])
 
   // Effects reset state after render. Fence synchronously so a new keyed
   // Transcript never mounts the previous conversation's expensive Markdown.

@@ -414,16 +414,25 @@ export function subscribeEventsIn(
   onEnvelope: (envelope: Envelope, cursor?: number) => void,
   onState?: (state: StreamState) => void,
   cursor?: number,
+  options?: { readonly delegationsOnly?: boolean },
 ): () => void {
-  const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
   const base = `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`
+  // `view=delegations` asks the server to project only delegation facts, for a
+  // root stream the client reads nothing else from.
+  const url = (from: number | undefined): string => {
+    const query = new URLSearchParams()
+    if (options?.delegationsOnly === true) query.set('view', 'delegations')
+    if (from !== undefined && Number.isSafeInteger(from) && from >= 0) query.set('cursor', String(from))
+    const text = query.toString()
+    return text === '' ? base : `${base}?${text}`
+  }
   let last: number | undefined
   const track = (envelope: Envelope, frame?: number): void => {
     if (frame !== undefined) last = frame
     onEnvelope(envelope, frame)
   }
   return reviving(
-    () => new EventSource(last !== undefined ? `${base}?cursor=${last}` : `${base}${suffix}`),
+    () => new EventSource(url(last ?? cursor)),
     (source) => wire(source, track, onState),
     onState,
   )
