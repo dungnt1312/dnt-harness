@@ -35,12 +35,12 @@ Every phase went through code review, and its findings were fixed before commit.
 
 ## Acceptance criteria
 
-Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun probe)** = real Bun 1.4.3 probe on Windows. **Pending (Linux CI)** / **Pending (live smoke)** = gate not run. **Not met** = not implemented.
+Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun probe)** = real Bun 1.4.3 probe on Windows. **Pass (Linux CI)** = `runtime-probes` job on GitHub `ubuntu-latest`, Bun 1.4.3, Node 22.20.0, 2026-10-18, run [39144703578](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578) (PR #1). **Pending (Linux CI)** / **Pending (live smoke)** = gate not run. **Not met** = not implemented.
 
 | ID | Status | Note |
 |---|---|---|
-| RH1-A | Pass (Windows/Node) + Pass (Bun probe) | Zero requests reach the destination when the dispatcher rejects. Linux run pending. |
-| RH1-B | Pass (Windows/Node) + Pass (Bun probe); Pending (Linux CI) | Fixture covers IPv4/IPv6/mapped/NAT64, mixed answers and re-resolve. Linux DNS probe not run. |
+| RH1-A | Pass (Windows/Node) + Pass (Bun probe) + Pass (Linux CI) | Zero requests reach the destination when the dispatcher rejects. Linux: outbound-http probe 16/16, including bare `undici` failing closed with zero connections. |
+| RH1-B | Pass (Windows/Node) + Pass (Bun probe) + Pass (Linux CI) | Fixture covers IPv4/IPv6/mapped/NAT64, mixed answers and re-resolve. Linux: `localhost` resolves to `::1, 127.0.0.1`; system-resolver and injected `[::1, 127.0.0.1]` fallback reach the IPv4 fixture; public-to-loopback and mixed answers are blocked at connect with zero requests. |
 | RH1-C | Pass (Windows/Node) + Pass (Bun probe) | Literal blocked before network; loopback profile works. |
 | RH1-D | Pass (Windows/Node) + Pass (Bun probe) | Private redirect refused; credentials stripped on foreign hops. |
 | RH1-E | Pass (Windows/Node) + Pass (Bun probe) | Abort before headers, during body/SSE, and on timeout. |
@@ -48,14 +48,14 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | RH1-G | Partial pass (2026-10-18, macOS, Bun 1.4.3) | Public HTTPS MCP passed: `McpServerClient` over the default outbound transport (custom Undici connect, real TLS certificate) connected to the unauthenticated DeepWiki Streamable HTTP endpoint, listed 3 tools and called the read-only `read_wiki_structure` (no error). Not run: OAuth refresh/revoke (the only configured OAuth servers are real user accounts; refresh/revoke would mutate live tokens) and media tools. |
 | RH2-A | Pass (Windows/Node) | Source HEAD/index/diffs/untracked unchanged. |
 | RH2-B | Pass (Windows/Node) | `HEAD=A, index=B, worktree=C` preserved on exit/error/timeout. |
-| RH2-C | Pass (Windows/Node); Pending (Linux CI) | Rename/delete/add/space pass. 2 POSIX-only special-name tests need Linux. Windows-invalid names are refused. |
+| RH2-C | Pass (Windows/Node) + Pass (Linux CI) | Rename/delete/add/space pass. Windows-invalid names are refused. Linux: `tests/scripts/repo-freeze.spec.ts` 71/71 with no skips, including the POSIX special-character and executable-bit/symlink tests (also 71/71 on macOS locally, Node 24.15). |
 | RH2-D | Pass (Windows/Node) | Drift gives nonzero exit and keeps artifacts. |
 | RH2-E | Pass (Windows/Node) | No destructive restore in any mode. |
-| RH3-A | Pending (Linux CI) | `scripts/pty-probes.mjs --require` is written and wired in CI, but has not run. |
+| RH3-A | Pass (Linux CI) | Bun's built-in PTY: remove stops shell, foreground and background jobs (3 members, 0 left, 54ms) with exactly one exit event; HUP-ignoring shell and job are KILLed at the escalation deadline (~1s); an unrelated process in the host session was never signalled. |
 | RH3-B | Pass (Windows/Node) | Fake adapter: 61 terminal tests pass. |
-| RH3-C | Pending (Linux CI) | Orchestration cycles pass with fakes. Real FD/UTF-8 checks need Linux. |
+| RH3-C | Pass (Linux CI) | Repeated create/close is bounded (fds 9→9, no surviving processes or records); UTF-8 split across PTY reads decodes intact (4001 groups, 0 replacement chars). |
 | RH3-D | Windows: Pass (bun-pty smoke 14/14, repeated). macOS: Not met (no evidence) | No macOS terminal support claim. The spec named node-pty; bun-pty smoke replaces it. |
-| RH3-E | Pending (Linux CI) | No actual POSIX integration evidence yet. |
+| RH3-E | Pass (Linux CI) | Real bash 5.2.21 under Bun's PTY: natural exit sweeps background jobs with one exit event; idle reap stops shell and jobs; disposeAll stops 16 terminals (48 members) in 1056ms against a 4000ms budget. 9/9 PTY probes. |
 | PH1-A | Pass (Windows/Node) | CLI (spawned Bun) and web manifest both 32768; wire cap 4096. |
 | PH1-B | Pass (Windows/Node) | |
 | PH1-C | Pass (Windows/Node) | No session is created before a CLI selection error. |
@@ -67,7 +67,7 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | PH3-A..E | Pass (Windows/Node) | 28-row classifier table. Squeeze path is exercised through the real adapter and agent loop. |
 | PH4-A..F | Pass (Windows/Node) | Fake strict DeepSeek gateway: real HTTP/SSE plus a real CLI process. |
 | PH4-G | Pass (2026-10-18, Bun 1.4.3) | `scripts/smoke-deepseek-reasoning.ts` against the `ocproxy-2` OpenAI-compatible proxy, model `deepseek-v4.1-flash-free`, thinking `high`: turn 1 completed (3 assistant messages, 1 with complete reasoning, 2 tool results); turn 2 on the same session completed (5 assistants, 2 with reasoning, 3 tool results). Proves reasoning replay through that proxy; not the first-party DeepSeek endpoint or `deepseek-v4-pro`. |
-| QH-1 | Partial: Pending (Linux CI) + admin config | Runtime pins and gated release workflow are done. Linux CI run, protected release env and tag protection are outstanding. |
+| QH-1 | Partial: Linux CI Pass; admin config pending | Runtime pins and gated release workflow are done. Linux `runtime-probes` is green ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578), 2026-10-18). Protected release env and tag protection are outstanding. |
 | QH-2 | Partial: metrics/docs Pass; prompt eval Not met | §11.3 behavioral recall/tool-count eval was not done. Prompt checks are string-level only. |
 
 ## Final verification (Windows)
@@ -90,7 +90,7 @@ Verdict: no regression attributable to this plan was found. The Linux suite/prob
 
 ## Pending gates (release-blocking)
 
-1. GitHub Linux CI never ran (branch not pushed). This leaves RH1-B Linux DNS, RH2-C POSIX names, and RH3-A/C/E unverified, and POSIX terminal support unproven.
+1. ~~GitHub Linux CI never ran.~~ Closed 2026-10-18: `runtime-probes` on PR #1 passed ([run 39144703578](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578); first run 39144485540 also green before the RH2-C step was added). Runtime probes 8/8 (outbound-http 16/16), repo-freeze spec 71/71, PTY probes 9/9. RH1-B Linux DNS, RH2-C POSIX names and RH3-A/C/E pass; Bun's built-in PTY is go for Linux. The full Vitest suite is still not run on Linux.
 2. macOS: no evidence. macOS terminal support must not be claimed.
 3. RH1-G: public HTTPS MCP passed under Bun; OAuth refresh/revoke and media remain unrun.
 4. PH4-G: passed via the `ocproxy-2` proxy with `deepseek-v4.1-flash-free`. A run against the first-party DeepSeek endpoint is still unrecorded; claim native thinking+tools support only as proven through that proxy.
@@ -109,7 +109,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 
 ## Residual risks
 
-- **POSIX PTY:** if Bun's PTY child is not a session leader on Linux, the session sweep falls back to shell-only HUP/KILL and RH3-A fails. In that case, evaluate bun-pty for POSIX (spec §6.2).
+- **POSIX PTY:** resolved on Linux (2026-10-18): the session sweep stops shell, foreground and background jobs under Bun's built-in PTY. Still unverified on macOS.
 - **macOS inspector:** `ps`/tty fields are unverified.
 - **Crash/SIGKILL:** external SIGKILL or a host crash during teardown can leave orphaned shells/jobs. Documented limitation; no orphan reaping.
 - **Shutdown trade-off:** agent stop timeout dropped from 10s to 1s inside the 13.5s budget. An agent in the middle of a tool call hits the persistence fence sooner.
@@ -130,7 +130,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 
 ## Follow-ups
 
-1. Push the branch to run GitHub Linux CI. Record the Linux baseline and the RH3-A/C/E, RH1-B DNS and RH2-C POSIX results, and make the go/no-go call on Bun's built-in POSIX PTY.
+1. Done 2026-10-18: Linux CI ran on PR #1 ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144703578)); RH3-A/C/E, RH1-B DNS and RH2-C POSIX pass, and Bun's built-in POSIX PTY is go on Linux. Remaining: a Linux baseline of the full Vitest suite.
 2. macOS zsh/Bash terminal evidence, or an explicit Windows/Linux-only release scope in the support docs.
 3. Remaining live smokes: RH1-G OAuth refresh/revoke and media under Bun (needs a disposable account), and PH4-G against the first-party DeepSeek endpoint with `DEEPSEEK_API_KEY`.
 4. Repo admin: configure the protected `release` environment and tag protection.
