@@ -992,6 +992,10 @@ async function startWebServer(options: WebServerOptions, boot: BootScope): Promi
   const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
   const mcpClientGeneration = new Map<string, number>()
+  // The generation a client was published under, readable from the client
+  // itself: a fence that deletes the map entry cannot change what a caller
+  // already holding the client reports for its call.
+  const mcpRuntimeGeneration = new WeakMap<McpServerClient, number>()
   /** Singleton connection promises prevent duplicate processes per workspace/server. */
   const mcpConnecting = new Map<string, Promise<McpServerClient>>()
   /** Disable/close cancellation epochs prevent late connection publication. */
@@ -3247,6 +3251,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         mcpClients.set(key, client)
         mcpClientGeneration.set(key, generationAtStart)
+        mcpRuntimeGeneration.set(client, generationAtStart)
         await client.listTools()
         await reconcileMcpTools(workspaceId, serverName, client)
         client.startHealthChecks(async () => {
@@ -3259,6 +3264,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         mcpClients.set(key, client)
         mcpClientGeneration.set(key, generationAtStart)
+        mcpRuntimeGeneration.set(client, generationAtStart)
         mcpConnectFailures.delete(key)
         return client
       } catch (error) {
@@ -3361,7 +3367,7 @@ ${entry.description}`.toLowerCase().includes(query))
           // The generation of the runtime that will carry this call, not the
           // current counter: a fence landing in between retires that runtime,
           // and its call is then refused unsent rather than labeled new.
-          const runtimeGeneration = mcpClientGeneration.get(`${scope.workspaceId}:${serverName}`) ?? generationOf(scope.workspaceId, serverName)
+          const runtimeGeneration = mcpRuntimeGeneration.get(scopedClient) ?? generationOf(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
           // The tool pipeline mints this host identity before durable intent;
