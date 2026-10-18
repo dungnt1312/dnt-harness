@@ -19,7 +19,7 @@ export interface AcceptedInput {
   readonly content: string
   readonly inputId: InputId
   readonly attachments?: readonly AttachmentRef[]
-  readonly origin?: 'hook'
+  readonly origin?: 'hook' | 'child'
   readonly summary?: string
 }
 
@@ -1067,10 +1067,15 @@ export class Agent {
   }
 }
 
-/** How an admitted inbox item is labeled in the log: context, a hook rewake, or (nothing) user text. */
-function inputOrigin(item: InboxItem): { origin?: 'context' | 'hook'; summary?: string } {
+/**
+ * How an admitted inbox item is labeled in the log: context, a hook rewake, a
+ * background child's report (shown like any delegated-report continuation),
+ * or (nothing) user text.
+ */
+function inputOrigin(item: InboxItem): { origin?: 'context' | 'hook' | 'continuation'; summary?: string } {
   if (item.kind === 'injected') return { origin: 'context' }
   if (item.origin === 'hook') return { origin: 'hook', ...(item.summary !== undefined ? { summary: item.summary } : {}) }
+  if (item.origin === 'child') return { origin: 'continuation' }
   return {}
 }
 

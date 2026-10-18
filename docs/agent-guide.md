@@ -91,11 +91,13 @@ accept comma-separated strings or YAML lists. Omitted `tools` inherits exposed
 tools, so explicitly list tools for a narrow read-only role. `model` can inherit,
 use an available alias, or select `provider:model`. Optional `skills` lists
 skills to preload into the child's turn; use names that resolve in its project.
+`background: true` makes the role's children outlive the spawning turn (a spawn
+can still pass `background: false`).
 
 Check `Agent` with `action: "catalog"` or Settings → Agents for the resolved
 role, source path and warnings. Test a small representative task before relying
 on a new role. Fields such as `maxTurns`, `permissionMode`, `hooks`, `memory`,
-`mcpServers`, `isolation` and `background` are recognized but **not enforced**;
+`mcpServers` and `isolation` are recognized but **not enforced**;
 do not promise their behavior. See [Claude format](claude-format.md) for the
 complete supported contract.
 

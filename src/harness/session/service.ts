@@ -31,8 +31,8 @@ export interface PendingInput {
   readonly clientRequestId?: string
   readonly content: string
   readonly attachments?: readonly AttachmentRef[]
-  /** `hook`: an `asyncRewake` result, not something the user typed. */
-  readonly origin?: 'hook'
+  /** `hook`: an `asyncRewake` result; `child`: a background child's report. Never user text. */
+  readonly origin?: 'hook' | 'child'
   readonly summary?: string
 }
 

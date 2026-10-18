@@ -1042,15 +1042,17 @@ describe('brief and inheritance', () => {
     await harness.kernel.stop()
   }, 15_000)
 
-  it('records inheritance as audit metadata only — never the inherited text', async () => {
+  it('records inheritance with audit metadata and pins the text once, in the child-meta snapshot only', async () => {
     const harness = await boot(['ok'])
     const inherited = 'User: the secret plan lives in plan-7.md'
     const handle = await harness.executor.spawn(request(harness, explorer, { inherit: 'brief', inheritedContext: inherited }))
     await settle(harness, handle.childSessionId)
-    const meta = childEvents(harness, handle.childSessionId).find((event) => event.type === 'session/child-meta')
-    expect(meta).toMatchObject({ inherit: 'brief', inheritedChars: inherited.length })
+    const events = childEvents(harness, handle.childSessionId)
+    const meta = events.find((event) => event.type === 'session/child-meta')
+    expect(meta).toMatchObject({ inherit: 'brief', inheritedChars: inherited.length, inheritedContext: inherited })
     expect(meta?.type === 'session/child-meta' && meta.inheritedHash).toMatch(/^[0-9a-f]{64}$/)
-    expect(JSON.stringify(childEvents(harness, handle.childSessionId))).not.toContain('plan-7.md')
+    // A resume rebuilds from the snapshot; no other record (or message) carries it.
+    expect(JSON.stringify(events.filter((event) => event.type !== 'session/child-meta'))).not.toContain('plan-7.md')
     await harness.kernel.stop()
   }, 15_000)
 

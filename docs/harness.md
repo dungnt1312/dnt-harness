@@ -65,7 +65,10 @@ session/grants      the session's extra file-tool folders (full list, last
                     wins, `revision` per change; `approvalId` when an approval
                     granted one)
 session/child-meta  child-session provenance (parent turn, definition, brief, inherit audit)
+                    and the snapshot a resume rebuilds from (instructions, tool
+                    ceiling, skills, grants, inherited context, background)
 agent/child-spawn   durable spawn intent + brief, written before a child agent starts
+agent/child-resume  a finished child runs again for a later turn (its opening input id)
 agent/child-result  a child agent's settled status (+ its failure, when failed)
 mcp/call            one MCP tool call (hashed args/results, duration, error flag)
 hook/run            one hook execution (event, matcher, exit code, decision)
@@ -972,6 +975,35 @@ root stops waiting:
   the call's abort signal, so Stop returns at once instead of sitting out the
   timeout.
 
+**Messaging and resuming a child.** `Agent action:"message"`
+(`ChildExecutor.message`) sends one child of this root a prompt. A running child
+takes it as durable `input/queued` in its own log and runs it as its next turn
+(`delivery:"queue"`) or at once, ending the current turn as `steered`
+(`"steer"`). A finished child runs again: the parent records
+`agent/child-resume` (the commit point, through the same admission writer and
+closing fence as spawn, charged to the calling turn), and the child's agent is
+rebuilt only from the pinned `session/child-meta` snapshot — a resume never
+re-reads the role file and never gains a tool or folder. Each run is scoped:
+its result is the `agent/child-result` after the newest spawn/resume record,
+and its report, partial work, files and progress are read from the run's
+opening input on. A resume interrupted by a restart reads `interrupted`, never
+the previous run's result. Children spawned before the snapshot existed, and
+`uncertain` children, refuse to resume.
+
+**Background children.** `background: true` (spawn argument, or the role's
+frontmatter) keeps a child out of the turn join and the turn-completion
+cleanup; a root Stop and root deletion still cancel it. When it settles, the
+executor hands the report to the host (`onBackgroundSettled`), which queues it
+as durable `input/queued` with `origin: 'child'` — an idle root wakes, a busy
+one gets it after its turn, and the turn admits it as a `continuation` message.
+A `wait` watching the child delivers the report itself; a Stop never wakes the
+root; a report the host could not take stays owed to the root's next join or
+`wait`. The obligation survives a restart without a new record: the queued
+report names its child (`input/queued` `childSessionId`), and recovery owes
+every settled background run that has no such input after its result. Nothing
+auto-runs; the report waits for the root's next join or `wait`. A report the
+model only got through `wait` before the crash is offered once more.
+
 **Lifecycle boundary.** `spawn` checks, in order: the brief and inherit fields
 (`SpawnError('packet' | 'inherit')`), that the parent is a root owned by the
 requested workspace and project (`'ownership'`) and not itself a child
@@ -984,8 +1016,8 @@ established, which leaves it `uncertain` (below). Settling releases the
 conversation's active count; the per-turn attempt stays recorded until the
 root turn's `agent/turn-settled`. A child
 session is driven by the executor only: the message routes answer 409 for any
-session carrying `session/child-meta`, so a child can never be resumed as a
-plain root Agent.
+session carrying `session/child-meta`, so a child is resumed only through
+`ChildExecutor.message`, never as a plain root Agent.
 
 **Uncertain children.** A rejected append is not proof of absence: the record
 may have reached storage before the parent `Session` poisoned. When the

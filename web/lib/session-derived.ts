@@ -17,7 +17,7 @@ import { todosFromEvents, type TodoView } from './todos-view.ts'
 const TURN_BOUNDARY_TYPES = ['turn/start', 'turn/end'] as const
 const TASK_TYPES = ['tool/call', 'tool/result'] as const
 const PROCESS_TYPES = ['process/start', 'process/exit'] as const
-const AGENT_TYPES = ['agent/child-spawn', 'agent/child-result'] as const
+const AGENT_TYPES = ['agent/child-spawn', 'agent/child-resume', 'agent/child-result'] as const
 /** A compaction's progress; a turn start also settles it (a job a crash left dangling is not running). */
 const COMPACTION_TYPES = ['compaction/job', 'turn/start'] as const
 

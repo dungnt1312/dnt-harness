@@ -56,6 +56,8 @@ export interface AgentDefinition {
   readonly model?: string
   /** Claude `effort`: the child's thinking level, over the parent's and the alias's. */
   readonly effort?: ThinkingLevel
+  /** Claude `background`: children of this role outlive the spawning turn by default. */
+  readonly background?: boolean
   /** Claude fields recognized but not enforced by dnt-harness (shown as warnings). */
   readonly unsupported?: readonly string[]
   /** Tool names the file listed that dnt-harness does not have (dropped). */
@@ -86,10 +88,10 @@ export class AgentDefinitionError extends Error {
 }
 
 /** Claude subagent frontmatter keys dnt-harness enforces. */
-const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'effort', 'mcpServers'])
+const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'effort', 'mcpServers', 'background'])
 /** Claude keys recognized but not enforced: accepted, reported as warnings. */
 const UNSUPPORTED_KEYS = new Set([
-  'permissionMode', 'hooks', 'memory', 'color', 'isolation', 'background', 'maxTurns',
+  'permissionMode', 'hooks', 'memory', 'color', 'isolation', 'maxTurns',
 ])
 
 /** Claude Code tool names → dnt-harness tools. `null` = no equivalent. */
@@ -225,6 +227,8 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
   }
 
   if (body === '') invalid.push('instructions body must not be empty')
+  const background = frontmatter['background']
+  if (background !== undefined && background !== null && typeof background !== 'boolean') invalid.push("'background' must be true or false")
   if (invalid.length > 0) {
     throw new AgentDefinitionError('invalid', `agent definition '${name}' is invalid: ${invalid.join('; ')}`)
   }
@@ -239,6 +243,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
     ...(mcpServers !== undefined && mcpServers.length > 0 ? { mcpServers } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(effort !== undefined ? { effort } : {}),
+    ...(background === true ? { background: true } : {}),
     ...(unsupported.length > 0 ? { unsupported } : {}),
     ...(dropped.length > 0 ? { droppedTools: dropped } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
