@@ -45,7 +45,7 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | RH1-D | Pass (Windows/Node) + Pass (Bun probe) | Private redirect refused; credentials stripped on foreign hops. |
 | RH1-E | Pass (Windows/Node) + Pass (Bun probe) | Abort before headers, during body/SSE, and on timeout. |
 | RH1-F | Pass (Windows/Node) | Scoped resolver/connector fixtures. Wiring test forbids raw `fetchImpl` / bare `undici`. |
-| RH1-G | Pending (live smoke) | Public HTTPS MCP, OAuth refresh/revoke and media under Bun not run. Real-cert TLS through the custom connect is unexercised. |
+| RH1-G | Partial pass (2026-10-18, macOS, Bun 1.4.3) | Public HTTPS MCP passed: `McpServerClient` over the default outbound transport (custom Undici connect, real TLS certificate) connected to the unauthenticated DeepWiki Streamable HTTP endpoint, listed 3 tools and called the read-only `read_wiki_structure` (no error). Not run: OAuth refresh/revoke (the only configured OAuth servers are real user accounts; refresh/revoke would mutate live tokens) and media tools. |
 | RH2-A | Pass (Windows/Node) | Source HEAD/index/diffs/untracked unchanged. |
 | RH2-B | Pass (Windows/Node) | `HEAD=A, index=B, worktree=C` preserved on exit/error/timeout. |
 | RH2-C | Pass (Windows/Node); Pending (Linux CI) | Rename/delete/add/space pass. 2 POSIX-only special-name tests need Linux. Windows-invalid names are refused. |
@@ -66,7 +66,7 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | PH2-D | Pass (Windows/Node) | Floor removed; ceiling ≤0 counts as exhausted. |
 | PH3-A..E | Pass (Windows/Node) | 28-row classifier table. Squeeze path is exercised through the real adapter and agent loop. |
 | PH4-A..F | Pass (Windows/Node) | Fake strict DeepSeek gateway: real HTTP/SSE plus a real CLI process. |
-| PH4-G | Pending (live smoke) | `scripts/smoke-deepseek-reasoning.ts` not run (no `DEEPSEEK_API_KEY`). |
+| PH4-G | Pass (2026-10-18, Bun 1.4.3) | `scripts/smoke-deepseek-reasoning.ts` against the `ocproxy-2` OpenAI-compatible proxy, model `deepseek-v4.1-flash-free`, thinking `high`: turn 1 completed (3 assistant messages, 1 with complete reasoning, 2 tool results); turn 2 on the same session completed (5 assistants, 2 with reasoning, 3 tool results). Proves reasoning replay through that proxy; not the first-party DeepSeek endpoint or `deepseek-v4-pro`. |
 | QH-1 | Partial: Pending (Linux CI) + admin config | Runtime pins and gated release workflow are done. Linux CI run, protected release env and tag protection are outstanding. |
 | QH-2 | Partial: metrics/docs Pass; prompt eval Not met | §11.3 behavioral recall/tool-count eval was not done. Prompt checks are string-level only. |
 
@@ -92,8 +92,8 @@ Verdict: no regression attributable to this plan was found. The Linux suite/prob
 
 1. GitHub Linux CI never ran (branch not pushed). This leaves RH1-B Linux DNS, RH2-C POSIX names, and RH3-A/C/E unverified, and POSIX terminal support unproven.
 2. macOS: no evidence. macOS terminal support must not be claimed.
-3. RH1-G live public HTTPS smoke under Bun.
-4. PH4-G live DeepSeek smoke. Native thinking+tools support must not be claimed until it passes.
+3. RH1-G: public HTTPS MCP passed under Bun; OAuth refresh/revoke and media remain unrun.
+4. PH4-G: passed via the `ocproxy-2` proxy with `deepseek-v4.1-flash-free`. A run against the first-party DeepSeek endpoint is still unrecorded; claim native thinking+tools support only as proven through that proxy.
 5. A repo admin must configure the protected `release` environment (required reviewers) and tag protection.
 
 Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
@@ -132,7 +132,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 
 1. Push the branch to run GitHub Linux CI. Record the Linux baseline and the RH3-A/C/E, RH1-B DNS and RH2-C POSIX results, and make the go/no-go call on Bun's built-in POSIX PTY.
 2. macOS zsh/Bash terminal evidence, or an explicit Windows/Linux-only release scope in the support docs.
-3. Live smokes with real credentials: RH1-G (public HTTPS MCP/OAuth/media under Bun) and PH4-G (`DEEPSEEK_API_KEY`).
+3. Remaining live smokes: RH1-G OAuth refresh/revoke and media under Bun (needs a disposable account), and PH4-G against the first-party DeepSeek endpoint with `DEEPSEEK_API_KEY`.
 4. Repo admin: configure the protected `release` environment and tag protection.
 5. Implement the behavioral prompt eval (recall / tool-count fixtures, spec §11.3).
 6. Leftover `bash.exe` PID 39640 (~2GB, a `/proc` kill loop from a 10/17 test run) was left alone. Kill it if the user agrees.
