@@ -71,15 +71,17 @@ Secret state distinguishes missing env/header reference, external token required
 ## Success Criteria
 
 - [x] Concurrent edits cannot silently overwrite each other.
-- [ ] Mutation acknowledgment defines a tested point after which no new dispatch uses old config/credential generation. Generation bumps on fence. A test that a call already in flight keeps the old generation is still open.
-- [ ] In-flight and remote-revocation limitations are reported, never implied undone.
-- [ ] Config command/URL/env/auth/transport/limits/allowlist changes reconcile to one current generation.
-- [ ] Secret deletion produces stable local-fence and remote-revocation statuses with affected servers.
-- [ ] Failed/auth-required/audit-fault/stale state survives refresh/restart. Stale is detected on the next read. Restart survival is not a separate test.
-- [ ] Old callbacks cannot publish/reconnect removed generations.
-- [ ] Global tool registration and two-workspace schema isolation remain correct.
+- [x] Mutation acknowledgment defines a tested point after which no new dispatch uses old config/credential generation. The fence retires the old client before the write is saved and acknowledged; a call that has not been sent by then is refused unsent. A `hang` call in flight keeps its old generation in the journal and ends `indeterminate`; the first call after the acknowledgment carries the new generation and runs on a new process (`tests/web/mcp-runtime-reconciliation.spec.ts` "a call in flight keeps its old generation…"). The intent now records the generation of the runtime that carries the call, not the counter read at dispatch time.
+- [x] In-flight and remote-revocation limitations are reported, never implied undone. A call cut by a fence tells the model it may already have run and was not undone or repeated (same test). Deleting a secret answers `localFence: 'fenced'` and `remoteRevocation: 'not_applicable'`; deleting a managed OAuth server answers `revocation: { local, remote }` (`tests/web/mcp-runtime-reconciliation.spec.ts` "MCP secret deletion").
+- [x] Config command/URL/env/auth/transport/limits/allowlist changes reconcile to one current generation. Each change bumps the generation, drops the old client and its process, and a reconnect brings up exactly one runtime that only uses the new command/URL/token (`tests/web/mcp-runtime-reconciliation.spec.ts` "command, env, limits, allowlist, transport, URL and auth changes…").
+- [x] Secret deletion produces stable local-fence and remote-revocation statuses with affected servers. `DELETE /secrets/:name` answers `{ deleted, localFence, affectedServers, remoteRevocation }`; the reading server's process is gone and its next start fails naming the secret. References are found anywhere in env, headers, static auth and a managed OAuth client secret (`src/harness/mcp/secret-dependencies.ts`, `tests/harness/mcp-secret-dependencies.spec.ts`); before this, rotation missed a reference embedded in a longer value.
+- [x] Failed/auth-required/audit-fault/stale state survives refresh/restart. Two restarts of the same data home (`tests/web/mcp-runtime-reconciliation.spec.ts` "failed, auth-required, audit-fault and stale states read the same after the host restarts"). The audit fault and the unvalidated `mcp.json` are durable files; failed and auth-required are rebuilt by the reopen connect attempt from durable config, secrets and OAuth state, not read from a stored status record.
+- [x] Old callbacks cannot publish/reconnect removed generations. A retired client's `tools/list_changed` refresh no longer calls back into the host (`tests/harness/mcp-client-fixes.spec.ts` "a tools/list_changed refresh in flight when the generation is retired…"; it called back before the fix). End to end, a save, a disable and a delete under a notification storm leave no listing, process, client or offered tool behind (`tests/web/mcp-runtime-reconciliation.spec.ts` "list-change refreshes of a fenced, disabled or deleted runtime…").
+- [x] Global tool registration and two-workspace schema isolation remain correct. Two workspaces, one server name, different `query` schemas: each turn is offered one `mcp__fx__query` with its own schema, a call runs on its own workspace's process, and disabling one leaves the other ready (`tests/web/mcp-runtime-reconciliation.spec.ts` "one global tool name carries each workspace its own schema…").
 - [x] External drift fences execution and cannot bypass CAS/audit.
-- [ ] Existing permission/mode/child/workspace contracts remain green.
+- [x] Existing permission/mode/child/workspace contracts remain green. Full suite on 2026-10-18: 371 files, 5114 tests passed, 3 skipped (`bun run test -- --maxWorkers=3`), `bun run typecheck` clean.
+
+Not done: implementation step 1 (one `McpRuntimeSupervisor` module owning lifecycle). Lifecycle, fencing and descriptor publication still live in `src/web/server.ts`; the criteria above are met through the existing generation counters and the per-workspace mutation queue. Extracting the supervisor is a refactor for a separate change.
 
 ## Risk Assessment
 
