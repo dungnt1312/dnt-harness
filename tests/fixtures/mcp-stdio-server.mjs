@@ -21,7 +21,8 @@ rl.on('line', async (line) => {
   }
   if (msg.method === 'tools/list') {
     send(msg.id, { tools: [
-      { name: 'query', description: 'Query fixture data', inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] }, annotations: { readOnlyHint: true } },
+      // QUERY_PROP renames the argument, so two configs can expose different schemas under one tool name.
+      { name: 'query', description: 'Query fixture data', inputSchema: { type: 'object', properties: { [process.env.QUERY_PROP ?? 'q']: { type: 'string' } }, required: [process.env.QUERY_PROP ?? 'q'] }, annotations: { readOnlyHint: true } },
       { name: 'interactive', description: 'Needs user interaction', inputSchema: { type: 'object', properties: {} }, annotations: { requiresUserInteraction: true } },
       { name: 'explode', description: 'Return isError', inputSchema: { type: 'object', properties: {} } },
       { name: 'hang', description: 'Never reply (timeout fixture)', inputSchema: { type: 'object', properties: {} } },
@@ -46,7 +47,7 @@ rl.on('line', async (line) => {
     // The remote side effect, recorded before any reply leaves (or does not).
     if (process.env.SIDE_EFFECT_FILE) {
       const { appendFileSync } = await import('node:fs')
-      appendFileSync(process.env.SIDE_EFFECT_FILE, `${name}\n`, 'utf8')
+      appendFileSync(process.env.SIDE_EFFECT_FILE, process.env.SIDE_EFFECT_PID === '1' ? `${name} ${process.pid}\n` : `${name}\n`, 'utf8')
     }
     if (name === 'query') send(msg.id, { content: [{ type: 'text', text: `result:${msg.params?.arguments?.q ?? ''}` }], isError: false })
     else if (name === 'interactive') send(msg.id, { content: [{ type: 'text', text: 'interactive ok' }], isError: false })

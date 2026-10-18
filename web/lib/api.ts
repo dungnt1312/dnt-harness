@@ -1859,9 +1859,15 @@ export function getMcpServer(workspaceId: string, name: string): Promise<Record<
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(name)}`).then((r) => json<Record<string, unknown>>(r))
 }
 
-export function deleteMcpServer(workspaceId: string, name: string): Promise<{ readonly deleted: string }> {
+/** Managed OAuth only: the local grant is always revoked; the provider's answer is reported apart. */
+export interface McpServerDeleted {
+  readonly deleted: string
+  readonly revocation?: { readonly local: 'revoked'; readonly remote: 'succeeded' | 'failed' | 'unavailable' }
+}
+
+export function deleteMcpServer(workspaceId: string, name: string): Promise<McpServerDeleted> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) =>
-    json<{ readonly deleted: string }>(r),
+    json<McpServerDeleted>(r),
   )
 }
 
@@ -1963,9 +1969,20 @@ export function setSecret(workspaceId: string, key: string, value: string): Prom
   }).then((r) => json<{ readonly rotated: string; readonly reconnected?: readonly string[] }>(r))
 }
 
-export function deleteSecret(workspaceId: string, key: string): Promise<{ readonly deleted: string }> {
+/**
+ * `localFence`: no new MCP dispatch uses the deleted value once this answers.
+ * `remoteRevocation`: a plain secret is never revoked at its issuer from here.
+ */
+export interface SecretDeleted {
+  readonly deleted: string
+  readonly localFence: 'fenced'
+  readonly affectedServers: readonly string[]
+  readonly remoteRevocation: 'not_applicable'
+}
+
+export function deleteSecret(workspaceId: string, key: string): Promise<SecretDeleted> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/secrets/${encodeURIComponent(key)}`, { method: 'DELETE' }).then((r) =>
-    json<{ readonly deleted: string }>(r),
+    json<SecretDeleted>(r),
   )
 }
 

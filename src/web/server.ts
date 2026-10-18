@@ -145,6 +145,7 @@ import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/e
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
 import { McpDispatchError } from '../harness/mcp/boundaries.ts'
 import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
+import { serversUsingSecret } from '../harness/mcp/secret-dependencies.ts'
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
@@ -6469,9 +6470,9 @@ async function handleApi(
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
           // Revoke locally first so a racing refresh cannot write the grant back;
           // the same call also asks the provider to void the token.
-          if (managed) await deps.oauth.revoke(wsId, serverName, revocationEndpoint)
+          const revocation = managed ? await deps.oauth.revoke(wsId, serverName, revocationEndpoint) : undefined
           await deps.oauthStore.deleteServer(wsId, serverName)
-          send(200, { deleted: serverName })
+          send(200, { deleted: serverName, ...(revocation !== undefined ? { revocation } : {}) })
           return
         }
         if (req.method === 'POST' && serverName !== undefined && action === undefined) {
@@ -6699,33 +6700,32 @@ async function handleApi(
         const value = body['value']
         await deps.updateMcpSecrets(wsId, (secrets) => { secrets[key] = value })
         // Rotation reconnects AFFECTED enabled servers before responding.
-        const config = await deps.mcpStore.loadMcp(wsId)
-        const ref = `\${${key}}`
-        const affected = Object.values(config.servers).filter((server) => {
-          if (!server.enabled) return false
-          const values = [
-            ...Object.values(server.env ?? {}),
-            ...Object.values(server.headers ?? {}),
-            ...(authSecretRef(server.auth) !== undefined ? [authSecretRef(server.auth) as string] : []),
-          ]
-          return values.includes(ref)
-        })
+        const affected = serversUsingSecret(await deps.mcpStore.loadMcp(wsId), key, { enabledOnly: true })
         try {
-          for (const server of affected) {
-            await deps.cancelMcpConnection(wsId, server.name)
-            deps.mcpCancelled.delete(`${wsId}:${server.name}`)
-            await deps.ensureMcpServer(wsId, server.name)
+          for (const name of affected) {
+            await deps.cancelMcpConnection(wsId, name)
+            deps.mcpCancelled.delete(`${wsId}:${name}`)
+            await deps.ensureMcpServer(wsId, name)
           }
         } catch (error) {
           send(502, { error: `secret rotated but affected MCP server failed to reconnect: ${String(error instanceof Error ? error.message : error)}` })
           return
         }
-        send(200, { rotated: key, reconnected: affected.map((server) => server.name) })
+        send(200, { rotated: key, reconnected: affected })
         return
       }
       if (req.method === 'DELETE' && key !== undefined) {
+        // The write fences the workspace before it is acknowledged: no new
+        // dispatch runs on a runtime built from the deleted value. Nothing is
+        // revoked at the secret's issuer — a plain secret has no revocation
+        // endpoint here — so that is reported apart from the local fence.
         await deps.updateMcpSecrets(wsId, (secrets) => { delete secrets[key] })
-        send(200, { deleted: key })
+        send(200, {
+          deleted: key,
+          localFence: 'fenced',
+          affectedServers: serversUsingSecret(await deps.mcpStore.loadMcp(wsId), key),
+          remoteRevocation: 'not_applicable',
+        })
         return
       }
       send(405, { error: 'method not allowed' })
