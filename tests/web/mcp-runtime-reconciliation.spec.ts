@@ -146,3 +146,47 @@ describe('MCP secret deletion', () => {
     expect(await deleted.json()).toEqual({ deleted: 'remote', revocation: { local: 'revoked', remote: 'succeeded' } })
   }, 30_000)
 })
+
+describe('MCP mutation linearization', () => {
+  it('a call in flight keeps its old generation and is reported as possibly run; the first dispatch after the acknowledgment uses the new runtime', async () => {
+    const { first: ws, stdio } = await boot()
+    const started = path.join(home, 'started.log')
+    const effects = path.join(home, 'effects.log')
+    expect((await ws.api('/mode', { modeId: 'full-access' }, 'PUT')).ok).toBe(true)
+    expect((await ws.api('/mcp/fx', { ...stdio({ INIT_FILE: started, SIDE_EFFECT_FILE: effects, SIDE_EFFECT_PID: '1' }), timeoutMs: 10_000 })).status).toBe(201)
+    expect((await ws.api('/mcp/fx/enable')).status).toBe(200)
+    const before = (await ws.row('fx'))!.generation
+    const sessionId = await ws.session()
+
+    // `hang` reaches the server (its side effect is recorded) and never answers.
+    const inFlight = ws.say(sessionId, 'call mcp__fx__hang {}')
+    await expect.poll(async () => (await lines(effects)).length, { timeout: 10_000, interval: 25 }).toBe(1)
+    const [hangTool, hangPid] = (await lines(effects))[0]!.split(' ')
+    expect(hangTool).toBe('hang')
+    // An unrelated secret write fences the whole workspace. Once it answers,
+    // the runtime that took the call is retired.
+    expect((await ws.api('/secrets/UNRELATED', { value: 'x' }, 'PUT')).status).toBe(200)
+    const after = (await ws.row('fx'))!.generation
+    expect(after).toBeGreaterThan(before)
+    expect(alive(Number(hangPid))).toBe(false)
+    await inFlight
+
+    const records = await ws.journal()
+    const hangIntent = records.find((record) => record.kind === 'dispatch_intent' && record.tool === 'hang')!
+    expect(hangIntent.generation).toBe(before)
+    expect(records.find((record) => record.kind === 'terminal' && record.invocationId === hangIntent.invocationId)?.outcome).toBe('indeterminate')
+    // The model is told the call may have run and was neither undone nor repeated.
+    const transcript = await fs.readFile(path.join(home, 'workspaces', ws.wsId, 'sessions', sessionId, 'events.jsonl'), 'utf8')
+    expect(transcript).toMatch(/changed while this call was in flight/)
+    expect(transcript).toMatch(/not undone/)
+
+    await ws.say(sessionId, 'call mcp__fx__query {"q":"next"}')
+    const queryIntent = (await ws.journal()).find((record) => record.kind === 'dispatch_intent' && record.tool === 'query')!
+    expect(queryIntent.generation).toBe(after)
+    const effectLines = await lines(effects)
+    expect(effectLines.filter((line) => line.startsWith('hang '))).toHaveLength(1)
+    const queryPid = effectLines.find((line) => line.startsWith('query '))!.split(' ')[1]
+    expect(queryPid).not.toBe(hangPid)
+    expect(await livePids(started)).toEqual([Number(queryPid)])
+  }, 40_000)
+})

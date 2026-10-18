@@ -3358,6 +3358,10 @@ ${entry.description}`.toLowerCase().includes(query))
             throw new Error(`MCP tool '${fullName}' is not exposed in this workspace`)
           }
           const scopedClient = await ensureMcpServer(scope.workspaceId, serverName)
+          // The generation of the runtime that will carry this call, not the
+          // current counter: a fence landing in between retires that runtime,
+          // and its call is then refused unsent rather than labeled new.
+          const runtimeGeneration = mcpClientGeneration.get(`${scope.workspaceId}:${serverName}`) ?? generationOf(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
           // The tool pipeline mints this host identity before durable intent;
@@ -3372,7 +3376,7 @@ ${entry.description}`.toLowerCase().includes(query))
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
-              generation: generationOf(scope.workspaceId, serverName),
+              generation: runtimeGeneration,
               epoch: ownerLock.epoch,
               configRevision: scopedConfig.revision ?? 1,
               secretRevision: 1,
@@ -3383,9 +3387,14 @@ ${entry.description}`.toLowerCase().includes(query))
               return { text, isError: result.isError }
             },
           }, auditFaultFile(workspaceId))
-          const text = dispatched.output.length > 60_000
+          const truncated = dispatched.output.length > 60_000
             ? `${dispatched.output.slice(0, 60_000)}\n… [truncated ${dispatched.output.length - 60_000} chars]`
             : dispatched.output
+          // A config or secret change retired the runtime mid-call. Stopping
+          // it cannot recall a request the server may already have acted on.
+          const text = dispatched.outcome === 'indeterminate' && generationOf(scope.workspaceId, serverName) !== runtimeGeneration
+            ? `${truncated}\n\nMCP server '${serverName}' configuration changed while this call was in flight. The call may already have run on the server; it was not undone and will not be repeated.`
+            : truncated
           const session = depsRef.current?.sessions.get(scope.sessionId)?.session
           if (session !== undefined) {
             session.append({
