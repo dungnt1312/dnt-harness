@@ -87,21 +87,34 @@ export function detectShell(explicit?: string): ShellDetection {
   return { executable: 'bash', hint: 'bash on PATH' }
 }
 
-/**
- * Locate the macOS zsh — the platform's default login shell, so a web
- * terminal should lead with it there. Checked in order: the account's login
- * shell from `dscl` when it is a zsh (respects `chsh`, and picks up a
- * Homebrew zsh's exact path), then the well-known path, then `zsh` on PATH.
- */
-function detectZsh(): ShellDetection {
+/** The account's login shell from Directory Services (respects `chsh`), or `undefined`. */
+function darwinUserShell(): string | undefined {
   const lookup = spawnSync('dscl', ['.', '-read', `/Users/${process.env['USER'] ?? ''}`, 'UserShell'], { encoding: 'utf8' })
-  if (lookup.status === 0) {
-    const match = /UserShell:\s*(\S+)/.exec(lookup.stdout)
-    const login = match?.[1]
-    if (login !== undefined && login.endsWith('/zsh') && existsSync(login)) return { executable: login, hint: login }
-  }
-  if (existsSync('/bin/zsh')) return { executable: '/bin/zsh', hint: '/bin/zsh' }
-  return { executable: 'zsh', hint: 'zsh on PATH' }
+  if (lookup.status !== 0) return undefined
+  const login = /UserShell:\s*(\S+)/.exec(lookup.stdout)?.[1]
+  return login !== undefined && existsSync(login) ? login : undefined
+}
+
+/**
+ * The macOS picker. Terminal.app opens the account's login shell as a login
+ * shell (`-l`), so `/etc/zprofile` (path_helper) and `~/.zprofile` — where
+ * Homebrew puts itself on PATH — are read; a web terminal that skipped them
+ * would answer `command not found` for tools the user's own terminal finds.
+ * The login shell leads (zsh by default, bash after `chsh -s /bin/bash`) and
+ * its exact path is used, so a Homebrew zsh or bash is the one started.
+ *
+ * Pure so the ordering is testable: `login` is an existing login-shell path
+ * or `undefined`; `bash` is the bash `detectShell` resolved, which wins over
+ * the login path when `bashPinned` (DNT_HARNESS_BASH names it explicitly).
+ */
+export function darwinShellOptions(login: string | undefined, bash: string | undefined, bashPinned = false): ShellOption[] {
+  const args = ['-l', '-i']
+  const zshPath = login?.endsWith('/zsh') === true ? login : existsSync('/bin/zsh') ? '/bin/zsh' : 'zsh'
+  const bashPath = login?.endsWith('/bash') === true && !bashPinned ? login : bash
+  const zsh: ShellOption = { id: 'zsh', label: 'zsh', executable: zshPath, args }
+  if (bashPath === undefined) return [zsh]
+  const bashOption: ShellOption = { id: 'bash', label: 'Bash', executable: bashPath, args }
+  return login?.endsWith('/bash') === true ? [bashOption, zsh] : [zsh, bashOption]
 }
 
 /**
@@ -124,11 +137,8 @@ export function detectLoginShell(): ShellDetection {
   const fromEnv = process.env['SHELL']?.trim()
   if (fromEnv !== undefined && fromEnv !== '' && existsSync(fromEnv)) return { executable: fromEnv, hint: fromEnv }
   if (process.platform === 'darwin') {
-    const lookup = spawnSync('dscl', ['.', '-read', `/Users/${process.env['USER'] ?? ''}`, 'UserShell'], { encoding: 'utf8' })
-    if (lookup.status === 0) {
-      const login = /UserShell:\s*(\S+)/.exec(lookup.stdout)?.[1]
-      if (login !== undefined && existsSync(login)) return { executable: login, hint: login }
-    }
+    const login = darwinUserShell()
+    if (login !== undefined) return { executable: login, hint: login }
   }
   return { executable: '/bin/sh', hint: '/bin/sh' }
 }
@@ -163,22 +173,20 @@ export function shellCatalog(): ShellOption[] {
 let catalogCache: ShellOption[] | undefined
 
 function buildShellCatalog(): ShellOption[] {
-  const options: ShellOption[] = []
-  // The user's login shell leads the picker: a web terminal that opens
+  // The user's login shell leads the macOS picker: a web terminal that opens
   // something other than what Terminal.app opens answers a question the user
   // did not ask. The Bash tool keeps its own bash resolution.
   if (process.platform === 'darwin') {
-    const zsh = detectZsh()
-    if (zsh.executable !== undefined) {
-      options.push({ id: 'zsh', label: 'zsh', executable: zsh.executable, args: ['-i'] })
-    }
+    const pinned = (process.env['DNT_HARNESS_BASH']?.trim() ?? '') !== ''
+    return darwinShellOptions(darwinUserShell(), detectShell().executable, pinned)
   }
+  const options: ShellOption[] = []
   const bash = detectShell()
   if (bash.executable !== undefined) {
     // `-i` gives the interactive prompt and job control a PTY user expects;
     // the Bash tool's `-lc` form is for one captured command, not a session.
-    // "Git Bash" is the Windows distribution; POSIX machines run system bash
-    // (or whatever DNT_HARNESS_BASH pins), so the label says only Bash.
+    // "Git Bash" is the Windows distribution; Linux runs system bash (or
+    // whatever DNT_HARNESS_BASH pins), so the label says only Bash.
     const label = process.platform === 'win32' ? 'Git Bash' : 'Bash'
     options.push({ id: 'bash', label, executable: bash.executable, args: ['-i'] })
   }

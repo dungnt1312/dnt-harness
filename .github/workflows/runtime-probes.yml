@@ -1,7 +1,7 @@
 name: Runtime probes
 
-# Linux gate for Bun runtime / DNS / PTY behaviour. Kept separate from the full
-# suite, which has known host-environment failures on GitHub's Linux runners.
+# Linux and macOS gate for Bun runtime / DNS / PTY behaviour. Kept separate from
+# the full suite, which has known host-environment failures on GitHub's Linux runners.
 on:
   push:
     branches: [main]
@@ -34,4 +34,22 @@ jobs:
         timeout-minutes: 5
       # RH-3: real bash under Bun's PTY; remove/reap/natural-exit/disposeAll teardown.
       - run: bun scripts/pty-probes.mjs --require
+        timeout-minutes: 5
+
+  macos-pty-probes:
+    # Real zsh (the macOS default login shell) and the system bash 3.2 under
+    # Bun's PTY; same probes as Linux, macOS process inspector (ps + getsid).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - run: sw_vers && uname -m && /bin/zsh --version && /bin/bash --version | head -1
+      - run: bun scripts/pty-probes.mjs --require --shell zsh
+        timeout-minutes: 5
+      - run: bun scripts/pty-probes.mjs --require --shell bash
         timeout-minutes: 5

@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
-// RH-3 actual-process PTY probes (RH3-A / RH3-C). Real processes, no mocks:
-// Bun's built-in PTY (`Bun.spawn({ terminal })`) driving
-// `bash --noprofile --norc -i`, torn down by the production terminal service
-// and its /proc session inspector.
+// Actual-process PTY probes. Real processes, no mocks: Bun's built-in PTY
+// (`Bun.spawn({ terminal })`) driving a clean interactive zsh or bash, torn
+// down by the production terminal service and the platform's session inspector
+// (`/proc` on Linux, `ps` + getsid(2) on macOS).
 //
-//   bun scripts/pty-probes.mjs            # Linux; other platforms print SKIP and exit 0
-//   bun scripts/pty-probes.mjs --require  # fail instead of skipping off Linux
+//   bun scripts/pty-probes.mjs                      # bash; other platforms print SKIP and exit 0
+//   bun scripts/pty-probes.mjs --shell zsh          # the same probes under zsh
+//   bun scripts/pty-probes.mjs --require            # fail instead of skipping off Linux/macOS
 //
-// Wired into .github/workflows/runtime-probes.yml (linux job).
+// Wired into .github/workflows/runtime-probes.yml (Linux and macOS jobs).
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 
 const results = []
@@ -16,54 +17,77 @@ const record = (name, ok, detail) => {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`)
 }
 
-if (process.platform !== 'linux' || !process.versions.bun) {
-  const why = !process.versions.bun ? 'not running under Bun' : `platform ${process.platform}`
-  console.log(`SKIP pty-probes (${why}); RH3-A/C need Linux + Bun`)
-  process.exit(process.argv.includes('--require') ? 1 : 0)
+const requireRun = process.argv.includes('--require')
+const shellFlag = process.argv.indexOf('--shell')
+const shellName = shellFlag >= 0 ? process.argv[shellFlag + 1] : 'bash'
+if (shellName !== 'bash' && shellName !== 'zsh') {
+  console.log(`unknown --shell '${shellName}'; use bash or zsh`)
+  process.exit(2)
 }
 
-const { bunPtySpawner, createTerminalService } = await import('../src/web/terminals.ts')
-const { linuxInspector, parseProcStat } = await import('../src/web/pty-session.ts')
+const supported = process.platform === 'linux' || process.platform === 'darwin'
+if (!supported || !process.versions.bun) {
+  const why = !process.versions.bun ? 'not running under Bun' : `platform ${process.platform}`
+  console.log(`SKIP pty-probes (${why}); they need Linux or macOS under Bun`)
+  process.exit(requireRun ? 1 : 0)
+}
 
-const BASH = existsSync('/bin/bash') ? '/bin/bash' : 'bash'
+const { bunPtySpawner, createTerminalService, TERMINAL_SHUTDOWN_BUDGET_MS } = await import('../src/web/terminals.ts')
+const { platformInspector } = await import('../src/web/pty-session.ts')
+const { shellCatalog } = await import('../src/capabilities/shell/detect.ts')
+const inspector = platformInspector()
+
+const resolveShell = (name) => [`/bin/${name}`, `/usr/bin/${name}`].find((file) => existsSync(file)) ?? name
+const SHELL = resolveShell(shellName)
+/** No profile or rc files: the probes must not depend on the runner's dotfiles. */
+const SHELL_ARGS = shellName === 'zsh' ? ['-f', '-i'] : ['--noprofile', '--norc', '-i']
+const BASH = resolveShell('bash')
 const WS = 'probe-ws'
 /** HUP→KILL escalation (1s) + KILL grace (1s) + slack. */
 const PER_TERMINAL_DEADLINE_MS = 3_500
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** Bun's PTY adapter, but always launching a clean interactive bash. */
-const base = bunPtySpawner(Bun)
-const spawner = { spawn: (_file, _args, options) => base.spawn(BASH, ['--noprofile', '--norc', '-i'], options) }
+console.log(`pty-probes: ${process.platform}/${process.arch} bun ${Bun.version} shell ${SHELL} ${SHELL_ARGS.join(' ')}`)
 
-function stat(pid) {
-  try {
-    return parseProcStat(pid, readFileSync(`/proc/${pid}/stat`, 'utf8'))
-  } catch {
-    return undefined
-  }
-}
+/** Bun's PTY adapter, but always launching the selected clean interactive shell. */
+const base = bunPtySpawner(Bun)
+const spawner = { spawn: (_file, _args, options) => base.spawn(SHELL, SHELL_ARGS, options) }
+
 function cmdline(pid) {
-  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim() } catch { return '' }
+  if (process.platform === 'linux') {
+    try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim() } catch { return '' }
+  }
+  const run = Bun.spawnSync(['ps', '-o', 'command=', '-p', String(pid)])
+  return run.stdout.toString().trim()
 }
 /** Alive and still the same process (start time unchanged), not a zombie. */
-function aliveSame(member) {
-  const now = stat(member.pid)
-  return now !== undefined && now.start === member.start && now.state !== 'Z' && now.state !== 'X'
+async function aliveSame(member) {
+  const now = await inspector.identity(member.pid)
+  return now !== undefined && now.start === member.start
+}
+async function survivors(members) {
+  const alive = await Promise.all(members.map(aliveSame))
+  return members.filter((_, i) => alive[i])
 }
 /** Session members whose command line matches `marker`. */
 async function waitForMembers(session, markers, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const members = await linuxInspector.members(session)
+    const members = await inspector.members(session)
     const found = markers.map((marker) => members.find((m) => cmdline(m.pid).includes(marker)))
     if (found.every(Boolean)) return { members, found }
     await sleep(50)
   }
-  const members = await linuxInspector.members(session)
+  const members = await inspector.members(session)
   throw new Error(`timed out waiting for ${markers.join(', ')}; members: ${members.map((m) => `${m.pid}:${cmdline(m.pid)}`).join(' | ')}`)
 }
 function fdCount() {
-  return readdirSync('/proc/self/fd').length
+  return readdirSync(process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd').length
+}
+async function waitForOutput(terminals, id, needle, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (!terminals.scrollback(id).includes(needle) && Date.now() < deadline) await sleep(50)
+  return terminals.scrollback(id).includes(needle)
 }
 
 /** Open a terminal and run `script` lines in it; returns shell identity and job identities. */
@@ -84,7 +108,7 @@ const tracking = { spawn: (file, args, options) => { const pty = spawner.spawn(f
 const idToPid = new Map()
 async function findShell(id) {
   const pid = idToPid.get(id)
-  const self = await linuxInspector.identity(pid)
+  const self = await inspector.identity(pid)
   if (self === undefined) throw new Error(`shell ${pid} not alive`)
   if (self.session !== String(pid)) record(`shell ${pid} is a session leader`, false, `session=${self.session}`)
   return self
@@ -103,7 +127,7 @@ function service(extra = {}) {
 // An unrelated process in the host's own session: must survive everything.
 const bystander = Bun.spawn(['sleep', '600'], { stdout: 'ignore', stderr: 'ignore' })
 await sleep(100)
-const bystanderId = stat(bystander.pid)
+const bystanderId = await inspector.identity(bystander.pid)
 
 async function probe(name, body) {
   try {
@@ -113,7 +137,27 @@ async function probe(name, body) {
   }
 }
 
-// ── RH3-A.1 remove: foreground + background jobs ──
+// ── input/output and resize reach the shell through the PTY ──
+await probe('input reaches the shell and its output comes back; resize changes the tty size', async () => {
+  const terminals = service()
+  const info = await terminals.create({ workspaceId: WS, cwd: process.cwd(), cols: 80, rows: 24 })
+  await sleep(150)
+  terminals.write(info.id, 'echo "IO-$((6 * 7))-OK"\n')
+  const echoed = await waitForOutput(terminals, info.id, 'IO-42-OK')
+  terminals.write(info.id, 'stty size\n')
+  const before = await waitForOutput(terminals, info.id, '24 80')
+  terminals.resize(info.id, 132, 41)
+  terminals.write(info.id, 'stty size\n')
+  const after = await waitForOutput(terminals, info.id, '41 132')
+  const described = terminals.get(info.id)
+  record('input reaches the shell and its output comes back; resize changes the tty size',
+    echoed && before && after && described?.cols === 132 && described?.rows === 41,
+    `echo=${echoed} size80x24=${before} size132x41=${after}`)
+  await terminals.kill(info.id)
+  await terminals.disposeAll()
+})
+
+// ── remove: foreground + background jobs ──
 await probe('remove stops shell, foreground and background jobs', async () => {
   const terminals = service()
   const exits = []
@@ -126,25 +170,25 @@ await probe('remove stops shell, foreground and background jobs', async () => {
   const started = Date.now()
   await terminals.kill(info.id)
   const elapsed = Date.now() - started
-  const left = members.filter(aliveSame)
+  const left = await survivors(members)
   record('remove stops shell, foreground and background jobs', left.length === 0 && elapsed < PER_TERMINAL_DEADLINE_MS,
     `members=${members.length} left=[${left.map((m) => m.pid)}] elapsed=${elapsed}ms shell=${self.pid}`)
   record('remove emits exactly one exit event', exits.length === 1, JSON.stringify(exits))
   await terminals.disposeAll()
 })
 
-// ── RH3-A.2 escalation: shell and a job both ignore HUP ──
+// ── escalation: shell and a job both ignore HUP ──
 await probe('HUP-ignoring shell and job are KILLed after the escalation deadline', async () => {
   const terminals = service()
   const { info, members } = await openWithJobs(
     terminals,
-    ["trap '' HUP", "bash --noprofile --norc -c \"trap '' HUP; exec sleep 1201\" &", 'sleep 1202'],
+    ["trap '' HUP", `${BASH} --noprofile --norc -c "trap '' HUP; exec sleep 1201" &`, 'sleep 1202'],
     ['sleep 1201', 'sleep 1202'],
   )
   const started = Date.now()
   await terminals.kill(info.id)
   const elapsed = Date.now() - started
-  const left = members.filter(aliveSame)
+  const left = await survivors(members)
   // Escalation really ran: a pure-HUP teardown would have finished well under 1s.
   record('HUP-ignoring shell and job are KILLed after the escalation deadline',
     left.length === 0 && elapsed >= 900 && elapsed < PER_TERMINAL_DEADLINE_MS,
@@ -152,24 +196,27 @@ await probe('HUP-ignoring shell and job are KILLed after the escalation deadline
   await terminals.disposeAll()
 })
 
-// ── RH3-A.3 natural exit sweeps leftover background jobs ──
+// ── natural exit sweeps leftover background jobs ──
 await probe('natural exit sweeps background jobs and emits one exit', async () => {
   const terminals = service()
   const exits = []
   terminals.subscribe(WS, (e) => { if (e.kind === 'exit') exits.push(e) })
-  const { info, members } = await openWithJobs(terminals, ['sleep 1301 &'], ['sleep 1301'])
+  // zsh hangs up its own jobs on exit (and refuses the first `exit` while jobs
+  // run); switch both off so only the service's sweep can stop the job.
+  const lines = shellName === 'zsh' ? ['setopt no_hup no_check_jobs', 'sleep 1301 &'] : ['sleep 1301 &']
+  const { info, members } = await openWithJobs(terminals, lines, ['sleep 1301'])
   terminals.write(info.id, 'exit\n')
   const deadline = Date.now() + PER_TERMINAL_DEADLINE_MS + 2_000
   while (terminals.get(info.id) !== undefined && Date.now() < deadline) await sleep(50)
   await sleep(100)
-  const left = members.filter(aliveSame)
+  const left = await survivors(members)
   record('natural exit sweeps background jobs and emits one exit',
     terminals.get(info.id) === undefined && left.length === 0 && exits.length === 1 && exits[0].reason === 'exit',
     `left=[${left.map((m) => m.pid)}] exits=${JSON.stringify(exits)}`)
   await terminals.disposeAll()
 })
 
-// ── RH3-A.4 idle reap ──
+// ── idle reap ──
 await probe('idle reap stops shell and jobs', async () => {
   const terminals = service({ idleMs: 300, reapIntervalMs: 100 })
   const exits = []
@@ -177,14 +224,14 @@ await probe('idle reap stops shell and jobs', async () => {
   const { info, members } = await openWithJobs(terminals, ['sleep 1401 &', 'sleep 1402'], ['sleep 1401', 'sleep 1402'])
   const deadline = Date.now() + 300 + 100 + PER_TERMINAL_DEADLINE_MS + 1_000
   while (terminals.get(info.id) !== undefined && Date.now() < deadline) await sleep(50)
-  const left = members.filter(aliveSame)
+  const left = await survivors(members)
   record('idle reap stops shell and jobs',
     terminals.get(info.id) === undefined && left.length === 0 && exits.length === 1 && exits[0].reason === 'idle',
     `left=[${left.map((m) => m.pid)}] exits=${JSON.stringify(exits)}`)
   await terminals.disposeAll()
 })
 
-// ── RH3-A.5 disposeAll: 16 terminals, some HUP-ignoring, one budget ──
+// ── disposeAll: 16 terminals, some HUP-ignoring, one budget ──
 await probe('disposeAll stops 16 terminals concurrently within the shutdown budget', async () => {
   const terminals = service()
   const all = []
@@ -199,14 +246,13 @@ await probe('disposeAll stops 16 terminals concurrently within the shutdown budg
   let error
   try { await terminals.disposeAll() } catch (e) { error = e }
   const elapsed = Date.now() - started
-  const left = members.filter(aliveSame)
-  const { TERMINAL_SHUTDOWN_BUDGET_MS } = await import('../src/web/terminals.ts')
+  const left = await survivors(members)
   record('disposeAll stops 16 terminals concurrently within the shutdown budget',
     error === undefined && left.length === 0 && elapsed <= TERMINAL_SHUTDOWN_BUDGET_MS,
     `members=${members.length} left=[${left.map((m) => m.pid)}] elapsed=${elapsed}ms budget=${TERMINAL_SHUTDOWN_BUDGET_MS}ms${error ? ` error=${error.message}` : ''}`)
 })
 
-// ── RH3-C: repeated create/close does not leak FDs, processes or records; UTF-8 split stream ──
+// ── repeated create/close does not leak FDs, processes or records; UTF-8 split stream ──
 await probe('repeated create/close is bounded (fds, processes, records)', async () => {
   const terminals = service()
   const warm = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
@@ -223,10 +269,10 @@ await probe('repeated create/close is bounded (fds, processes, records)', async 
   }
   await sleep(300)
   const fdAfter = fdCount()
-  const survivors = (await Promise.all(sessions.map((s) => linuxInspector.members(s)))).flat()
+  const leftover = (await Promise.all(sessions.map((s) => inspector.members(s)))).flat()
   record('repeated create/close is bounded (fds, processes, records)',
-    fdAfter - fdBefore <= 4 && survivors.length === 0 && terminals.list(WS).length === 0,
-    `fds ${fdBefore}→${fdAfter} survivors=[${survivors.map((m) => m.pid)}]`)
+    fdAfter - fdBefore <= 4 && leftover.length === 0 && terminals.list(WS).length === 0,
+    `fds ${fdBefore}→${fdAfter} survivors=[${leftover.map((m) => m.pid)}]`)
   await terminals.disposeAll()
 })
 
@@ -236,23 +282,43 @@ await probe('UTF-8 split across PTY reads decodes intact', async () => {
   await sleep(150)
   // 20k two- and four-byte characters: PTY reads will split some sequences.
   terminals.write(info.id, "for i in $(seq 1 4000); do printf 'é😀ü€ß'; done; echo; echo UTF8-DONE\n")
-  const deadline = Date.now() + 8_000
-  while (!terminals.scrollback(info.id).includes('UTF8-DONE\r\n') && Date.now() < deadline) await sleep(50)
+  await waitForOutput(terminals, info.id, 'UTF8-DONE\r\n', 8_000)
   const text = terminals.scrollback(info.id)
   const count = (text.match(/é😀ü€ß/g) ?? []).length
-  record('UTF-8 split across PTY reads decodes intact', !text.includes('\uFFFD') && count >= 4000,
-    `groups=${count} replacementChars=${(text.match(/\uFFFD/g) ?? []).length}`)
+  record('UTF-8 split across PTY reads decodes intact', !text.includes('�') && count >= 4000,
+    `groups=${count} replacementChars=${(text.match(/�/g) ?? []).length}`)
   await terminals.kill(info.id)
   await terminals.disposeAll()
 })
 
+// ── the product's own default shell (no override): macOS opens the login shell as a login shell ──
+if (process.platform === 'darwin') {
+  await probe('the default macOS terminal is the catalog\'s first shell, started as a login shell', async () => {
+    const terminals = createTerminalService()
+    const first = shellCatalog()[0]
+    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+    const check = first.id === 'zsh'
+      ? '[[ -o login ]] && echo "LOGIN-$((40 + 2))"\n'
+      : 'shopt -q login_shell && echo "LOGIN-$((40 + 2))"\n'
+    // Dotfiles may be slow; this only needs the shell to answer.
+    await sleep(300)
+    terminals.write(info.id, check)
+    const login = await waitForOutput(terminals, info.id, 'LOGIN-42', 10_000)
+    record('the default macOS terminal is the catalog\'s first shell, started as a login shell',
+      info.shellId === first.id && login,
+      `shell=${first.id} ${first.executable} ${first.args.join(' ')} login=${login}`)
+    await terminals.kill(info.id)
+    await terminals.disposeAll()
+  })
+}
+
 // ── Nothing outside the PTY sessions was signalled ──
 {
-  const ok = bystanderId !== undefined && aliveSame({ pid: bystander.pid, start: bystanderId.start })
+  const ok = bystanderId !== undefined && await aliveSame(bystanderId)
   record('unrelated process in the host session was never signalled', ok, `pid=${bystander.pid}`)
   bystander.kill('SIGKILL')
 }
 
 const failed = results.filter((r) => !r.ok)
-console.log(`\n${results.length - failed.length}/${results.length} pty probes passed`)
+console.log(`\n${results.length - failed.length}/${results.length} pty probes passed (${shellName})`)
 process.exit(failed.length === 0 ? 0 : 1)

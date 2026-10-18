@@ -80,9 +80,10 @@ jobs:
         timeout-minutes: 15
 
   linux-runtime-probes:
-    name: Gate · Linux Bun runtime + PTY probes
+    name: Gate · Bun runtime + PTY probes (Linux, macOS)
     # Bun 1.4.3: real Undici dispatcher, DNS policy, and
-    # `bun scripts/pty-probes.mjs --require` (real bash PTY teardown).
+    # `bun scripts/pty-probes.mjs --require` (real bash PTY teardown on Linux,
+    # zsh and bash on macOS).
     uses: ./.github/workflows/runtime-probes.yml
     permissions:
       contents: read

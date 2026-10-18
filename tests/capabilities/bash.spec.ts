@@ -10,7 +10,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { bashTool, DEFAULT_LIMITS, fsTools, Kernel, ToolsService, type LimitsSnapshot, type ToolExecution } from 'dnt-harness'
 import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
-import { detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
+import { darwinShellOptions, detectLoginShell, detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
 
 const exec: ToolExecution = { root: process.cwd() }
 
@@ -167,14 +167,16 @@ describe('bash tool', () => {
     expect(bash!.label).toBe(process.platform === 'win32' ? 'Git Bash' : 'Bash')
   })
 
-  it('leads the macOS catalog with zsh and still offers bash after it', () => {
+  it('leads the macOS catalog with the login shell and still offers the other one', () => {
     if (process.platform !== 'darwin') return
     const catalog = shellCatalog()
-    expect(catalog[0]).toMatchObject({ id: 'zsh', label: 'zsh', executable: expect.stringMatching(/\/zsh$/) })
-    expect(catalog.map((option) => option.id)).toContain('bash')
+    const login = detectLoginShell().executable ?? ''
+    const lead = login.endsWith('/bash') ? 'bash' : 'zsh'
+    expect(catalog[0]?.id).toBe(lead)
+    expect(catalog.map((option) => option.id).sort()).toEqual(['bash', 'zsh'])
   })
 
-  it('resolves the zsh option to an existing executable with interactive args', () => {
+  it('resolves the zsh option to an existing executable started as a login shell on macOS only', () => {
     const zsh = shellCatalog().find((option) => option.id === 'zsh')
     if (process.platform !== 'darwin') {
       expect(zsh).toBeUndefined()
@@ -182,7 +184,28 @@ describe('bash tool', () => {
     }
     expect(zsh).toBeDefined()
     expect(existsSync(zsh!.executable)).toBe(true)
-    expect(zsh!.args).toEqual(['-i'])
+    expect(zsh!.args).toEqual(['-l', '-i'])
+  })
+
+  it('starts the macOS login shell like Terminal.app: first, by its exact path, as a login shell', () => {
+    expect(darwinShellOptions('/opt/homebrew/bin/zsh', '/bin/bash')).toEqual([
+      { id: 'zsh', label: 'zsh', executable: '/opt/homebrew/bin/zsh', args: ['-l', '-i'] },
+      { id: 'bash', label: 'Bash', executable: '/bin/bash', args: ['-l', '-i'] },
+    ])
+    expect(darwinShellOptions('/opt/homebrew/bin/bash', '/bin/bash').map((option) => [option.id, option.executable])).toEqual([
+      ['bash', '/opt/homebrew/bin/bash'],
+      ['zsh', existsSync('/bin/zsh') ? '/bin/zsh' : 'zsh'],
+    ])
+    // DNT_HARNESS_BASH pins bash explicitly: the login path only decides the order.
+    expect(darwinShellOptions('/opt/homebrew/bin/bash', '/custom/bash', true)[0]).toMatchObject({ id: 'bash', executable: '/custom/bash' })
+    // Login shell unknown or something else (fish): zsh, the macOS default, leads.
+    expect(darwinShellOptions(undefined, '/bin/bash').map((option) => option.id)).toEqual(['zsh', 'bash'])
+    expect(darwinShellOptions('/opt/homebrew/bin/fish', undefined).map((option) => option.id)).toEqual(['zsh'])
+  })
+
+  it('keeps the Linux interactive shell a non-login bash', () => {
+    if (process.platform !== 'linux') return
+    expect(shellCatalog()).toEqual([expect.objectContaining({ id: 'bash', args: ['-i'] })])
   })
 
   it.runIf(process.platform === 'win32')('the tag sweep alone kills a tagged tree whose root no walk can reach', async () => {

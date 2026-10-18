@@ -499,13 +499,25 @@ function defaultSpawner(): { spawner: PtySpawner; load: () => Promise<string | u
   }
 }
 
-/** Environment for a PTY: the host's, minus unset keys, plus a colour-capable TERM. */
-function ptyEnv(): Record<string, string> {
+/**
+ * Environment for a PTY: the host's, minus unset keys, plus a colour-capable TERM.
+ *
+ * On macOS a host started outside Terminal.app (launchd, an IDE, a CI runner)
+ * often has no locale at all, so zsh and bash run in the C locale: the line
+ * editor then mangles typed UTF-8 (bash 3.2's readline turns it into meta
+ * keys) although the PTY stream and xterm.js are UTF-8. Like Terminal.app, a
+ * UTF-8 character type is supplied when the host names no locale; an explicit
+ * `LC_ALL`, `LC_CTYPE` or `LANG` is always kept.
+ */
+export function ptyEnv(source: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): Record<string, string> {
   const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(source)) {
     if (value !== undefined) env[key] = value
   }
   env['TERM'] = 'xterm-256color'
+  if (platform === 'darwin' && !['LC_ALL', 'LC_CTYPE', 'LANG'].some((key) => (env[key] ?? '') !== '')) {
+    env['LC_CTYPE'] = 'UTF-8'
+  }
   return env
 }
 

@@ -11,17 +11,17 @@
  * re-read immediately before every signal. A process whose start time or
  * session changed is not the one we enumerated and is left alone.
  *
- * Linux reads `/proc/<pid>/stat`. macOS shells out to `ps` and keys membership
- * on the controlling tty; that path has no runner evidence yet (see the
- * phase-03 report) and must not back a macOS support claim until it does.
+ * Linux reads `/proc/<pid>/stat`. macOS lists processes with `ps` and reads
+ * each one's session id with getsid(2); see `createDarwinInspector`.
  */
 import { execFile } from 'node:child_process'
 import { readdir, readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 
 /** One process as seen at a moment: PID, opaque session token, start-time identity. */
 export interface ProcessIdentity {
   readonly pid: number
-  /** Session token. Linux: the numeric session id; macOS: `tty:<controlling tty>`. */
+  /** Session token: the numeric session id (the leader's PID) on Linux and macOS. */
   readonly session: string
   /** Start-time identity. Linux: `/proc/<pid>/stat` field 22; macOS: `ps lstart`. */
   readonly start: string
@@ -35,10 +35,10 @@ export type TeardownSignal = 'SIGHUP' | 'SIGCONT' | 'SIGKILL'
 export interface ProcessInspector {
   /**
    * Whether the session token stays bound to this terminal after its PTY is
-   * closed. Linux session ids cannot be reallocated while any member lives, so
-   * rescanning and re-checking the session are safe; a macOS tty name can be
-   * handed to the next PTY (and a revoked tty may print as `??`), so there
-   * only the pre-close snapshot is trusted and identity is pid + start time.
+   * closed. Linux and macOS session ids cannot be reallocated while any member
+   * lives, so rescanning and re-checking the session are safe. An inspector
+   * keyed on something reusable (a tty name) must say `false`: then only the
+   * pre-close snapshot is trusted and identity is pid + start time.
    */
   readonly sessionStable: boolean
   /** Identity of a live (non-zombie) process, or `undefined` when gone. */
@@ -116,21 +116,28 @@ export const linuxInspector: ProcessInspector = {
   signal: deliver,
 }
 
-/** Parse `ps -o pid=,ppid=,stat=,tty=,lstart=` lines. `lstart` contains spaces, so it is the tail. */
-export function parsePsListing(text: string): ProcessIdentity[] {
-  const rows: ProcessIdentity[] = []
+/** One `ps` row: PID, parent PID and start-time identity. Zombies are dropped. */
+export interface PsRow {
+  readonly pid: number
+  readonly ppid: number
+  readonly start: string
+}
+
+/** Parse `ps -o pid=,ppid=,stat=,lstart=` lines. `lstart` contains spaces, so it is the tail. */
+export function parsePsListing(text: string): PsRow[] {
+  const rows: PsRow[] = []
   for (const line of text.split('\n')) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$/.exec(line)
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line)
     if (match === null) continue
-    const [, pid, ppid, state, tty, start] = match
-    if (pid === undefined || ppid === undefined || state === undefined || tty === undefined || start === undefined) continue
+    const [, pid, ppid, state, start] = match
+    if (pid === undefined || ppid === undefined || state === undefined || start === undefined) continue
     if (state.startsWith('Z')) continue
-    rows.push({ pid: Number(pid), session: `tty:${tty}`, start, ppid: Number(ppid) })
+    rows.push({ pid: Number(pid), ppid: Number(ppid), start })
   }
   return rows
 }
 
-const PS_FIELDS = 'pid=,ppid=,stat=,tty=,lstart='
+const PS_FIELDS = 'pid=,ppid=,stat=,lstart='
 
 function ps(args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -143,26 +150,91 @@ function ps(args: readonly string[]): Promise<string> {
   })
 }
 
-/** macOS (no runner evidence yet). Membership = same controlling tty as the shell. */
-export const darwinInspector: ProcessInspector = {
-  sessionStable: false,
-  async identity(pid) {
-    return parsePsListing(await ps(['-o', PS_FIELDS, '-p', String(pid)])).find((row) => row.pid === pid)
-  },
-  async members(session) {
-    return parsePsListing(await ps(['-A', '-o', PS_FIELDS])).filter((row) => row.session === session)
-  },
-  async ownsSession(self) {
-    if (self.session === 'tty:??' || self.session === 'tty:-') return false
-    const host = await darwinInspector.identity(process.pid)
-    return host !== undefined && host.session !== self.session
-  },
-  signal: deliver,
+/** What the macOS inspector needs from the OS. Injectable so its logic is testable without real processes. */
+export interface DarwinProcessSource {
+  /** Run `ps` with these arguments and return its stdout (empty when no process matched). */
+  ps(args: readonly string[]): Promise<string>
+  /** getsid(2): the session id of `pid`, or -1 when it is gone. */
+  getsid(pid: number): number
 }
 
-/** The inspector for this platform, or `null` where teardown relies on the PTY backend alone (Windows). */
+/**
+ * macOS inspector. `ps` reports no usable session id there (its `sess` column
+ * is always 0), and the controlling tty is no anchor either: the moment the
+ * session leader exits, the kernel revokes the tty and every job left behind
+ * shows `??` with parent 1 — exactly the jobs a natural-exit sweep is for. So
+ * membership comes from getsid(2), which keeps answering for those orphans.
+ * Like Linux, XNU never hands out a PID that is still in use as a session id,
+ * so the session token stays bound to this terminal while any member lives.
+ */
+export function createDarwinInspector(source: DarwinProcessSource): ProcessInspector {
+  let scanned: { readonly at: number; readonly result: Promise<ProcessIdentity[]> } | undefined
+  const withSession = (rows: readonly PsRow[]): ProcessIdentity[] => {
+    const out: ProcessIdentity[] = []
+    for (const row of rows) {
+      const sid = source.getsid(row.pid)
+      if (sid > 0) out.push({ pid: row.pid, session: String(sid), start: row.start, ppid: row.ppid })
+    }
+    return out
+  }
+  return {
+    sessionStable: true,
+    async identity(pid) {
+      return withSession(parsePsListing(await source.ps(['-o', PS_FIELDS, '-p', String(pid)])).filter((row) => row.pid === pid))[0]
+    },
+    async members(session) {
+      // One `ps -A` shared by concurrent callers, as on Linux.
+      const now = Date.now()
+      if (scanned === undefined || now - scanned.at > SCAN_REUSE_MS) {
+        scanned = { at: now, result: source.ps(['-A', '-o', PS_FIELDS]).then((text) => withSession(parsePsListing(text))) }
+      }
+      return (await scanned.result).filter((row) => row.session === session)
+    },
+    async ownsSession(self) {
+      return self.session === String(self.pid) && self.pid !== process.pid
+    },
+    signal: deliver,
+  }
+}
+
+type GetSid = (pid: number) => number
+let getsid: GetSid | null | undefined
+
+/** getsid(2) through `bun:ffi`, or `null` where it cannot load (not Bun, no libSystem). */
+function loadGetSid(): GetSid | null {
+  if (getsid !== undefined) return getsid
+  getsid = null
+  const bun = (globalThis as { Bun?: unknown }).Bun
+  if (bun === undefined) return getsid
+  try {
+    // A variable specifier: the repo carries no Bun type package, and this
+    // path only runs under Bun. Bun resolves `bun:` modules synchronously.
+    const ffiModule = 'bun:ffi'
+    const ffi = createRequire(import.meta.url)(ffiModule) as {
+      dlopen(path: string, symbols: Record<string, { args: string[]; returns: string }>): { symbols: Record<string, (...args: number[]) => number> }
+    }
+    const lib = ffi.dlopen('/usr/lib/libSystem.B.dylib', { getsid: { args: ['i32'], returns: 'i32' } })
+    const call = lib.symbols['getsid']
+    if (call !== undefined) getsid = (pid) => call(pid)
+  } catch {
+    getsid = null
+  }
+  return getsid
+}
+
+let darwinCached: ProcessInspector | null | undefined
+
+/** The macOS inspector, or `null` when getsid(2) is unavailable (the terminals then run under Bun only anyway). */
+export function darwinInspector(): ProcessInspector | null {
+  if (darwinCached !== undefined) return darwinCached
+  const sid = loadGetSid()
+  darwinCached = sid === null ? null : createDarwinInspector({ ps, getsid: sid })
+  return darwinCached
+}
+
+/** The inspector for this platform, or `null` where teardown relies on the PTY backend alone (Windows; macOS outside Bun). */
 export function platformInspector(): ProcessInspector | null {
   if (process.platform === 'linux') return linuxInspector
-  if (process.platform === 'darwin') return darwinInspector
+  if (process.platform === 'darwin') return darwinInspector()
   return null
 }

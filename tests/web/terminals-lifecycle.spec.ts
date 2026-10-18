@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createTerminalService,
+  ptyEnv,
   TerminalError,
   TerminalTeardownError,
   type PtyHandle,
@@ -18,7 +19,7 @@ import {
   type TerminalEvent,
   type TerminalService,
 } from '../../src/web/terminals.ts'
-import { parseProcStat, parsePsListing, type ProcessIdentity, type ProcessInspector, type TeardownSignal } from '../../src/web/pty-session.ts'
+import { createDarwinInspector, parseProcStat, parsePsListing, type ProcessIdentity, type ProcessInspector, type TeardownSignal } from '../../src/web/pty-session.ts'
 import type { WorkspaceId } from '../../src/util/brand.ts'
 
 const WS = 'workspace-a' as WorkspaceId
@@ -350,14 +351,73 @@ describe('process identity parsing', () => {
 
   it('reads ps listings with a multi-word lstart and drops zombies', () => {
     const text = [
-      '  501   400 Ss   ttys003  Sat Oct 17 10:00:01 2026',
-      '  502   501 S+   ttys003  Sat Oct 17 10:00:05 2026',
-      '  503   501 Z    ttys003  Sat Oct 17 10:00:06 2026',
+      '  501   400 Ss   Sat Oct 17 10:00:01 2026',
+      '  502   501 S+   Sat Oct 17 10:00:05 2026',
+      '  503   501 Z    Sat Oct 17 10:00:06 2026',
     ].join('\n')
     expect(parsePsListing(text)).toEqual([
-      { pid: 501, session: 'tty:ttys003', start: 'Sat Oct 17 10:00:01 2026', ppid: 400 },
-      { pid: 502, session: 'tty:ttys003', start: 'Sat Oct 17 10:00:05 2026', ppid: 501 },
+      { pid: 501, ppid: 400, start: 'Sat Oct 17 10:00:01 2026' },
+      { pid: 502, ppid: 501, start: 'Sat Oct 17 10:00:05 2026' },
     ])
+  })
+})
+
+describe('macOS process inspector', () => {
+  // After the session leader 501 exits, macOS revokes its tty: the job left
+  // behind is reparented to launchd and `ps` shows no tty, but getsid(2)
+  // still names the dead leader's session.
+  const listing = [
+    '  502     1 SN   Sat Oct 17 10:00:05 2026',
+    '  503   502 S    Sat Oct 17 10:00:06 2026',
+    '  600     1 Ss   Sat Oct 17 09:00:00 2026',
+    '  700   600 Z    Sat Oct 17 09:00:01 2026',
+  ].join('\n')
+  const sids = new Map([[502, 501], [503, 501], [600, 600], [700, 600]])
+  const inspector = createDarwinInspector({
+    async ps(args) {
+      const at = args.indexOf('-p')
+      if (at < 0) return listing
+      const pid = args[at + 1]
+      return listing.split('\n').filter((line) => line.trim().startsWith(`${pid} `)).join('\n')
+    },
+    getsid: (pid) => sids.get(pid) ?? -1,
+  })
+
+  it('keys membership on getsid, so jobs orphaned by a natural exit stay in the session', async () => {
+    expect(inspector.sessionStable).toBe(true)
+    expect(await inspector.members('501')).toEqual([
+      { pid: 502, session: '501', start: 'Sat Oct 17 10:00:05 2026', ppid: 1 },
+      { pid: 503, session: '501', start: 'Sat Oct 17 10:00:06 2026', ppid: 502 },
+    ])
+  })
+
+  it('reads one identity, drops zombies and treats a vanished session id as gone', async () => {
+    expect(await inspector.identity(503)).toEqual({ pid: 503, session: '501', start: 'Sat Oct 17 10:00:06 2026', ppid: 502 })
+    expect(await inspector.identity(700)).toBeUndefined()
+    expect(await inspector.identity(999)).toBeUndefined()
+    sids.delete(502)
+    expect(await inspector.identity(502)).toBeUndefined()
+    sids.set(502, 501)
+  })
+
+  it('owns a session only as its leader, never the host process', async () => {
+    expect(await inspector.ownsSession({ pid: 600, session: '600', start: 'x' })).toBe(true)
+    expect(await inspector.ownsSession({ pid: 503, session: '501', start: 'x' })).toBe(false)
+    expect(await inspector.ownsSession({ pid: process.pid, session: String(process.pid), start: 'x' })).toBe(false)
+  })
+})
+
+describe('terminal environment', () => {
+  it('supplies a UTF-8 character type on macOS when the host names no locale', () => {
+    const env = ptyEnv({ PATH: '/usr/bin', LANG: '' }, 'darwin')
+    expect(env).toMatchObject({ PATH: '/usr/bin', TERM: 'xterm-256color', LC_CTYPE: 'UTF-8' })
+  })
+
+  it('keeps an explicit locale, and leaves other platforms alone', () => {
+    expect(ptyEnv({ LANG: 'de_DE.UTF-8' }, 'darwin')['LC_CTYPE']).toBeUndefined()
+    expect(ptyEnv({ LC_ALL: 'C' }, 'darwin')['LC_CTYPE']).toBeUndefined()
+    expect(ptyEnv({ LC_CTYPE: 'ja_JP.eucJP' }, 'darwin')['LC_CTYPE']).toBe('ja_JP.eucJP')
+    expect(ptyEnv({}, 'linux')['LC_CTYPE']).toBeUndefined()
   })
 })
 
