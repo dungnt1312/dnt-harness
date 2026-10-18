@@ -49,7 +49,8 @@ DNS policy). See [docs/migration-runtime-hardening.md](docs/migration-runtime-ha
 for behaviour changes in this release.
 
 **Platform support.** Terminal (PTY) support is claimed only where it has
-been verified. Windows (node-pty/ConPTY) has local smoke evidence. Linux
+been verified. Windows (bun-pty/ConPTY) has local smoke evidence
+(`bun scripts/pty-smoke-windows.mjs`). Linux
 (Bun built-in PTY) is gated by the `runtime-probes` CI job
 (`bun scripts/pty-probes.mjs --require`); that gate is wired but pending
 its first green CI run, so Linux evidence is not yet recorded. **macOS terminal support is
@@ -108,9 +109,8 @@ bun run probe:runtime   # Bun runtime probes (Undici dispatcher, DNS policy)
 
 The Workbench terminal uses Bun's built-in PTY on POSIX (Linux gated in CI,
 pending its first green run; macOS unverified, see above). On Windows
-it needs `node-pty`, which places a prebuilt binary and a bundled ConPTY DLL
-from its install script; `trustedDependencies` in `package.json` allows that
-script. Everything else runs normally without it — a missing PTY backend
+it uses `bun-pty`, which ships a prebuilt Rust PTY library for each platform
+and loads it through `bun:ffi`: no install script and no build toolchain. Everything else runs normally without it — a missing PTY backend
 disables the terminal and nothing else.
 
 ## Configuration

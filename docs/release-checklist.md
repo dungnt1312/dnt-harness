@@ -80,7 +80,15 @@ Run on Windows with Bun 1.4.3 using an **absolute** Bun path for PM2:
       version.
 - [ ] `dnt-harness start pm2 --name dnt-smoke`. Then `pm2 describe dnt-smoke`
       shows interpreter `bun` (absolute path) and `/api/health` answers 200.
-- [ ] Workbench terminal (node-pty/ConPTY): open bash/PowerShell/cmd,
+- [ ] From the repo checkout (`scripts/` is not in the tarball):
+      `bun scripts/pty-smoke-windows.mjs --require` passes (I/O, resize,
+      natural exit, kill with background-job cleanup, no console-host leak,
+      16 terminals).
+- [ ] The installed bun-pty DLL matches the reviewed one (bun-pty 0.5.1):
+      `rust_pty.dll` SHA-256 `6F45D637E26365BD72A16964453047E2D563F2E3FD0D374A9182C0F38C6F5CFC`,
+      `rust_pty_arm64.dll` SHA-256 `CA64B48DBC617DD5684D405DDE4A605470F05B952153C36EF08A2E39B1D15E76`.
+      Any bun-pty version bump needs a new review and new hashes.
+- [ ] Workbench terminal (bun-pty/ConPTY): open bash/PowerShell/cmd,
       input → output, resize, close (DELETE answers 200), natural `exit`.
 - [ ] `pm2 restart dnt-smoke` and `pm2 stop dnt-smoke` complete within PM2's
       `kill_timeout` (15 s), with no leftover shell processes.

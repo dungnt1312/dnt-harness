@@ -87,8 +87,8 @@ jobs:
     permissions:
       contents: read
 
-  # Build the tarball WITHOUT the OIDC token: `bun install` runs dependency
-  # lifecycle scripts (node-pty) and `npm pack` runs prepack (`vite build`).
+  # Build the tarball WITHOUT the OIDC token: `bun install` and `npm pack`
+  # (prepack runs `vite build`) execute dependency code.
   # None of that code ever sees `id-token: write`.
   pack:
     name: Pack tarball (no OIDC)

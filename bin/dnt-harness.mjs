@@ -132,7 +132,7 @@ function upgrade(rest) {
 
   const managed = run('pm2', ['-v'], { stdio: 'ignore' }).status === 0 && isRegistered(name)
   // Stop first: on Windows a running process keeps its files locked, which
-  // breaks the replacement of native modules such as node-pty.
+  // breaks the replacement of native libraries such as bun-pty's PTY DLL.
   if (managed) must(runVisible('pm2', ['stop', name]))
   const installed = runVisible('bun', ['add', '-g', `dnt-harness@${latest}`])
   // Bring the server back even when the install failed, so it is never left down.

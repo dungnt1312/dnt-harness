@@ -781,10 +781,10 @@ boundaries matter more than the feature:
 - **Shells** come from the shared resolver (`capabilities/shell/detect.ts`) and
   the client renders only what the host reports — zsh and Bash on macOS, Bash
   elsewhere (labelled Git Bash on Windows), and on Windows
-  PowerShell and cmd. On Windows the PTY is created with `useConptyDll`: the
-  default kill path forks a console-list helper that dies with
-  `AttachConsole failed` once the shell has exited, and both paths were
-  measured to reap a backgrounded grandchild.
+  PowerShell and cmd. On Windows the PTY comes from `bun-pty` (ConPTY via
+  portable-pty). Closing it ends the whole console session: background jobs
+  of cmd (`start /b`), PowerShell and Git Bash (`&`) were measured to die with
+  the shell.
 - **cwd** is the conversation's project folder, or the host's `--root`
   otherwise. As with `Bash`, a shell is not path-confined: the user can `cd`
   anywhere the OS user can.
@@ -805,13 +805,14 @@ One stream carries every terminal in a workspace: browsers cap HTTP/1.1 at
 about six connections per origin and the chat stream already holds one.
 Keystrokes POST to `/input` batched per 16 ms frame rather than per character.
 
-On macOS and Linux under Bun the PTY is Bun's built-in `Bun.spawn({ terminal })`;
-node-pty's addon starts processes under Bun but never delivers their output.
-Elsewhere (Windows) `node-pty` is imported lazily. Without it the routes answer
-`501` with the install hint and the rest of the product is untouched.
+On macOS and Linux under Bun the PTY is Bun's built-in `Bun.spawn({ terminal })`.
+On Windows it is `bun-pty` (a prebuilt Rust library loaded through `bun:ffi`,
+no install script), imported lazily. If it cannot load, the routes answer
+`501` with the reason and the rest of the product is untouched.
 
-**Platform support (this release).** Windows (node-pty/ConPTY) has local
-smoke evidence. Linux (Bun 1.4.3 built-in PTY) is gated by
+**Platform support (this release).** Windows (bun-pty/ConPTY) has local
+smoke evidence (`bun scripts/pty-smoke-windows.mjs`: bash, PowerShell, cmd
+I/O, resize, natural exit, kill with background-job cleanup, 16 terminals). Linux (Bun 1.4.3 built-in PTY) is gated by
 `bun scripts/pty-probes.mjs --require` in the `runtime-probes` CI job (pending
 its first green CI run; no Linux evidence is recorded until then). **macOS
 is unverified.** The `ps`/tty session inspector exists, but no zsh/Bash
@@ -823,8 +824,9 @@ See [release-checklist.md](release-checklist.md).
 - A terminal moves `running → closing → exited | failedTeardown`. Delete, idle
   reap, natural exit and shutdown all share one idempotent teardown. On POSIX
   it closes the PTY, sends HUP to the shell and its session members, escalates
-  to KILL after 1 s, and then reports an explicit failure. Windows keeps the
-  node-pty kill path.
+  to KILL after 1 s, and then reports an explicit failure. On Windows closing
+  the ConPTY is the kill; the exit is confirmed only once the shell PID is
+  gone, never on bun-pty's synthetic exit event alone.
 - `DELETE …/terminals/:tid` **awaits** teardown. It answers `200 {killed:true}`
   only after exit is confirmed, `500 {killed:false,error}` when teardown fails,
   and `409` while another close is in progress. A failed terminal keeps its

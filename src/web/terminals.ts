@@ -12,9 +12,10 @@
  * scrollback lives in a capped in-memory ring per terminal and dies with the
  * host. A page reload replays that ring and reattaches; a host restart does not.
  *
- * `node-pty` is imported lazily and its absence is a reported state, never a
- * boot failure: the rest of the product must serve normally on a machine where
- * the native module never built.
+ * Backends: Bun's built-in PTY on POSIX, `bun-pty` (prebuilt Rust library via
+ * `bun:ffi`) on Windows. `bun-pty` is imported lazily and its absence is a
+ * reported state, never a boot failure: the rest of the product must serve
+ * normally on a host where the library cannot load.
  *
  * Lifecycle (RH-3): `running → closing → exited | failedTeardown`. Every close
  * path — delete, idle reap, natural exit, shutdown — goes through one shared,
@@ -24,7 +25,7 @@
  * retried explicitly, by the reaper, or by `disposeAll`.
  */
 import { randomUUID } from 'node:crypto'
-import { chmod } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { shellCatalog, type ShellId, type ShellOption } from '../capabilities/shell/detect.ts'
@@ -45,8 +46,8 @@ const REAP_INTERVAL_MS = 60_000
 const ESCALATE_MS = 1_000
 /**
  * After KILL, how long to wait for exit confirmation before declaring the
- * teardown failed. Windows has no KILL path (node-pty closes the ConPTY), and
- * a shell killed while still starting was measured to report its exit only
+ * teardown failed. Windows has no KILL path (closing the ConPTY is the kill),
+ * and a shell killed while still starting was measured to report its exit only
  * after ~2.5s with 16 terminals at once, so it gets a longer confirmation wait.
  */
 const KILL_GRACE_MS = process.platform === 'win32' ? 2_500 : 1_000
@@ -100,9 +101,9 @@ export type TerminalEvent =
 export type TerminalListener = (event: TerminalEvent) => void
 
 /**
- * The subset of a PTY process this service relies on. `node-pty`'s `IPty`
- * satisfies the required members; the optional ones are teardown hooks the
- * built-in Bun adapter provides.
+ * The subset of a PTY process this service relies on. Both adapters provide the
+ * required members; the optional ones are teardown hooks only the built-in Bun
+ * (POSIX) adapter provides.
  */
 export interface PtyHandle {
   /** May return a disposable (`{ dispose() }`), which is released once the terminal has exited. */
@@ -110,7 +111,7 @@ export interface PtyHandle {
   onExit(listener: (event: { exitCode: number }) => void): unknown
   write(data: string): void
   resize(cols: number, rows: number): void
-  /** Request termination with the backend's own close semantics (node-pty: HUP / ConPTY close; Bun adapter: SIGHUP). */
+  /** Request termination with the backend's own close semantics (bun-pty: ConPTY close; Bun adapter: SIGHUP). */
   kill(): void
   /** Shell PID. Used on POSIX to own the PTY session's processes. */
   readonly pid?: number
@@ -127,17 +128,6 @@ export interface PtySpawnOptions {
   readonly rows: number
   readonly cwd: string
   readonly env: Record<string, string>
-  /**
-   * Windows only. node-pty's default kill path forks a
-   * `conpty_console_list_agent` helper to enumerate console processes; once
-   * the shell has already exited that helper dies with `AttachConsole failed`
-   * and prints a stack trace, which would appear on every terminal close and
-   * four times over on shutdown. The DLL path forks nothing. Both were
-   * measured to reap a backgrounded grandchild, so this buys quiet without
-   * giving up cleanup. The DLL ships with the same post-install step that
-   * places the native binding, so if `node-pty` imported at all, it is there.
-   */
-  readonly useConptyDll?: boolean
 }
 
 /** Injectable PTY backend — the test suite supplies a fake, so the suite needs no native module. */
@@ -254,24 +244,6 @@ interface LiveTerminal {
 }
 
 /**
- * node-pty's npm tarball stores the macOS `spawn-helper` helper executable with
- * mode 0644, so `posix_spawnp` fails with every command it is asked to launch
- * and every terminal open reports a bare "could not start". Restore the
- * execute bit once per load; EACCES/EROFS are swallowed because a failed heal
- * must not turn into a broken host.
- */
-async function healSpawnHelperExecBit(): Promise<void> {
-  if (process.platform !== 'darwin') return
-  try {
-    const pkgDir = path.dirname(createRequire(import.meta.url).resolve('node-pty/package.json'))
-    await chmod(path.join(pkgDir, 'prebuilds', 'darwin-arm64', 'spawn-helper'), 0o755).catch(() => {})
-    await chmod(path.join(pkgDir, 'prebuilds', 'darwin-x64', 'spawn-helper'), 0o755).catch(() => {})
-  } catch {
-    // No resolvable node-pty install: the load below reports that itself.
-  }
-}
-
-/**
  * The slice of Bun's built-in PTY (`Bun.spawn({ terminal })`, POSIX only) used
  * here. Verified against Bun 1.4.3 at runtime: `Subprocess` has `pid`,
  * `kill(signal)`, `exited`, `exitCode`, `terminal`; `Terminal` has `write`,
@@ -292,7 +264,7 @@ export interface BunPtyRuntime {
   }
 }
 
-/** Bun's own PTY: node-pty's native addon starts processes under Bun but never delivers their output. */
+/** Bun's own PTY (`Bun.spawn({ terminal })`). POSIX only. */
 export function bunPtySpawner(bun: BunPtyRuntime): PtySpawner {
   return {
     spawn(file, args, options) {
@@ -333,26 +305,186 @@ export function bunPtySpawner(bun: BunPtyRuntime): PtySpawner {
   }
 }
 
-/** The default backend: Bun's PTY on POSIX Bun, otherwise `node-pty`, loaded on first use. */
-function nodePtySpawner(): { spawner: PtySpawner; load: () => Promise<string | undefined> } {
+/**
+ * The slice of `bun-pty`'s `IPty` used here. Behaviour verified against
+ * bun-pty 0.5.1 on Windows (ConPTY via portable-pty):
+ * - `kill()` terminates the child, closes the PTY handle, then fires a
+ *   synthetic `onExit({ exitCode: 0 })` synchronously, and later calls are
+ *   no-ops. The read loop stops, so the real exit is never reported after a
+ *   kill.
+ * - A natural exit fires `onExit` once, but does NOT release the native handle:
+ *   only `kill()` reaches `bun_pty_close`. Without it every exited terminal
+ *   keeps its ConPTY and console host alive (measured: +1 conhost per exit).
+ * - Exit codes are passed through as reported. PowerShell and Git Bash report
+ *   the shell's code; cmd was measured reporting 1 for `exit 0` on some runs.
+ * - Background jobs of cmd/PowerShell/Git Bash died with the shell (ConPTY
+ *   closes the whole console session).
+ * - Importing the package swallows a failed `dlopen` (it logs and leaves the
+ *   library unset), so `loadBunPty` checks the library loads before use.
+ */
+export interface BunPtyModule {
+  spawn(file: string, args: string[], options: { name: string; cols: number; rows: number; cwd: string; env: Record<string, string> }): {
+    readonly pid: number
+    onData(listener: (data: string) => void): { dispose(): void }
+    onExit(listener: (event: { exitCode: number }) => void): { dispose(): void }
+    write(data: string): void
+    resize(cols: number, rows: number): void
+    kill(signal?: string): void
+  }
+}
+
+/**
+ * EPERM counts as alive: it means a process we may not signal holds the PID,
+ * which after our shell exited can only be a reused PID. Reporting that as
+ * "alive" errs toward a failed (retryable) teardown, never a false success.
+ */
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * `bun-pty` adapter (Windows). It reports exactly one exit per terminal, only
+ * once the shell PID is actually gone: the synthetic exit `kill()` fires is
+ * held until the process has disappeared, so teardown never confirms on an
+ * event alone. A shell still alive at the deadline is not reported; the
+ * service's teardown then fails explicitly, and its retry calls `kill()`
+ * again, which restarts the confirmation.
+ */
+export function bunPtyLibSpawner(lib: BunPtyModule, options: { pollMs?: number; deadlineMs?: number } = {}): PtySpawner {
+  const pollMs = options.pollMs ?? 25
+  const deadlineMs = options.deadlineMs ?? 10_000
+  return {
+    spawn(file, args, spawnOptions) {
+      const pty = lib.spawn(file, [...args], {
+        name: spawnOptions.name,
+        cols: spawnOptions.cols,
+        rows: spawnOptions.rows,
+        cwd: spawnOptions.cwd,
+        env: spawnOptions.env,
+      })
+      const pid = pty.pid
+      const exitListeners = new Set<(event: { exitCode: number }) => void>()
+      let killed = false
+      let reported = false
+      let confirming = false
+      const report = (exitCode: number): void => {
+        if (reported) return
+        reported = true
+        for (const listener of [...exitListeners]) listener({ exitCode })
+      }
+      /** Report the exit once the PID is gone; give up at the deadline (a later kill() retries). */
+      const confirmGone = (exitCode: number): void => {
+        if (confirming || reported) return
+        confirming = true
+        const deadline = Date.now() + deadlineMs
+        const tick = (): void => {
+          if (!isAlive(pid)) {
+            confirming = false
+            return report(exitCode)
+          }
+          if (Date.now() >= deadline) {
+            confirming = false
+            return
+          }
+          const timer = setTimeout(tick, pollMs)
+          timer.unref?.()
+        }
+        tick()
+      }
+      pty.onExit((event) => {
+        if (killed) {
+          // Synthetic exit from kill(): confirm against the OS, not the event.
+          confirmGone(event.exitCode)
+          return
+        }
+        // Natural exit: report the real code, then release the native handle.
+        // bun-pty frees the ConPTY/console host only in kill(); the synthetic
+        // exit that kill() fires is ignored because `reported` is already set.
+        report(event.exitCode)
+        killed = true
+        try { pty.kill() } catch { /* the process is already gone */ }
+      })
+      return {
+        pid,
+        onData: (listener) => pty.onData(listener),
+        onExit: (listener) => {
+          exitListeners.add(listener)
+          // The library-side listener stays: it must still release the native
+          // handle on a natural exit even when nobody is listening any more.
+          return { dispose: () => exitListeners.delete(listener) }
+        },
+        write: (data) => pty.write(data),
+        resize: (cols, rows) => pty.resize(cols, rows),
+        kill: () => {
+          if (reported) return
+          if (killed) {
+            // A retry after a failed teardown: bun-pty's kill() is a no-op by
+            // now, so re-check whether the shell has gone since.
+            confirmGone(0)
+            return
+          }
+          killed = true
+          pty.kill()
+        },
+      }
+    },
+  }
+}
+
+/** The PTY library file bun-pty itself would load (its `BUN_PTY_LIB` override first). */
+function bunPtyLibraryPath(): string {
+  const override = process.env['BUN_PTY_LIB']
+  if (override !== undefined && override !== '' && existsSync(override)) return override
+  const pkgDir = path.dirname(createRequire(import.meta.url).resolve('bun-pty/package.json'))
+  const name = process.arch === 'arm64' ? 'rust_pty_arm64.dll' : 'rust_pty.dll'
+  return path.join(pkgDir, 'rust-pty', 'target', 'release', name)
+}
+
+/**
+ * Load bun-pty and prove its native library opens. bun-pty's own import logs
+ * and swallows a failed `dlopen` (wrong architecture, quarantined DLL), which
+ * would leave the backend "available" with every spawn failing as a bad
+ * shell. Opening the same file here turns that into a reported unavailability.
+ */
+async function loadBunPty(): Promise<BunPtyModule> {
+  const file = bunPtyLibraryPath()
+  if (!existsSync(file)) throw new Error(`PTY library not found at ${file}`)
+  // A variable specifier: the repo carries no Bun type package, and this path
+  // only runs under Bun (defaultSpawner checks for the runtime first).
+  const ffiModule = 'bun:ffi'
+  const ffi = (await import(ffiModule)) as {
+    dlopen(path: string, symbols: Record<string, { args: string[]; returns: string }>): { close(): void }
+  }
+  ffi.dlopen(file, { bun_pty_get_pid: { args: ['i32'], returns: 'i32' } }).close()
+  return (await import('bun-pty')) as unknown as BunPtyModule
+}
+
+/** The default backend: Bun's PTY on POSIX Bun, otherwise `bun-pty`, loaded on first use. */
+function defaultSpawner(): { spawner: PtySpawner; load: () => Promise<string | undefined> } {
   const bun = (globalThis as { Bun?: BunPtyRuntime }).Bun
   if (bun !== undefined && process.platform !== 'win32') {
     return { spawner: bunPtySpawner(bun), load: async () => undefined }
   }
-  let loaded: { spawn: (file: string, args: string[], opts: unknown) => PtyHandle } | undefined
+  let loaded: PtySpawner | undefined
   let failure: string | undefined
   const load = async (): Promise<string | undefined> => {
     if (loaded !== undefined || failure !== undefined) return failure
-    await healSpawnHelperExecBit()
+    if (bun === undefined) {
+      failure = 'terminals need the Bun runtime (bun-pty loads its PTY library through bun:ffi)'
+      return failure
+    }
     try {
-      loaded = (await import('node-pty')) as unknown as typeof loaded
+      loaded = bunPtyLibSpawner(await loadBunPty())
       return undefined
     } catch (error) {
       // Mirrors how the Bash tool disables itself: an actionable reason, never
       // a silent substitution.
-      failure =
-        `node-pty is not available (${String(error)}); install it and allow its build ` +
-        `(bun: trustedDependencies, npm: 'npm install-scripts approve node-pty')`
+      failure = `bun-pty is not available (${String(error)}); reinstall dependencies with 'bun install'`
       return failure
     }
   }
@@ -360,8 +492,8 @@ function nodePtySpawner(): { spawner: PtySpawner; load: () => Promise<string | u
     load,
     spawner: {
       spawn(file, args, options) {
-        if (loaded === undefined) throw new TerminalError('unavailable', failure ?? 'node-pty is not loaded')
-        return loaded.spawn(file, [...args], options)
+        if (loaded === undefined) throw new TerminalError('unavailable', failure ?? 'bun-pty is not loaded')
+        return loaded.spawn(file, args, options)
       },
     },
   }
@@ -401,7 +533,8 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
   const killGraceMs = options.teardown?.killGraceMs ?? KILL_GRACE_MS
   const pollMs = options.teardown?.pollMs ?? POLL_MS
 
-  const fallback = nodePtySpawner()
+  const fallback = defaultSpawner()
+  const backendName = process.platform === 'win32' ? 'bun-pty' : 'bun'
   const injected = options.spawner
   const terminals = new Map<string, LiveTerminal>()
   const listeners = new Map<WorkspaceId, Set<TerminalListener>>()
@@ -696,7 +829,7 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
       if (injected !== undefined) return { available: true, hint }
       const failure = await fallback.load()
       available = failure === undefined
-      hint = failure ?? 'node-pty'
+      hint = failure ?? backendName
       return { available, hint }
     },
 
@@ -724,7 +857,7 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
       if (injected === undefined) {
         const failure = await fallback.load()
         available = failure === undefined
-        hint = failure ?? 'node-pty'
+        hint = failure ?? backendName
         if (failure !== undefined) throw new TerminalError('unavailable', failure)
       }
       const catalog = shellCatalog()
@@ -745,13 +878,11 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
           rows,
           cwd: input.cwd,
           env: ptyEnv(),
-          ...(process.platform === 'win32' ? { useConptyDll: true } : {}),
         })
       } catch (error) {
         // A raw spawn failure would escape as a 500 carrying the shell path and
-        // command line. Report the reason (node-pty's own message, e.g. the
-        // macOS "posix_spawnp failed." when its spawn-helper lost the execute
-        // bit) without the host's file layout.
+        // command line. Report the backend's own reason (e.g. bun-pty's
+        // "PTY spawn failed") without the host's file layout.
         if (error instanceof TerminalError) throw error
         const reason = error instanceof Error ? error.message : String(error)
         throw new TerminalError('bad-shell', `could not start ${shell.label} in '${input.cwd}': ${reason}`)

@@ -393,7 +393,7 @@ describe('terminal HTTP surface', () => {
       terminals: {
         spawner: {
           spawn() {
-            throw new TerminalError('unavailable', 'node-pty is not available (test)')
+            throw new TerminalError('unavailable', 'bun-pty is not available (test)')
           },
         },
       },
@@ -405,7 +405,7 @@ describe('terminal HTTP surface', () => {
       body: JSON.stringify({ cols: 80, rows: 24 }),
     })
     expect(response.status).toBe(501)
-    expect(((await response.json()) as { error: string }).error).toMatch(/node-pty/)
+    expect(((await response.json()) as { error: string }).error).toMatch(/bun-pty/)
   })
 
   it('answers DELETE only after teardown, and reports a failed teardown instead of success', async () => {

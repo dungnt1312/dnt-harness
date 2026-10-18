@@ -7948,7 +7948,7 @@ async function handleApi(
             return
           }
           // `NaN < 1` is false, so a bare range check lets NaN and Infinity
-          // through to node-pty, which throws a plain Error and turns a bad
+          // through to the PTY backend, which throws a plain Error and turns a bad
           // request into a 500.
           const cols = terminalDimension(body['cols'])
           const rows = terminalDimension(body['rows'])
