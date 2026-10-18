@@ -25,6 +25,9 @@ export function maxOutputTokenOverrides(entry: ProviderConfig): Record<string, n
   return out
 }
 
+/** What one configured provider serves: chat completions, transcription, or both. */
+export type ProviderKind = 'chat' | 'stt'
+
 /** One configured OpenAI-completions provider, persisted as JSON. */
 export interface ProviderConfig {
   readonly id: string
@@ -33,6 +36,8 @@ export interface ProviderConfig {
   readonly apiKey: string
   readonly models: readonly string[]
   readonly enabled: boolean
+  /** Absent means `['chat']`; `['stt']` keeps the provider out of every chat surface. */
+  readonly kinds?: readonly ProviderKind[]
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
   /**
    * Reasoning overrides, opencode-style `{ reasoningField?, requireReasoning?,
@@ -79,6 +84,19 @@ export function parseCompatibility(candidate: Record<string, unknown>, providerI
     warn(`ignoring invalid legacy reasoning entry: ${error instanceof Error ? error.message : 'invalid'}`)
     return hasRaw ? { rawCompatibility: raw } : {}
   }
+}
+
+/** Parse a `kinds` value (request body or JSON row): junk drops, absent/empty means undefined (chat). */
+export function parseKinds(raw: unknown): readonly ProviderKind[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const kinds = [...new Set(raw.filter((kind): kind is ProviderKind => kind === 'chat' || kind === 'stt'))]
+  return kinds.length === 0 ? undefined : [...kinds].sort()
+}
+
+/** Does this provider serve the named kind? Absent kinds means chat-only. */
+export function servesKind(entry: ProviderConfig, kind: ProviderKind): boolean {
+  const kinds = entry.kinds ?? ['chat']
+  return kinds.includes(kind)
 }
 
 export interface ModelDefaults {
@@ -241,6 +259,7 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
     const id = candidate['id']; const name = candidate['name']; const baseUrl = candidate['baseUrl']; const apiKey = candidate['apiKey']
     if (typeof id !== 'string' || id === '' || typeof name !== 'string' || name === '' || typeof baseUrl !== 'string' || baseUrl === '' || typeof apiKey !== 'string') continue
     const models = Array.isArray(candidate['models']) ? candidate['models'].filter((model): model is string => typeof model === 'string') : []
+    const kinds = parseKinds(candidate['kinds'])
     const modelSettings: Record<string, ModelSettings> = {}
     if (candidate['contextLimits'] !== null && typeof candidate['contextLimits'] === 'object' && !Array.isArray(candidate['contextLimits'])) {
       for (const [model, tokens] of Object.entries(candidate['contextLimits'] as Record<string, unknown>)) {
@@ -261,7 +280,7 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
       }
     }
     const compat = parseCompatibility(candidate, id)
-    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...compat })
+    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(kinds !== undefined ? { kinds } : {}), ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...compat })
   }
   return out
 }

@@ -1243,6 +1243,33 @@ export function setImageUnderstandingSettings(update: ImageUnderstandingSettings
   }).then((r) => json<ImageUnderstandingSettings>(r))
 }
 
+/** Settings → Providers & Models → Speech-to-text: the dictation model (OpenAI-compatible /audio/transcriptions). */
+export type SpeechToTextSettings = ImageGenerationSettings
+
+export function getSpeechToTextSettings(): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text').then((r) => json<SpeechToTextSettings>(r))
+}
+
+export function setSpeechToTextSettings(update: SpeechToTextSettings): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<SpeechToTextSettings>(r))
+}
+
+/** Dictate one audio blob to text; the server proxies the configured provider. */
+export async function transcribeSpeech(blob: Blob, language?: string): Promise<string> {
+  const query = language !== undefined && language !== '' ? `?language=${encodeURIComponent(language)}` : ''
+  const response = await apiFetch(`/api/speech-to-text/transcribe${query}`, {
+    method: 'POST',
+    headers: { 'content-type': blob.type !== '' ? blob.type : 'application/octet-stream' },
+    body: blob,
+  })
+  if (!response.ok) throw new Error(((await response.json().catch(() => ({}))) as { error?: string }).error ?? `transcription failed (${response.status})`)
+  return ((await response.json()) as { text: string }).text
+}
+
 /** Settings → Providers & Models → Videos: the provider/model the GenerateVideo tool calls. */
 export type VideoGenerationSettings = ImageGenerationSettings
 

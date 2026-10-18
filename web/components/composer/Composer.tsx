@@ -10,6 +10,7 @@ import { RichInput, type CaretBookmark, type RichInputHandle } from './RichInput
 import { ThinkingMenu } from './ThinkingMenu.tsx'
 import { SAFE_MODEL_VISIBLE_BYTES, utf8Bytes } from './paste-classification.ts'
 import { useUploadQueue } from './useUploadQueue.ts'
+import { useDictation } from './useDictation.ts'
 import { cn } from '../../lib/cn.ts'
 import { decodeModelChoice } from '../../lib/providers.ts'
 import {
@@ -221,6 +222,13 @@ export function Composer({
       return next
     })
   }
+
+  // ── Dictation ──────────────────────────────────────────────────────────
+
+  const { state: dictation, supported: dictationSupported, toggle: toggleDictation } = useDictation(
+    (text) => { editor.current?.insertAtCaret({ kind: 'text', text: `${text} ` }); editor.current?.focus() },
+    (message) => notify(message),
+  )
 
   // ── Completion (`@` files, `/` and `$` skills) ──────────────────────────
 
@@ -563,6 +571,19 @@ export function Composer({
               onUpload={onUploadFiles !== undefined ? () => fileInput.current?.click() : undefined}
               onMention={onSearchFiles !== undefined ? mentionFile : undefined}
             />
+          ) : null}
+          {dictationSupported ? (
+            <button
+              type="button"
+              data-compact-control
+              aria-label={dictation === 'recording' ? 'Stop dictation' : 'Dictate a message'}
+              aria-pressed={dictation === 'recording'}
+              title={dictation === 'recording' ? 'Stop dictation' : 'Dictate — speech becomes text'}
+              onClick={toggleDictation}
+              className={cn('flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-9', dictation === 'recording' && 'text-bad hover:text-bad')}
+            >
+              {dictation === 'transcribing' ? <Spinner size={14} /> : <Icon name="mic" size={16} />}
+            </button>
           ) : null}
           {modeValue !== null && modes.length > 0 ? <ModeMenu modes={modes} value={modeValue} {...(modeMenuLabel !== undefined ? { label: modeMenuLabel } : {})} onChange={onMode} /> : null}
           {folderControl}
