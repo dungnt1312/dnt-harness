@@ -5,6 +5,8 @@ import { AxeBuilder } from '@axe-core/playwright'
 import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { openWorkbench, selectWorkbenchView } from './workbench-nav.ts'
+import { DEFAULT_LIMITS } from '../../src/harness/limits.ts'
+import { LIMIT_FIELDS } from '../../src/harness/limits-config.ts'
 
 const screenshotRoot = fileURLToPath(new URL('../../artifacts/product-ui/chat/matrix', import.meta.url))
 const REQUIRED_WIDTHS = [320, 375, 768, 1024, 1440, 1920] as const
@@ -24,6 +26,13 @@ interface Fixture {
 }
 
 const SESSION_PATH = '/api/workspaces/w/sessions/s'
+/** Global configuration descriptor: an empty file, every limit inherited. */
+const APP_CONFIG_VIEW = {
+  document: { v: 1 }, hash: 'app-config-hash',
+  active: { revision: 0, values: DEFAULT_LIMITS }, inherited: DEFAULT_LIMITS,
+  fields: LIMIT_FIELDS.map((field) => ({ ...field, source: 'library', locked: false, shadowed: false })),
+  outOfSync: false,
+}
 const EVENTS_PATH = `${SESSION_PATH}/events`
 
 function fixtureEvents(state: FixtureState): readonly unknown[] {
@@ -161,6 +170,11 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       if (path === '/api/providers/fixture-provider' && method === 'PATCH') { provider = { ...provider, ...(body as object) }; return json(route, provider) }
       if (path === '/api/providers/fixture-provider' && method === 'DELETE') { providerDeleted = true; return json(route, { deleted: true }) }
       if (path === '/api/providers/fixture-provider/test' && method === 'POST') return json(route, { ok: true })
+      if (path === '/api/app-config' && method === 'GET') return json(route, APP_CONFIG_VIEW)
+      if (path === '/api/app-config' && method === 'PATCH') {
+        const value = (body as { edits: { value: number }[] }).edits[0]!.value
+        return json(route, { ...APP_CONFIG_VIEW, hash: 'app-config-saved', document: { v: 1, limits: { toolTimeoutMs: value } }, fields: APP_CONFIG_VIEW.fields.map((field) => field.key === 'toolTimeoutMs' ? { ...field, source: 'file', fileValue: value } : field) })
+      }
       // The probe answers without storing anything, as the server does.
       if (path === '/api/providers/fixture-provider/models' && method === 'GET') return json(route, { ok: true, models: ['fixture-model', 'fixture-next'] })
       // Sync persists the fetched list, as the server does.
@@ -245,7 +259,7 @@ function expectNoMutationRequests(state: Fixture, before: number): void {
 }
 
 for (const width of [320, 375, 768, 1024, 1440]) {
-  test(`settings keeps all eight sections reachable with keyboard navigation at ${width}px`, async ({ page }) => {
+  test(`settings keeps all nine sections reachable with keyboard navigation at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 })
     const state = await fixture(page, 'settings')
     const trigger = await settingsTrigger(page)
@@ -253,7 +267,7 @@ for (const width of [320, 375, 768, 1024, 1440]) {
     await trigger.click()
     const dialog = page.getByRole('dialog', { name: 'Settings' })
     await expect(dialog).toBeVisible()
-    const labels = ['Providers', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']
+    const labels = ['Providers', 'Advanced', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']
     if (width <= 600) {
       const section = page.getByRole('combobox', { name: 'Settings section' })
       await expect(section).toBeVisible()
@@ -266,7 +280,7 @@ for (const width of [320, 375, 768, 1024, 1440]) {
       const providers = dialog.getByRole('tab', { name: /Providers/ })
       await providers.focus()
       await page.keyboard.press('ArrowDown')
-      await expect(dialog.getByRole('tab', { name: /Projects/ })).toBeFocused()
+      await expect(dialog.getByRole('tab', { name: /Advanced/ })).toBeFocused()
       for (const label of labels) {
         const tab = dialog.getByRole('tab', { name: new RegExp(`^${label}`) }).first()
         await tab.click()
@@ -311,6 +325,44 @@ for (const width of [375, 1024]) {
     await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeVisible()
     await page.getByRole('button', { name: 'Cancel' }).click()
     await expect(dialog.getByLabel('Name', { exact: true })).toHaveValue('Dirty provider')
+  })
+}
+
+for (const width of [375, 1024]) {
+  test(`advanced limits draft is guarded on ${width <= 600 ? 'mobile Select' : 'desktop tabs'} at ${width}px and saves only the changed field`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 })
+    const state = await fixture(page, 'settings')
+    await (await settingsTrigger(page)).click()
+    const dialog = page.getByRole('dialog', { name: 'Settings' })
+    const goTo = async (label: string): Promise<void> => {
+      if (width <= 600) {
+        await page.getByRole('combobox', { name: 'Settings section' }).click()
+        await page.getByRole('option', { name: label, exact: true }).click()
+      } else await dialog.getByRole('tab', { name: new RegExp(`^${label}`) }).click()
+    }
+    await goTo('Advanced')
+    await expect(dialog.getByText('All workspaces')).toBeVisible()
+    const timeout = dialog.getByLabel('Tool timeout', { exact: true })
+    await expect(timeout).toHaveValue(String(APP_CONFIG_VIEW.inherited.toolTimeoutMs))
+    await timeout.fill('300000')
+    await goTo('Projects')
+    const confirm = page.getByRole('dialog', { name: 'Discard unsaved advanced settings?' })
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    await expect(timeout).toHaveValue('300000')
+    await page.keyboard.press('Escape')
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Cancel' }).click()
+    expectNoMutationRequests(state, 0)
+    await dialog.getByRole('button', { name: 'Save changes' }).click()
+    await expect.poll(() => state.count('PATCH', '/api/app-config')).toBe(1)
+    const patch = state.requests().find(request => request.method === 'PATCH' && request.path === '/api/app-config')?.body
+    expect(patch).toEqual({ expectedHash: 'app-config-hash', edits: [{ op: 'set', key: 'toolTimeoutMs', value: 300000 }] })
+    await expect(timeout).toHaveValue('300000')
+    // Saved: leaving no longer asks.
+    await goTo('Projects')
+    await expect(confirm).toHaveCount(0)
+    await expect(dialog.getByRole('heading', { name: 'Projects', exact: true }).first()).toBeVisible()
   })
 }
 
@@ -852,7 +904,7 @@ test('axe gates shell, drawers, Context, Trajectory, approval, and every setting
   await fixture(settingsPage, 'settings')
   await (await settingsTrigger(settingsPage)).click()
   const dialog = settingsPage.getByRole('dialog', { name: 'Settings' })
-  for (const label of ['Providers', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']) {
+  for (const label of ['Providers', 'Advanced', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']) {
     await dialog.getByRole('tab', { name: new RegExp(label) }).click()
     await expectAxeClean(settingsPage, '[role="dialog"][aria-label="Settings"]')
   }

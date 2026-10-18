@@ -110,11 +110,34 @@ export const DEFAULT_LIMITS: HarnessLimits = {
 }
 
 const BOOLEAN_LIMITS: ReadonlySet<keyof HarnessLimits> = new Set(['compactionEffectiveEnabled', 'compactionPrecomputeEnabled'])
-const INTEGER_LIMITS: ReadonlySet<string> = new Set([
+/**
+ * Keys whose values must be whole numbers (durations feeding timers, token
+ * budgets and retry/backoff/concurrency counts). Other numeric keys accept
+ * legacy fractions.
+ */
+const INTEGER_LIMITS: ReadonlySet<keyof HarnessLimits> = new Set([
   'streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency',
   'compactionDeadlineMs', 'compactionOutputTokens', 'compactionCandidateWaitMs',
 ])
-const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs', 'approvalExpiryMs'])
+/** The only keys where 0 is an accepted value: each treats it as "off", "none" or "forever". */
+const ZERO_CAPABLE_LIMITS: ReadonlySet<keyof HarnessLimits> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs', 'approvalExpiryMs'])
+
+/**
+ * One accepted-value predicate for every limit: booleans for the rollout
+ * switches, a fraction in (0, 1] for the precompute pressure, and otherwise
+ * finite numbers within [0, MAX_TIMER_MS], whole numbers on the integer keys,
+ * 0 only where a limit doubles as an off switch. resolveLimits filters
+ * overrides through this; the strict config parser (limits-config.ts) reuses
+ * it verbatim so the two paths can never drift.
+ */
+export function isValidLimit<K extends keyof HarnessLimits>(key: K, value: unknown): value is HarnessLimits[K] {
+  if (BOOLEAN_LIMITS.has(key)) return typeof value === 'boolean'
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false
+  if (key === 'compactionPrecomputePressure') return value > 0 && value <= 1
+  if (INTEGER_LIMITS.has(key) && !Number.isSafeInteger(value)) return false
+  if (!(ZERO_CAPABLE_LIMITS.has(key) ? value >= 0 : value > 0)) return false
+  return value <= MAX_TIMER_MS
+}
 
 /** Merge overrides; invalid request durations/counts (including fractions) use defaults. */
 export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
@@ -122,18 +145,7 @@ export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
   const merged: Record<string, number | boolean> = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(DEFAULT_LIMITS) as (keyof HarnessLimits)[]) {
     const value = partial[key]
-    if (BOOLEAN_LIMITS.has(key)) {
-      if (typeof value === 'boolean') merged[key] = value
-      continue
-    }
-    if (key === 'compactionPrecomputePressure') {
-      if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1) merged[key] = value
-      continue
-    }
-    const zeroCapable = ZERO_CAPABLE_LIMITS.has(key)
-    if (typeof value === 'number' && Number.isFinite(value) && (!INTEGER_LIMITS.has(key) || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
-      merged[key] = value
-    }
+    if (isValidLimit(key, value)) merged[key] = value
   }
   return merged as unknown as HarnessLimits
 }

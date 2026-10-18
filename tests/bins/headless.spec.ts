@@ -439,4 +439,44 @@ describe('headless CLI', () => {
       }
     }, 30_000)
   })
+
+  it('loads the same app-config file contract: valid overrides apply, malformed files refuse without leaking the lock', async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-config-'))
+    const configFile = path.join(dataDir, 'app-config.json')
+    const lockFile = path.join(dataDir, 'mcp-owner.lock')
+    const requests: string[] = []
+    const provider = createServer(async (req, res) => {
+      let raw = ''
+      for await (const chunk of req) raw += chunk
+      requests.push(raw)
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
+    })
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+    const env = { DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${(provider.address() as { port: number }).port}` }
+    try {
+      await writeFile(configFile, JSON.stringify({ v: 1, limits: { bogus: 1 } }))
+      const refused = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--message', 'hello'], env)
+      expect(refused.code, refused.stderr).toBe(1)
+      expect(refused.stderr).toContain('app-config.json')
+      expect(refused.stderr).toContain('unknown limit key: bogus')
+      expect(requests).toHaveLength(0)
+      await expect(readFile(lockFile)).rejects.toThrow()
+
+      // A startup failure after the lock was taken still releases it.
+      await writeFile(configFile, JSON.stringify({ v: 1, limits: { toolTimeoutMs: 1234, bashMaxWaitMs: 5678 } }))
+      const missingRoot = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--root', path.join(dataDir, 'no-such-root'), '--message', 'hello'], env)
+      expect(missingRoot.code, missingRoot.stderr).toBe(1)
+      await expect(readFile(lockFile)).rejects.toThrow()
+
+      const ok = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--message', 'hello'], env)
+      expect(ok.code, ok.stderr).toBe(0)
+      expect(requests).toHaveLength(1)
+      // The advertised Bash budget follows the file's live limits.
+      expect(requests[0]).toContain('default 1234, max 5678')
+      await expect(readFile(lockFile)).rejects.toThrow()
+    } finally {
+      await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+    }
+  }, 60_000)
 })

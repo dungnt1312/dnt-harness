@@ -25,6 +25,7 @@
  * selected model before it reaches the wire.
  */
 import { createInterface } from 'node:readline/promises'
+import { inspect } from 'node:util'
 import path from 'node:path'
 import { loadRepoEnv, readApiKey, resolveAppHome } from './env.ts'
 import {
@@ -51,8 +52,10 @@ import {
   type SessionsService,
   DataHomeLock,
   OwnershipError,
+  AppConfigService,
+  AppConfigStore,
+  APP_CONFIG_FILE,
 } from '../index.ts'
-import { DEFAULT_LIMITS } from '../harness/limits.ts'
 import { createProcessSessionEventBridge } from '../harness/processes/session-event-bridge.ts'
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
@@ -285,6 +288,18 @@ async function main(): Promise<void> {
   } else if (selectedModel === undefined) {
     process.stderr.write(`no model selected for provider '${selectedProvider}', which advertises none: pass --model.\n`)
   }
+  // Global limits from `<data-dir>/app-config.json`, the same file contract
+  // as the web host. Booted before the data-home lock: an invalid file
+  // refuses to start with nothing acquired.
+  const appConfigFile = path.join(dataDir, APP_CONFIG_FILE)
+  const appConfig = new AppConfigService(new AppConfigStore(appConfigFile))
+  try {
+    await appConfig.boot()
+  } catch (error) {
+    process.stderr.write(`dnt-harness: cannot load '${appConfigFile}': ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+    return
+  }
   // One writer per data home: a web host (or another CLI) on the same
   // directory would append independent sequence numbers to shared logs.
   let ownerLock: DataHomeLock
@@ -300,156 +315,164 @@ async function main(): Promise<void> {
   }
 
   const kernel = new Kernel()
-  kernel.ctx.plugin(fileSessions(dataDir))
-  kernel.ctx.provide('limits', DEFAULT_LIMITS)
-  kernel.ctx.plugin(LlmService)
-  kernel.ctx.plugin(ToolsService)
-  kernel.ctx.plugin(AgentsService)
-  // One data home, workspace-scoped sessions: the CLI works inside the
-  // home's Default workspace (stable id, idempotently migrated).
-  const workspaces = new WorkspaceService(dataDir)
-  await workspaces.boot()
-  kernel.ctx.provide('workspaces', workspaces)
-  await kernel.ctx.sessions.boot()
-  const workspaceId = workspaces.defaultWorkspace
-  const canonicalRoot = await fs.realpath(path.resolve(root))
-  const project = workspaces.listProjects(workspaceId).find((record) => record.path === canonicalRoot)
-    ?? await workspaces.createProject(workspaceId, path.basename(canonicalRoot), canonicalRoot)
-  const scope = { workspaceId, projectId: project.id }
-  const memory = new MemoryService(dataDir)
-  const modes = new ModesService(dataDir)
-  const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
-  const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
-  const roots = memoryEnabled ? memoryRoots(memory, scope) : []
-  const memoryAccess = mode.definition.toolExposure.some((name) => ['Write', 'Edit', 'ApplyPatch'].includes(name)) ? 'write' as const : 'read' as const
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-    if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
-    if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
-    return next()
-  }, true)
-  // Dangerous Commands: the same workspace config the web host edits (same
-  // data home). Registered AFTER the exposure gate with prepend, so it runs
-  // first: a `deny` rule refuses the Bash call outright; an `ask` rule forces
-  // an approval even when the mode (or --yolo) allows Bash — the same
-  // contract as the web host, where yolo never answers a guard question.
-  const dangerousStore = new DangerousCommandsStore(dataDir)
-  const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
-    configSource: async (requested?: string) => {
-      const { config, hash } = await dangerousStore.load(requested ?? workspaceId)
-      return { config, hash, revision: hash }
-    },
-  })
-  const policy: Record<string, 'allow' | 'ask' | 'deny'> = Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission]))
-  const options: ApprovalOptions = {
-    defaultMode: yolo ? 'allow' : 'ask', askUser,
-    // Same Bash mode properties as the web host: read-only commands lift an
-    // ask, risky ones (Autonomous) force one.
-    authorityResolver: (call) => {
-      const permission = resolvePermission(policy, call.name, { defaultMode: yolo ? 'allow' : 'ask' })
-      if (permission === 'deny') return { kind: 'deny', reason: `policy denies '${call.name}'` }
-      if (permission === 'ask' && !liftsReadOnlyBash(mode.definition, call)) return { kind: 'ask', requirements: [{ kind: 'tool-policy' }] }
-      return { kind: 'allow' }
-    },
-    forceAsk: (call, approvalScope) => dangerousGuard.getMatch(call, approvalScope.executionId)?.action === 'ask'
-      || (!yolo && riskyBashMatch(mode.definition, call) !== null),
-    policy,
-  }
-  attachApproval(kernel.ctx, options)
-  for (const tool of fsTools()) {
-    kernel.ctx.tools.register(tool)
-  }
-  const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
-  const processes = new ProcessRegistry(processEvents)
-  kernel.ctx.provide('processes', processes)
-  kernel.ctx.provide('process-events', processEvents)
-  kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs, processes }))
-  kernel.ctx.tools.register(bashOutputTool({ processes }))
-  kernel.ctx.tools.register(killShellTool({ processes }))
-  kernel.ctx.tools.register(todoWriteTool())
-  kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir), ...defaultSecretRoots(homedir())], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
-  // Providers come from the same store the web host edits, plus the legacy
-  // env key — never from an implicit mock.
-  for (const entry of enabled) {
-    kernel.ctx.llm.register(new OpenAiCompletionsProvider({
-      name: entry.id,
-      apiKey: entry.apiKey,
-      baseUrl: entry.baseUrl,
-      ...(entry.models.length > 0 ? { models: entry.models } : {}),
-      maxOutputTokens: maxOutputTokenOverrides(entry),
-      credentialHasher,
-      ...(entry.compatibility !== undefined ? { compatibility: entry.compatibility } : {}),
-    }))
-  }
-  if (legacyKey !== undefined) {
-    kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, legacyBaseUrl, { credentialHasher }))
-  }
-
-  const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
-  session.append({ type: 'session/project', projectId: project.id })
-  await session.durable()
-  kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter === session) render(event)
-  })
-
-  // The operator's context override wins over the catalog, as in the web host.
-  const budget = resolved.value.budget
-
-  const agent = kernel.ctx.agents.create(session, scope)
-  kernel.ctx.on('agent/context', async (projected, next) => {
-    const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
-    const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
-    const guidanceAccess = memoryGuidanceAccess(schemas.map((schema) => schema.name))
-    if (roots.length > 0 && guidanceAccess !== undefined) pinnedMemory.unshift(memoryGuidance(roots, guidanceAccess))
-    const environment = renderEnvironmentContext({
-      now: new Date(),
-      platform: process.platform,
-      arch: process.arch,
-      nodeVersion: process.version,
-      workspacePath: canonicalRoot,
-    })
-    // The provider's last report calibrates the budget, as in the web host.
-    const calibration = latestCalibration(session.events, { model: selectedModel, provider: selectedProvider })
-    const assembled = buildContext({
-      events: session.events, mode, modeRevision: 0,
-      model: selectedModel, providerName: selectedProvider,
-      schemas, activeSkills: [], pinnedMemory, budget,
-      ...(environment !== undefined ? { environment } : {}),
-      ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
-      ...(calibration !== undefined ? { calibration } : {}),
-      fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
-    })
-    // Calibration pairs a provider report with its manifest by contextId, so the request carries one and its manifest is logged.
-    const contextId = randomUUID()
-    const turnId = agentScope.getStore()?.turnId
-    if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
-    return next({
-      ...projected,
-      ...(selectedProvider !== undefined ? { providerName: selectedProvider } : {}),
-      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
-      ...(selectedThinking !== undefined ? { thinkingLevel: selectedThinking } : {}),
-      // Stable per conversation: every request of this session carries the
-      // same affinity, so provider-side prefix caches stay reusable.
-      sessionAffinity: session.id,
-      contextId,
-      messages: assembled.messages,
-      tools: schemas,
-      outputCeilingTokens: assembled.maxOutputTokens,
-    })
-  }, true)
-
-  /** Durably accept one input, adopt anything still pending, then run. */
-  const acceptAndRun = async (text: string): Promise<void> => {
-    const inputId = newInputId()
-    session.append({ type: 'input/queued', inputId, content: text })
-    await session.durable()
-    const sessions: SessionsService = kernel.ctx.sessions
-    for (const item of sessions.pendingInputs(session)) {
-      agent.enqueueAccepted(item)
-    }
-    await (agent as Agent).run()
-  }
-
+  let processes: ProcessRegistry | undefined
+  let processEvents: ReturnType<typeof createProcessSessionEventBridge> | undefined
+  // Everything after acquisition runs inside this scope, so a failed startup
+  // still stops the kernel and releases the lock once writers settled.
+  let failure: { readonly error: unknown } | undefined
   try {
+    kernel.ctx.plugin(fileSessions(dataDir))
+    // Static startup value for legacy readers; operations capture the reader.
+    kernel.ctx.provide('limits', appConfig.read().values)
+    kernel.ctx.provide('limits-reader', appConfig)
+    kernel.ctx.provide('app-config', appConfig)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    // One data home, workspace-scoped sessions: the CLI works inside the
+    // home's Default workspace (stable id, idempotently migrated).
+    const workspaces = new WorkspaceService(dataDir)
+    await workspaces.boot()
+    kernel.ctx.provide('workspaces', workspaces)
+    await kernel.ctx.sessions.boot()
+    const workspaceId = workspaces.defaultWorkspace
+    const canonicalRoot = await fs.realpath(path.resolve(root))
+    const project = workspaces.listProjects(workspaceId).find((record) => record.path === canonicalRoot)
+      ?? await workspaces.createProject(workspaceId, path.basename(canonicalRoot), canonicalRoot)
+    const scope = { workspaceId, projectId: project.id }
+    const memory = new MemoryService(dataDir)
+    const modes = new ModesService(dataDir)
+    const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
+    const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
+    const roots = memoryEnabled ? memoryRoots(memory, scope) : []
+    const memoryAccess = mode.definition.toolExposure.some((name) => ['Write', 'Edit', 'ApplyPatch'].includes(name)) ? 'write' as const : 'read' as const
+    kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+      if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
+      if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
+      return next()
+    }, true)
+    // Dangerous Commands: the same workspace config the web host edits (same
+    // data home). Registered AFTER the exposure gate with prepend, so it runs
+    // first: a `deny` rule refuses the Bash call outright; an `ask` rule forces
+    // an approval even when the mode (or --yolo) allows Bash — the same
+    // contract as the web host, where yolo never answers a guard question.
+    const dangerousStore = new DangerousCommandsStore(dataDir)
+    const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
+      configSource: async (requested?: string) => {
+        const { config, hash } = await dangerousStore.load(requested ?? workspaceId)
+        return { config, hash, revision: hash }
+      },
+    })
+    const policy: Record<string, 'allow' | 'ask' | 'deny'> = Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission]))
+    const options: ApprovalOptions = {
+      defaultMode: yolo ? 'allow' : 'ask', askUser,
+      // Same Bash mode properties as the web host: read-only commands lift an
+      // ask, risky ones (Autonomous) force one.
+      authorityResolver: (call) => {
+        const permission = resolvePermission(policy, call.name, { defaultMode: yolo ? 'allow' : 'ask' })
+        if (permission === 'deny') return { kind: 'deny', reason: `policy denies '${call.name}'` }
+        if (permission === 'ask' && !liftsReadOnlyBash(mode.definition, call)) return { kind: 'ask', requirements: [{ kind: 'tool-policy' }] }
+        return { kind: 'allow' }
+      },
+      forceAsk: (call, approvalScope) => dangerousGuard.getMatch(call, approvalScope.executionId)?.action === 'ask'
+        || (!yolo && riskyBashMatch(mode.definition, call) !== null),
+      policy,
+    }
+    attachApproval(kernel.ctx, { ...options, expiryMsOf: () => appConfig.read().values.approvalExpiryMs })
+    for (const tool of fsTools()) {
+      kernel.ctx.tools.register(tool)
+    }
+    processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
+    processes = new ProcessRegistry(processEvents)
+    kernel.ctx.provide('processes', processes)
+    kernel.ctx.provide('process-events', processEvents)
+    kernel.ctx.tools.register(bashTool({ processes, limits: appConfig }))
+    kernel.ctx.tools.register(bashOutputTool({ processes }))
+    kernel.ctx.tools.register(killShellTool({ processes }))
+    kernel.ctx.tools.register(todoWriteTool())
+    kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir), ...defaultSecretRoots(homedir())], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
+    // Providers come from the same store the web host edits, plus the legacy
+    // env key — never from an implicit mock.
+    for (const entry of enabled) {
+      kernel.ctx.llm.register(new OpenAiCompletionsProvider({
+        name: entry.id,
+        apiKey: entry.apiKey,
+        baseUrl: entry.baseUrl,
+        ...(entry.models.length > 0 ? { models: entry.models } : {}),
+        maxOutputTokens: maxOutputTokenOverrides(entry),
+        credentialHasher,
+        ...(entry.compatibility !== undefined ? { compatibility: entry.compatibility } : {}),
+      }))
+    }
+    if (legacyKey !== undefined) {
+      kernel.ctx.llm.register(new DeepSeekProvider(legacyKey, legacyBaseUrl, { credentialHasher }))
+    }
+
+    const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
+    session.append({ type: 'session/project', projectId: project.id })
+    await session.durable()
+    kernel.ctx.on('session/event', (emitter, event) => {
+      if (emitter === session) render(event)
+    })
+
+    // The operator's context override wins over the catalog, as in the web host.
+    const budget = resolved.value.budget
+
+    const agent = kernel.ctx.agents.create(session, scope)
+    kernel.ctx.on('agent/context', async (projected, next) => {
+      const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
+      const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
+      const guidanceAccess = memoryGuidanceAccess(schemas.map((schema) => schema.name))
+      if (roots.length > 0 && guidanceAccess !== undefined) pinnedMemory.unshift(memoryGuidance(roots, guidanceAccess))
+      const environment = renderEnvironmentContext({
+        now: new Date(),
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        workspacePath: canonicalRoot,
+      })
+      // The provider's last report calibrates the budget, as in the web host.
+      const calibration = latestCalibration(session.events, { model: selectedModel, provider: selectedProvider })
+      const assembled = buildContext({
+        events: session.events, mode, modeRevision: 0,
+        model: selectedModel, providerName: selectedProvider,
+        schemas, activeSkills: [], pinnedMemory, budget,
+        ...(environment !== undefined ? { environment } : {}),
+        ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+        ...(calibration !== undefined ? { calibration } : {}),
+        fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
+      })
+      // Calibration pairs a provider report with its manifest by contextId, so the request carries one and its manifest is logged.
+      const contextId = randomUUID()
+      const turnId = agentScope.getStore()?.turnId
+      if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
+      return next({
+        ...projected,
+        ...(selectedProvider !== undefined ? { providerName: selectedProvider } : {}),
+        ...(selectedModel !== undefined ? { model: selectedModel } : {}),
+        ...(selectedThinking !== undefined ? { thinkingLevel: selectedThinking } : {}),
+        // Stable per conversation: every request of this session carries the
+        // same affinity, so provider-side prefix caches stay reusable.
+        sessionAffinity: session.id,
+        contextId,
+        messages: assembled.messages,
+        tools: schemas,
+        outputCeilingTokens: assembled.maxOutputTokens,
+      })
+    }, true)
+
+    /** Durably accept one input, adopt anything still pending, then run. */
+    const acceptAndRun = async (text: string): Promise<void> => {
+      const inputId = newInputId()
+      session.append({ type: 'input/queued', inputId, content: text })
+      await session.durable()
+      const sessions: SessionsService = kernel.ctx.sessions
+      for (const item of sessions.pendingInputs(session)) {
+        agent.enqueueAccepted(item)
+      }
+      await (agent as Agent).run()
+    }
+
     if (message !== undefined) {
       await acceptAndRun(message)
     } else {
@@ -463,21 +486,34 @@ async function main(): Promise<void> {
       }
       rl.close()
     }
+  } catch (error) {
+    failure = { error }
+    throw error
   } finally {
-    processes.closeAdmission()
-    const agentDrivers = kernel.ctx.agents
+    processes?.closeAdmission()
+    const agentDrivers = kernel.ctx.get('agents') as AgentsService | undefined
+    const ownedProcesses = processes
+    const ownedEvents = processEvents
     let teardownSafe = true
-    await runCleanup([
-      () => agentDrivers.stopAll(),
-      () => processes.disposeAll(),
-      async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
+    const cleanup = runCleanup([
+      () => agentDrivers?.stopAll(),
+      () => ownedProcesses?.disposeAll(),
+      async () => { try { if (ownedEvents !== undefined) await boundedCleanup(() => ownedEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
       async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
-      () => { if (!teardownSafe || !agentDrivers.persistenceSafe) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
+      () => { if (!teardownSafe || agentDrivers?.persistenceSafe === false) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
     ])
+    try {
+      await cleanup
+    } catch (cleanupError) {
+      // A cleanup failure must not hide why startup or the run failed.
+      if (failure !== undefined) throw new AggregateError([failure.error, cleanupError], 'run failed and cleanup did not complete')
+      throw cleanupError
+    }
   }
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`dnt-harness: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  // inspect prints AggregateError members too, so a cleanup failure never hides the original.
+  process.stderr.write(`dnt-harness: ${inspect(error, { depth: 4 })}\n`)
   process.exitCode = 1
 })

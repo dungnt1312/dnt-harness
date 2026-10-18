@@ -2,7 +2,10 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getImageGenerationSettings, getImageUnderstandingSettings, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, revealProviderKey, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
+import type { AppConfigView } from '../../../src/harness/config/types.ts'
+import { DEFAULT_LIMITS } from '../../../src/harness/limits.ts'
+import { LIMIT_FIELDS } from '../../../src/harness/limits-config.ts'
+import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getAppConfig, getImageGenerationSettings, getImageUnderstandingSettings, getMcpServer, getModeFile, patchAppConfig, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, revealProviderKey, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
@@ -26,6 +29,9 @@ vi.mock('../../lib/api.ts', () => ({
   setImageUnderstandingSettings: vi.fn(async (value: unknown) => value),
   getVideoGenerationSettings: vi.fn(async () => ({ provider: null, model: null })),
   setVideoGenerationSettings: vi.fn(async (value: unknown) => value),
+  getAppConfig: vi.fn(),
+  patchAppConfig: vi.fn(),
+  reloadAppConfig: vi.fn(),
   listMcpServers: vi.fn(async () => [{
     name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
     discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
@@ -592,8 +598,9 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
-    expect(sections).toHaveLength(13)
+    expect(sections).toHaveLength(14)
     expect(sections.map((tab) => tab.textContent)).toContain('Sources')
+    expect(sections.map((tab) => tab.textContent)).toContain('Advanced')
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
     expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos', 'Voice', 'Git'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
@@ -848,6 +855,177 @@ describe('settings dialog', () => {
     await act(async () => type(input('Name'), 'local edited'))
     expect(document.body.querySelector('.error-notice')).toBeNull()
     expect(button('Test model auto').disabled).toBe(true)
+  })
+})
+
+describe('settings dialog leave guard', () => {
+  const providers = [{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto'] }] as const
+  const view: AppConfigView = {
+    document: { v: 1, limits: { toolTimeoutMs: 120_000 } },
+    hash: 'h1',
+    active: { revision: 0, values: { ...DEFAULT_LIMITS, toolTimeoutMs: 120_000 } },
+    inherited: DEFAULT_LIMITS,
+    fields: LIMIT_FIELDS.map((field) => field.key === 'toolTimeoutMs'
+      ? { ...field, source: 'file' as const, locked: false, shadowed: false, fileValue: 120_000 }
+      : { ...field, source: 'library' as const, locked: false, shadowed: false }),
+    outOfSync: false,
+  }
+  let onDismiss: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    onDismiss = vi.fn()
+    vi.mocked(getAppConfig).mockResolvedValue(view)
+  })
+
+  const modal = (initialTab: 'providers' | 'advanced' | 'projects' = 'advanced') => (
+    <SettingsModal open initialTab={initialTab} workspaceId="ws" providers={providers} activeProvider="p1" onDismiss={onDismiss} onRefresh={async () => {}} />
+  )
+  const heading = (): string => document.body.querySelector('header h2')?.textContent ?? ''
+  const confirmTitle = (): string | undefined => [...document.body.querySelectorAll('[role="dialog"]')]
+    .map((node) => node.getAttribute('aria-label') ?? '')
+    .find((label) => label.startsWith('Discard'))
+  const escape = (): void => { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) ?? document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) }
+  const desktopTab = (name: string): HTMLElement => {
+    const found = [...document.body.querySelectorAll<HTMLElement>('[role="tab"]')].find((node) => node.textContent === name)
+    if (found === undefined) throw new Error(`no tab "${name}"`)
+    return found
+  }
+  const acted = (fn: () => void) => async (): Promise<void> => { await act(async () => fn()) }
+  const pressTab = (name: string): void => { desktopTab(name).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 })) }
+  async function openDirtyAdvanced(): Promise<void> {
+    await act(async () => root.render(modal()))
+    await settle()
+    expect(heading()).toBe('Advanced')
+    await act(async () => type(input('Tool timeout'), '300000'))
+  }
+  /** Each trigger runs its own act() so multi-step ones (the section Select) render between steps. */
+  async function cancelThenDiscard(trigger: () => Promise<void>, after: () => void): Promise<void> {
+    await trigger()
+    expect(confirmTitle()).toBe('Discard unsaved advanced settings?')
+    await act(async () => button('Cancel').click())
+    expect(confirmTitle()).toBeUndefined()
+    expect(input('Tool timeout').value).toBe('300000')
+    await trigger()
+    await act(async () => button('Discard changes').click())
+    after()
+  }
+
+  it('lists Advanced as a global tab that applies to all workspaces', async () => {
+    await act(async () => root.render(modal()))
+    await settle()
+    expect(desktopTab('Advanced')).toBeTruthy()
+    expect(document.body.textContent).toContain('All workspaces')
+    expect(document.body.textContent).not.toContain('Workspace: ws')
+  })
+
+  it('guards the close button', async () => {
+    await openDirtyAdvanced()
+    await cancelThenDiscard(acted(() => button('Close settings').click()), () => expect(onDismiss).toHaveBeenCalledTimes(1))
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('guards Escape, even when pressed right after the edit', async () => {
+    await act(async () => root.render(modal()))
+    await settle()
+    act(() => {
+      type(input('Tool timeout'), '300000')
+      escape()
+    })
+    expect(onDismiss).not.toHaveBeenCalled()
+    expect(confirmTitle()).toBe('Discard unsaved advanced settings?')
+    await act(async () => button('Cancel').click())
+    await cancelThenDiscard(acted(escape), () => expect(onDismiss).toHaveBeenCalledTimes(1))
+  })
+
+  it('guards a backdrop press', async () => {
+    await openDirtyAdvanced()
+    // Radix arms its outside-press listener a macrotask after a layer opens or
+    // closes, and may defer the press until the click that completes it.
+    const outside = async (): Promise<void> => {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+      const overlay = document.body.querySelector('.bg-scrim')!
+      await act(async () => { overlay.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 })) })
+      await act(async () => { overlay.dispatchEvent(new MouseEvent('click', { bubbles: true, button: 0 })) })
+    }
+    await cancelThenDiscard(outside, () => expect(onDismiss).toHaveBeenCalledTimes(1))
+  })
+
+  it('guards a desktop tab change and navigates once discarded', async () => {
+    await openDirtyAdvanced()
+    await cancelThenDiscard(acted(() => pressTab('Projects')), () => expect(heading()).toBe('Projects'))
+  })
+
+  it('guards the mobile section selector', async () => {
+    Element.prototype.scrollIntoView ??= () => {}
+    Element.prototype.hasPointerCapture ??= () => false
+    Element.prototype.releasePointerCapture ??= () => {}
+    await openDirtyAdvanced()
+    const choose = async (): Promise<void> => {
+      const trigger = document.body.querySelector<HTMLElement>('[role="combobox"][aria-label="Settings section"]')!
+      await act(async () => { trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
+      const option = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')].find((node) => node.textContent === 'Projects')!
+      await act(async () => { option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })) })
+    }
+    await cancelThenDiscard(choose, () => expect(heading()).toBe('Projects'))
+  })
+
+  it('routes an external section request through the guard', async () => {
+    await openDirtyAdvanced()
+    await act(async () => root.render(modal('projects')))
+    expect(confirmTitle()).toBe('Discard unsaved advanced settings?')
+    await act(async () => button('Cancel').click())
+    expect(heading()).toBe('Advanced')
+    expect(input('Tool timeout').value).toBe('300000')
+    await act(async () => root.render(modal('providers')))
+    await act(async () => button('Discard changes').click())
+    expect(heading()).toBe('Providers & Models')
+  })
+
+  it('forgets the advanced guard once its panel unmounts after a confirmed discard', async () => {
+    await openDirtyAdvanced()
+    await act(async () => pressTab('Projects'))
+    await act(async () => button('Discard changes').click())
+    expect(heading()).toBe('Projects')
+    // The discarded panel never published a clean guard before unmounting.
+    await act(async () => button('Close settings').click())
+    expect(confirmTitle()).toBeUndefined()
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks leaving while an advanced save is in flight', async () => {
+    let finish!: (value: AppConfigView) => void
+    vi.mocked(patchAppConfig).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
+    await openDirtyAdvanced()
+    await act(async () => button('Save changes').click())
+    expect(button('Close settings').disabled).toBe(true)
+    expect((desktopTab('Projects') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => escape())
+    expect(onDismiss).not.toHaveBeenCalled()
+    expect(confirmTitle()).toBeUndefined()
+    await act(async () => finish(view))
+    await settle()
+    expect(button('Close settings').disabled).toBe(false)
+  })
+
+  it('keeps the provider and advanced drafts independent', async () => {
+    await act(async () => root.render(modal('providers')))
+    await act(async () => type(input('Name'), 'renamed'))
+    await act(async () => pressTab('Advanced'))
+    expect(confirmTitle()).toBe('Discard unsaved provider changes?')
+    await act(async () => button('Discard changes').click())
+    await settle()
+    expect(heading()).toBe('Advanced')
+    // The provider discard left the advanced editor clean: leaving needs no confirmation.
+    await act(async () => pressTab('Providers & Models'))
+    expect(confirmTitle()).toBeUndefined()
+    expect(input('Name').value).toBe('local')
+    await act(async () => pressTab('Advanced'))
+    await settle()
+    await act(async () => type(input('Tool timeout'), '300000'))
+    await act(async () => pressTab('Providers & Models'))
+    expect(confirmTitle()).toBe('Discard unsaved advanced settings?')
+    await act(async () => button('Discard changes').click())
+    expect(input('Name').value).toBe('local')
   })
 })
 

@@ -1,4 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
+import type { AppConfigView, LimitEdit } from '../../src/harness/config/types.ts'
 import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, CommandRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, ResourceSourcesDoc, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow, WorkspaceSourcesRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
@@ -387,6 +388,32 @@ export function testProvider(id: string, model?: string): Promise<{ ok: boolean;
     method: 'POST',
     ...(model !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) } : {}),
   }).then((r) => json<{ ok: boolean; error?: string }>(r))
+}
+
+/** Global configuration descriptor: observed file, active limits and per-field metadata. */
+export function getAppConfig(): Promise<AppConfigView> {
+  return apiFetch('/api/app-config').then((r) => json<AppConfigView>(r))
+}
+
+/**
+ * Apply field-scoped limit edits against the file revision the editor loaded.
+ * A stale `expectedHash` is refused with 409 rather than overwriting the file.
+ */
+export function patchAppConfig(edits: readonly LimitEdit[], expectedHash: string): Promise<AppConfigView> {
+  return apiFetch('/api/app-config', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedHash, edits }),
+  }).then((r) => json<AppConfigView>(r))
+}
+
+/** Activate the configuration file as it is on disk now (manual edits included). */
+export function reloadAppConfig(): Promise<AppConfigView> {
+  return apiFetch('/api/app-config/reload', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).then((r) => json<AppConfigView>(r))
 }
 
 /** Live connection state of one session's event stream. */

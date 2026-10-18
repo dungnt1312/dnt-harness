@@ -94,7 +94,7 @@ export type AttachmentLookup = ReadonlyMap<string, LoadedAttachment>
 const CACHE_BUDGET_BYTES = 64 * 1024 * 1024
 
 export class AttachmentStore {
-  /** `workspaceId:id` → decoded content, insertion-ordered for FIFO eviction. */
+  /** `workspaceId:id:mediaType[:textLimit]` → decoded content, insertion-ordered for FIFO eviction. */
   private readonly cache = new Map<string, LoadedAttachment & { readonly bytes: number }>()
   private cachedBytes = 0
 
@@ -111,15 +111,21 @@ export class AttachmentStore {
 
   /**
    * Store bytes and return their reference. The declared media type must be
-   * supported and, for images, must match the bytes.
+   * supported and, for images, must match the bytes. `limits` is the cap the
+   * caller captured when its upload started, so the body read and this check
+   * agree; without it the constructor's static cap applies.
    */
-  async put(workspaceId: string, input: { readonly name: string; readonly mediaType: string; readonly bytes: Buffer }): Promise<AttachmentRef> {
+  async put(
+    workspaceId: string,
+    input: { readonly name: string; readonly mediaType: string; readonly bytes: Buffer },
+    limits: AttachmentLimits = this.limits,
+  ): Promise<AttachmentRef> {
     const mediaType = normalizeMediaType(input.mediaType)
     const name = input.name.trim().replaceAll(/[\r\n\t]/g, ' ').slice(0, 200)
     if (name === '') throw new AttachmentError('attachment needs a file name')
     if (input.bytes.length === 0) throw new AttachmentError(`'${name}' is empty`)
-    if (input.bytes.length > this.limits.maxBytes) {
-      throw new AttachmentError(`'${name}' is ${input.bytes.length} bytes; the limit is ${this.limits.maxBytes}`)
+    if (input.bytes.length > limits.maxBytes) {
+      throw new AttachmentError(`'${name}' is ${input.bytes.length} bytes; the limit is ${limits.maxBytes}`)
     }
     if (!isSupportedMediaType(mediaType)) {
       throw new AttachmentError(`'${name}' has unsupported type '${mediaType || 'unknown'}'; images and text files are accepted`)
@@ -159,7 +165,9 @@ export class AttachmentStore {
    * attachment is unavailable instead of pretending it was never sent.
    *
    * Results are cached under a byte budget: a long conversation would
-   * otherwise re-read and re-encode the same screenshots on every step.
+   * otherwise re-read and re-encode the same screenshots on every step. A
+   * text entry is keyed by the limit it was cut at, so a changed limit
+   * re-projects instead of reusing text truncated under another cap.
    */
   async load(
     workspaceId: string,
@@ -169,7 +177,9 @@ export class AttachmentStore {
     const loaded = new Map<string, LoadedAttachment>()
     for (const ref of refs) {
       if (loaded.has(ref.id)) continue
-      const key = `${workspaceId}:${ref.id}`
+      const mediaType = normalizeMediaType(ref.mediaType)
+      const image = isImageMediaType(mediaType)
+      const key = `${workspaceId}:${ref.id}:${mediaType}${image ? '' : `:${options.textLimit}`}`
       const cached = this.cache.get(key)
       if (cached !== undefined) {
         loaded.set(ref.id, cached)
@@ -177,8 +187,7 @@ export class AttachmentStore {
       }
       const bytes = await this.read(workspaceId, ref.id).catch(() => null)
       if (bytes === null) continue
-      const mediaType = normalizeMediaType(ref.mediaType)
-      const content: LoadedAttachment = isImageMediaType(mediaType)
+      const content: LoadedAttachment = image
         ? { mediaType, base64: bytes.toString('base64') }
         : {
             mediaType,
@@ -192,6 +201,12 @@ export class AttachmentStore {
   }
 
   private remember(key: string, content: LoadedAttachment, bytes: number): void {
+    // Concurrent loads of one key both miss and both remember: replace, never double-count.
+    const previous = this.cache.get(key)
+    if (previous !== undefined) {
+      this.cache.delete(key)
+      this.cachedBytes -= previous.bytes
+    }
     this.cache.set(key, { ...content, bytes })
     this.cachedBytes += bytes
     for (const [oldest, entry] of this.cache) {

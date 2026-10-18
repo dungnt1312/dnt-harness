@@ -9,6 +9,9 @@ import { toolExecutionScope } from './execution-scope.ts'
 import { agentScope } from '../agent/scope.ts'
 import { FileObservations } from '../../capabilities/fs/observation.ts'
 import { classifyGrantedRoots, samePath, within } from '../../capabilities/fs/grants.ts'
+import { readLimits } from '../config/limits-reader.ts'
+import { DEFAULT_LIMITS } from '../limits.ts'
+import type { LimitsSnapshot } from '../config/types.ts'
 import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
 declare module 'dnt-harness' {
@@ -16,6 +19,9 @@ declare module 'dnt-harness' {
     tools: ToolsService
   }
 }
+
+/** One captured limits snapshot and the output cap the host configured, if any. */
+interface LimitsPolicy { readonly snapshot: LimitsSnapshot; readonly outputLimit?: number }
 
 /** Resolves the workspace grant for the tool run in flight, if any. */
 export type RootResolver = () => {
@@ -200,12 +206,22 @@ export class ToolsService extends Service {
   async prepare(call: ToolCall, options: { signal?: AbortSignal; executionId?: ExecutionId } = {}): Promise<PreparedToolCall> {
     const executionId = options.executionId ?? newExecutionId()
     const canonical = snapshotCall(call)
-    const exec = this.buildExecution(canonical, options.signal, executionId)
+    let policy: LimitsPolicy | undefined
+    let policyError: unknown
+    try {
+      policy = this.limitsPolicy()
+    } catch (error) {
+      policyError = error
+    }
+    const exec = this.buildExecution(canonical, options.signal, executionId, policy)
     let prepared: PreparedToolCall
-    // Unknown original identity is not recoverable by hooks: fail closed.
-    if (!this.tools.has(canonical.name)) {
-      await this.approvedPathResolver?.(canonical, false, exec).catch(() => undefined)
-      prepared = { call: canonical, executionId, execute: () => this.postExecute(canonical, exec, { ok: false, output: `unknown tool '${canonical.name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})` }) }
+    if (policy === undefined) {
+      // An unreadable limits source authorizes nothing: fail the call the
+      // same way an unreadable policy at body start would.
+      prepared = await this.failClosed(canonical, exec, executionId, `error: ${String(policyError)}`)
+    } else if (!this.tools.has(canonical.name)) {
+      // Unknown original identity is not recoverable by hooks: fail closed.
+      prepared = await this.failClosed(canonical, exec, executionId, this.unknownTool(canonical.name))
     } else {
       try {
         prepared = await toolExecutionScope.run(exec, () => this.gate(canonical, exec, executionId))
@@ -263,10 +279,7 @@ export class ToolsService extends Service {
     // clone here would break the ask lookup downstream.
     const rewritten = rewrite.call === canonical ? canonical : snapshotCall(rewrite.call)
     const tool = this.tools.get(rewritten.name)
-    if (tool === undefined) {
-      await this.approvedPathResolver?.(rewritten, false, exec).catch(() => undefined)
-      return { call: rewritten, executionId, execute: () => this.postExecute(rewritten, exec, { ok: false, output: `unknown tool '${rewritten.name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})` }) }
-    }
+    if (tool === undefined) return this.failClosed(rewritten, exec, executionId, this.unknownTool(rewritten.name))
     let attemptedRewrite = false
     let rewriteDenialReason = 'authorization cannot rewrite finalized tool identity or arguments'
     const rewriteDenied = (reason?: string): PreExecuteDecision => {
@@ -372,24 +385,33 @@ export class ToolsService extends Service {
           this.retireAuthority(executionId)
           return this.postExecute(preparedCall, exec, { ok: false, output: `denied: cancelled: stop requested before dispatch of '${preparedCall.name}'` })
         }
-        let output: string
         let runExec: ToolExecution
         try {
-          runExec = this.executionAtRun(exec, approvedPaths)
+          // The body's limits policy is captured exactly once, here: after
+          // every authority and approval wait, before dispatch. The result
+          // below is shaped under the same envelope, never a recapture.
+          runExec = this.executionAtRun(exec, approvedPaths, this.limitsPolicy())
+        } catch (error) {
+          // Nothing dispatched: release the call's authority like a final-gate denial.
+          this.retireAuthority(executionId)
+          return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
+        }
+        let output: string
+        try {
           output = await tool.execute(preparedCall.args, runExec)
         } catch (error) {
-          return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
+          return this.postExecute(preparedCall, runExec, { ok: false, output: `error: ${String(error)}` })
         }
         const staged = exec.executionId !== undefined ? takeMcpOutcome(exec.executionId) : undefined
         if (staged !== undefined) {
-          return this.postExecute(preparedCall, exec, {
+          return this.postExecute(preparedCall, runExec, {
             ok: staged.ok,
             output,
             outcome: staged.outcome,
             invocationId: staged.invocationId,
           })
         }
-        return this.postExecute(preparedCall, exec, { ok: true, output })
+        return this.postExecute(preparedCall, runExec, { ok: true, output })
       },
     }
   }
@@ -405,9 +427,11 @@ export class ToolsService extends Service {
    * be long; a revoked folder must stop authorizing), and the approved
    * out-of-grant paths for this call are attached. A changed primary root
    * fails the call instead of running somewhere the approver did not see.
+   * The limits policy captured for this run replaces the preparation-time
+   * output cap and child background maximum.
    */
-  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined): ToolExecution {
-    const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, ...base } = exec
+  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined, policy: LimitsPolicy): ToolExecution {
+    const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, outputLimit: _outputBefore, ...base } = exec
     let additionalRoots = exec.additionalRoots
     let memoryRoots = exec.memoryRoots
     let hostStorageRoot = exec.hostStorageRoot
@@ -423,6 +447,9 @@ export class ToolsService extends Service {
     }
     return freezeExecution({
       ...base,
+      ...(policy.outputLimit !== undefined ? { outputLimit: policy.outputLimit } : {}),
+      ...(exec.subagentBackgroundBashMaxMs !== undefined ? { subagentBackgroundBashMaxMs: policy.snapshot.values.subagentBackgroundBashMaxMs } : {}),
+      limitsSnapshot: policy.snapshot,
       ...(additionalRoots !== undefined && additionalRoots.length > 0 ? { additionalRoots } : {}),
       ...(memoryRoots !== undefined && memoryRoots.length > 0 ? { memoryRoots } : {}),
       ...(hostStorageRoot !== undefined ? { hostStorageRoot } : {}),
@@ -435,13 +462,15 @@ export class ToolsService extends Service {
    * requiresRoot fail-closed check runs after the permission gate, so a
    * policy denial always outranks a missing (or present) grant.
    */
-  private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId?: ExecutionId): ToolExecution {
+  private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId: ExecutionId, policy: LimitsPolicy | undefined): ToolExecution {
     const grant = this.rootResolver?.()
-    const limits = this.ctx.get('limits') as { toolOutputLimit?: number; subagentBackgroundBashMaxMs?: number } | undefined
+    // Preparation envelope only (denials before dispatch); the body gets its
+    // own policy captured at run time and no snapshot is pinned here.
     const scope = agentScope.getStore()
     return freezeExecution({
       ...(scope?.turnId !== undefined ? { turnId: scope.turnId } : {}),
-      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: limits?.subagentBackgroundBashMaxMs ?? 3_600_000 } : {}),
+      // Child scopes only; the run-time stamp refreshes it, never introduces it.
+      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: policy?.snapshot.values.subagentBackgroundBashMaxMs ?? DEFAULT_LIMITS.subagentBackgroundBashMaxMs } : {}),
       root: grant?.root ?? '',
       ...(scope?.sessionId !== undefined ? { sessionId: scope.sessionId, observations: this.fileObservations } : {}),
       ...(scope?.rootSessionId !== undefined ? { rootSessionId: scope.rootSessionId } : {}),
@@ -452,10 +481,39 @@ export class ToolsService extends Service {
       ...(grant?.memoryRoots !== undefined ? { memoryRoots: grant.memoryRoots } : {}),
       ...(grant?.hostStorageRoot !== undefined ? { hostStorageRoot: grant.hostStorageRoot } : {}),
       ...(signal !== undefined ? { signal } : {}),
-      ...(limits?.toolOutputLimit !== undefined ? { outputLimit: limits.toolOutputLimit } : {}),
-      ...(executionId !== undefined ? { executionId } : {}),
+      ...(policy?.outputLimit !== undefined ? { outputLimit: policy.outputLimit } : {}),
+      executionId,
       ...(call.id !== '' ? { toolCallId: call.id } : {}),
     })
+  }
+
+  /**
+   * Capture the limits policy for one envelope. `outputLimit` is present only
+   * when the host configured one — a mounted reader, or a legacy `limits`
+   * value naming it — so a bare kernel leaves each tool its own default. A
+   * mounted reader always stamps it: tool-local defaults (e.g. BashOutput's
+   * 30_000) never apply on such a host.
+   */
+  private limitsPolicy(): LimitsPolicy {
+    const snapshot = readLimits(this.ctx)
+    const legacy = this.ctx.get('limits') as { toolOutputLimit?: unknown } | null | undefined
+    const configured = this.ctx.get('limits-reader') !== undefined || legacy?.toolOutputLimit !== undefined
+    return configured ? { snapshot, outputLimit: snapshot.values.toolOutputLimit } : { snapshot }
+  }
+
+  /**
+   * End a call before authorization ran: drop per-call host state (pending
+   * path matches and any evidence already issued for this execution), then
+   * report `output` as its no-side-effect result.
+   */
+  private async failClosed(call: ToolCall, exec: ToolExecution, executionId: ExecutionId, output: string): Promise<PreparedToolCall> {
+    await this.approvedPathResolver?.(call, false, exec).catch(() => undefined)
+    this.retireAuthority(executionId)
+    return { call, executionId, execute: () => this.postExecute(call, exec, { ok: false, output }) }
+  }
+
+  private unknownTool(name: string): string {
+    return `unknown tool '${name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})`
   }
 
   private retireAuthority(executionId: ExecutionId): void {

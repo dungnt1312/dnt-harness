@@ -1,6 +1,6 @@
 import type { Context } from '../../kernel/index.ts'
 import { newExecutionId, newStepId, newTurnId, type ExecutionId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
-import { resolveLimits, type HarnessLimits } from '../limits.ts'
+import { readLimits } from '../config/limits-reader.ts'
 import { MAX_SQUEEZE_LEVEL } from '../context/budget.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
 import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from '../llm/types.ts'
@@ -681,7 +681,10 @@ export class Agent {
     // be retried by abandoning the step wholesale and re-asking under a fresh
     // id. Only once per step: after the re-ask, a second failure is final.
     let discardBudget = 1
-    const owner = new LogicalRequest({ firstProgressMs: this.limits().streamFirstEventMs, idleMs: this.limits().streamIdleMs, totalMs: this.limits().logicalRequestMs, retryBaseMs: this.limits().stepRetryBaseMs, maxAttempts: Math.min(4, this.limits().stepRetries + 1) })
+    // One policy per logical request: every retry keeps it even if the
+    // limits are republished while this request waits out a backoff.
+    const policy = readLimits(this.ctx).values
+    const owner = new LogicalRequest({ firstProgressMs: policy.streamFirstEventMs, idleMs: policy.streamIdleMs, totalMs: policy.logicalRequestMs, retryBaseMs: policy.stepRetryBaseMs, maxAttempts: Math.min(4, policy.stepRetries + 1) })
     const cancelOwner = (): void => owner.cancel()
     signal?.addEventListener('abort', cancelOwner, { once: true })
     if (signal?.aborted) owner.cancel()
@@ -902,7 +905,7 @@ export class Agent {
     // reads after a write see it. Every call is prepared (hooks, approval) in
     // order first; each group then records its intents, runs, and records its
     // results in the model's original order.
-    const concurrency = Math.max(1, this.limits().readOnlyToolConcurrency)
+    const concurrency = Math.max(1, readLimits(this.ctx).values.readOnlyToolConcurrency)
     let group: ReadyCall[] = []
     const runPending = async (): Promise<void> => {
       if (group.length === 0) return
@@ -1059,11 +1062,6 @@ export class Agent {
   /** The error a stopped step unwinds with. */
   private abortError(): Error {
     return new StopRequested()
-  }
-
-  private limits(): HarnessLimits {
-    const shared = (this.ctx.get('limits') ?? {}) as Partial<HarnessLimits>
-    return resolveLimits(shared)
   }
 }
 

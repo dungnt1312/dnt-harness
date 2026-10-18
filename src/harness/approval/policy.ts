@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Context } from '../../kernel/index.ts'
 import type { ExecutionId, SessionId, TurnId } from '../../util/brand.ts'
 import { agentScope } from '../agent/scope.ts'
+import { timerBudget } from '../processes/shutdown.ts'
 import type { ToolCall } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
 import { resolvePermission, type ApprovalMode } from './resolution.ts'
@@ -84,6 +85,12 @@ export interface ApprovalOptions {
   readonly askUser?: (call: ToolCall, lifecycle: ApprovalLifecycle) => Promise<boolean>
   /** Undecided approvals expire after this long; defaults to the harness limit. 0 waits forever. */
   readonly expiryMs?: number
+  /**
+   * Live expiry source, read once when each approval is created; a pending
+   * approval keeps its deadline when the value changes. Falls back to
+   * `expiryMs` when absent or not a valid timer duration; 0 waits forever.
+   */
+  readonly expiryMsOf?: () => number
   /**
    * Hard interaction annotation: true forces ask even if policy exact/wildcard
    * says allow. `scope` is the call's own session/workspace — at first
@@ -363,6 +370,11 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     const record = recorder(callScope)
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
+    // Read once per approval. A live 0 waits forever like the static 0; any
+    // other invalid live value (non-finite, negative, past the timer cap)
+    // keeps the static expiry.
+    const liveExpiry = options.expiryMsOf?.()
+    const expiresIn = liveExpiry === 0 ? 0 : timerBudget(liveExpiry, expiryMs)
     if (record !== undefined) {
       record.session.append({
         ...(options.requestDetails?.(call, callScope) ?? {}),
@@ -400,12 +412,12 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         resolve,
       }
       pending.set(approvalId, pendingEntry)
-      // expiryMs 0 = no deadline: the ask waits until answered, denied, or the
+      // expiresIn 0 = no deadline: the ask waits until answered, denied, or the
       // turn stops — it is never settled by a timer.
-      const expiresAt = expiryMs > 0 ? Date.now() + expiryMs : undefined
+      const expiresAt = expiresIn > 0 ? Date.now() + expiresIn : undefined
       const timer = expiresAt !== undefined ? setTimeout(() => {
         void settle(pendingEntry, 'expired', `approval for '${call.name}' expired undecided`)
-      }, expiryMs) : undefined
+      }, expiresIn) : undefined
       timer?.unref?.()
       const onAbort = (): void => {
         void settle(pendingEntry, 'cancelled', `cancelled: stop requested while awaiting approval for '${call.name}'`)

@@ -37,7 +37,20 @@ export { newSessionId, newStepId, newTurnId, newExecutionId, newInputId, newWork
 export { AttemptAdmission, LogicalRequest, classifyTransport, runAttempt, type AttemptTicket, type PhysicalAdmission, type RequestPolicy, type AttemptFact, type AttemptObserver } from './harness/llm/request-lifecycle.ts'
 
 // ── Harness: limits ──────────────────────────────────────────────────────
-export { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from './harness/limits.ts'
+export { DEFAULT_LIMITS, resolveLimits, isValidLimit, type HarnessLimits } from './harness/limits.ts'
+export { parseLimitOverrides, LIMIT_FIELDS, WEB_LIMIT_DEFAULTS, type LimitKey, type LimitField } from './harness/limits-config.ts'
+export { APP_CONFIG_FILE, AppConfigStore, type ConfigRead, type ConfigStoreIo } from './harness/config/store.ts'
+export { AppConfigService, type AppConfigServiceOptions } from './harness/config/service.ts'
+export { readLimits } from './harness/config/limits-reader.ts'
+export {
+  AppConfigError,
+  type AppConfigDocument,
+  type AppConfigView,
+  type LimitEdit,
+  type LimitSource,
+  type LimitsReader,
+  type LimitsSnapshot,
+} from './harness/config/types.ts'
 
 // ── Harness: session log ─────────────────────────────────────────────────
 export {
@@ -99,6 +112,7 @@ export {
   isTextMediaType,
   normalizeMediaType,
   sniffImageMediaType,
+  type AttachmentLimits,
   type AttachmentLookup,
   type AttachmentRef,
   type LoadedAttachment,

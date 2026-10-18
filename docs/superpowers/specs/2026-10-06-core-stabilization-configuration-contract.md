@@ -46,7 +46,7 @@ Audit reflects working-tree source on this date. The repository contains substan
 | Startup | `src/kernel/registry.ts`: sync apply failure throws; async failure logs and removes entry; activation writes active unconditionally | Late startup must not revive an unloaded fiber; failed registrations must unwind and failures remain observable. |
 | Dependency restart | Registry removes/disposes dependent then remounts; `tests/kernel/services.spec.ts` covers basic restart | Restart is fire-and-forget, and `Context.plugin()` documents lost parent linkage. Coordinate restart and preserve ownership. |
 | Loader | `src/kernel/loader.ts`: one-time YAML parse/import/mount | No code/config reload manager. Do not treat lifecycle primitives as complete HMR. |
-| Limits | `src/harness/limits.ts`: 17 fields, `resolveLimits()` merges defaults with permissive fallback | Mostly boot-captured. Existing validator is not a complete strict editor schema; it also does not freeze returned objects. |
+| Limits | `src/harness/limits.ts`: 18 fields, `resolveLimits()` merges defaults with permissive fallback | Mostly boot-captured. Existing validator is not a complete strict editor schema; it also does not freeze returned objects. |
 | Agent request | `src/harness/agent/agent.ts`: LogicalRequest construction reads `this.limits()` multiple times; maxAttempts capped at 4 | Capture one revision for an entire logical request, including retries. Preserve attempt ceiling. |
 | Web limits | `src/web/server.ts`: resolves options once; closures and HandlerDeps retain limits; Bash/attachments/approvals capture values at construction | Must migrate actual consumers, not merely replace a ctx entry. |
 | Web defaults | `src/bins/web.ts`: sets automaticCompactionPressure to 0.85; library default is 0 | Preserve both profiles; file introduction must not silently disable web auto-compaction. |
@@ -172,7 +172,7 @@ Recommended behavior:
 
 Strict file/API validation reports malformed fields rather than silently falling back; it accepts the existing supported value domain and does not introduce incidental range/integer changes. `resolveLimits()` retains its exported programmatic fallback behavior. Both validation paths share field rules owned by limits so accepted values cannot drift. Invalid programmatic overrides fall through to lower layers; invalid durable configuration refuses publication.
 
-## 6. Operation-boundary contract for all 17 limits
+## 6. Operation-boundary contract for all 18 limits
 
 Capture once at the stated boundary. Never re-time an existing operation or combine two revisions within its policy. Permission narrowing remains governed by existing live authority gates, not by a numeric-config snapshot.
 
@@ -287,6 +287,6 @@ Upstream profile editing can pin complete entry configs because Include replaces
 
 ## 12. Self-review record
 
-Checked scope, ownership, compatibility, operation boundaries and update failure behavior against the final direction and local code. Corrected an omission in the earlier draft by adding the `delegationJoinMs` boundary, bringing the table to all 17 current fields. Distinguished provider file naming, host defaults from explicit locks, strict editing from legacy fallback, and durable hash from active revision. Added serialization of reload versus save, saved/active visibility, no external-editor exclusion claim, and upstream implemented/proposed distinctions.
+Checked scope, ownership, compatibility, operation boundaries and update failure behavior against the final direction and local code. Corrected an omission in the earlier draft by adding the `delegationJoinMs` boundary, bringing the table to all 18 current fields. Distinguished provider file naming, host defaults from explicit locks, strict editing from legacy fallback, and durable hash from active revision. Added serialization of reload versus save, saved/active visibility, no external-editor exclusion claim, and upstream implemented/proposed distinctions.
 
 No product implementation or implementation-test success is claimed by this documentation change.
