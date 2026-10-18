@@ -349,3 +349,49 @@ describe('MCP workspace isolation', () => {
     expect((await b.row('fx'))?.status).toBe('ready')
   }, 60_000)
 })
+
+describe('MCP status across a restart', () => {
+  it('failed, auth-required, audit-fault and stale states read the same after the host restarts', async () => {
+    oauth = await startOAuthFixture()
+    const { first: ws, stdio } = await boot()
+    expect((await ws.api('/mcp/broken', stdio({ TOKEN: '${MISSING_SECRET}' }))).status).toBe(201)
+    expect((await ws.api('/mcp/broken/enable')).ok).toBe(false)
+    const url = oauth.mcpUrl
+    expect((await ws.api('/mcp/remote', { transport: 'http', url, enabled: false, auth: { type: 'managed_oauth', provider: new URL(url).host, resource: url } })).status).toBe(201)
+    expect((await ws.api('/mcp/remote/enable')).ok).toBe(false)
+    // What the coordinator leaves when an execution record cannot be stored.
+    const faultFile = path.join(home, 'mcp-audit-faults', `${encodeURIComponent(ws.wsId)}.json`)
+    await fs.mkdir(path.dirname(faultFile), { recursive: true })
+    await fs.writeFile(faultFile, JSON.stringify({ invocationId: 'lost', workspaceId: ws.wsId, outcome: 'success', message: 'execution journal write failed' }))
+
+    const expectStates = async (): Promise<void> => {
+      await expect.poll(async () => (await ws.row('broken'))?.status, { timeout: 10_000, interval: 100 }).toBe('failed')
+      await expect.poll(async () => (await ws.row('remote'))?.status, { timeout: 10_000, interval: 100 }).toBe('failed')
+      const rows = await ws.rows()
+      expect(rows.find((row) => row.name === 'broken')?.lastError).toMatch(/MISSING_SECRET/)
+      const remote = rows.find((row) => row.name === 'remote')
+      expect(remote?.lastError).toMatch(/auth_required/)
+      expect(remote?.oauth?.state).toBe('not_connected')
+      expect(rows.every((row) => row.auditFault)).toBe(true)
+    }
+    await expectStates()
+
+    const restart = async (): Promise<void> => {
+      await web!.close()
+      web = await createWebServer({ home, configFile: path.join(home, 'providers.json'), providers: [instructedProvider([])] })
+      // Opening the workspace starts its enabled servers again.
+      expect((await ws.api('/meta', undefined, 'GET')).status).toBe(200)
+    }
+    await restart()
+    await expectStates()
+
+    // A direct edit that cannot be validated fences the workspace, and still does after a restart.
+    await fs.writeFile(path.join(home, 'workspaces', ws.wsId, 'mcp.json'), '{ not json')
+    const stale = await ws.api('/mcp', undefined, 'GET')
+    expect(stale.status).toBe(400)
+    await restart()
+    const staleAfter = await ws.api('/mcp', undefined, 'GET')
+    expect(staleAfter.status).toBe(400)
+    expect(((await staleAfter.json()) as { error: string }).error).toMatch(/mcp\.json/)
+  }, 60_000)
+})
