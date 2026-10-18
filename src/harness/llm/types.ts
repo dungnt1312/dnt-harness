@@ -77,19 +77,23 @@ export type ContentPart =
     }
 
 /**
- * The model's reasoning for one assistant message, kept apart from `content`
- * (phase 05, spec §10 PH-4). Recorded only for routes whose compatibility
- * profile requires reasoning replay.
+ * The model's reasoning for one assistant message, kept apart from `content`.
+ * Recorded for any provider that streams reasoning, and sent back on later
+ * requests (see `reasoning.ts`).
  *
+ * - `field`: the wire field the reasoning arrived under (`reasoning_content`,
+ *   `reasoning`, …); replayed under the same field to the same provider/model.
+ *   Absent on records written before it existed.
  * - `complete`: the attempt reached a valid semantic completion other than an
  *   output-token cutoff. A `length` reply is `false` and is never replayed.
- * - `source`: the route identity key (`routeKey`, v1, with the keyed credential
- *   generation) that produced it. Replay only ever goes back to the same key.
+ * - `source`: the provider and model that produced it (`reasoningSourceFor`).
+ *   Another route still receives the text, but picks its own field.
  * - `redacted`: secret-shaped substrings were masked before persistence, so the
  *   text is not byte-faithful to what the provider streamed.
  */
 export interface ReasoningPayload {
   readonly text: string
+  readonly field?: string
   readonly complete: boolean
   readonly source: string
   readonly redacted?: true
@@ -104,10 +108,7 @@ export interface ModelMessage {
   readonly toolCalls?: readonly ToolCall[]
   /** Which call this result answers; tool messages only. */
   readonly toolCallId?: string
-  /**
-   * Durable reasoning of an assistant message. Only an adapter whose profile
-   * requires it serializes it, and only for its own route and replay window.
-   */
+  /** Durable reasoning of an assistant message; the adapter decides the wire field. */
   readonly reasoning?: ReasoningPayload
 }
 
@@ -193,10 +194,9 @@ export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filt
 export type CompletionPolicy = 'strict' | 'finish-eof' | 'legacy-iterable'
 export type ProviderErrorReason = 'cancelled' | 'connect' | 'read' | 'reset' | 'first_progress_timeout' | 'idle_timeout' | 'total_timeout' | 'rate_limit' | 'server_error' | 'auth_configuration' | 'quota' | 'context_exceeded' | 'malformed_protocol' | 'invalid_tool_input' | 'incomplete_completion' | 'output_limit' | 'length' | 'content_filter' | 'unknown'
 /** See {@link ProviderError.classification}. */
-// `reasoning_replay_missing`: the strict pre-network gate (phase 05) refused a
-// tool loop without complete reasoning of this route; `reasoning_replay_rejected`:
-// the endpoint itself refused it. Both keep public reason `unknown` (terminal).
-export type ProviderErrorClassification = 'context_exceeded' | 'payload_too_large' | 'output_cap_rejected' | 'missing_required_cap' | 'quota' | 'auth' | 'rate_limit' | 'server_error' | 'request' | 'reasoning_replay_missing' | 'reasoning_replay_rejected'
+// `reasoning_replay_rejected`: the endpoint refused history whose reasoning it
+// requires back. Public reason stays `unknown` (terminal).
+export type ProviderErrorClassification = 'context_exceeded' | 'payload_too_large' | 'output_cap_rejected' | 'missing_required_cap' | 'quota' | 'auth' | 'rate_limit' | 'server_error' | 'request' | 'reasoning_replay_rejected'
 export type ProviderErrorPhase = 'connect' | 'headers' | 'stream' | 'completion' | 'cleanup'
 export interface ModelCompletion {
   readonly type: 'completion'
@@ -205,11 +205,12 @@ export interface ModelCompletion {
   readonly policy: CompletionPolicy
   readonly transportSettled: boolean
   /**
-   * Set only by an adapter whose route requires reasoning replay: the route
-   * identity key the reply's reasoning belongs to. The turn loop then records
-   * the attempt's thinking text on the assistant message (phase 05).
+   * The provider/model the reply's reasoning belongs to (`reasoningSourceFor`).
+   * Unset: the turn loop derives it from the request.
    */
   readonly reasoningSource?: string
+  /** The wire field the reply's reasoning streamed under, when any did. */
+  readonly reasoningField?: string
   /** The adapter masked secret-shaped text in this reply's thinking deltas (not byte-faithful). */
   readonly reasoningRedacted?: true
 }
@@ -243,19 +244,6 @@ export interface LlmProvider {
   /** Model names this provider offers, for UI selection. */
   readonly models?: readonly string[]
   stream(request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent>
-  /**
-   * Reasoning replay facts for `model` on this provider, or undefined when the
-   * route does not require reasoning back (the generic default). Hosts pass it
-   * to context assembly so only replayable reasoning is counted and kept.
-   */
-  reasoningReplay?(model: string): ReasoningReplay | undefined
-}
-
-/** See {@link LlmProvider.reasoningReplay}. */
-export interface ReasoningReplay {
-  /** Route identity key (v1) reasoning must have been recorded under. */
-  readonly source: string
-  readonly window: import('./reasoning.ts').ReplayWindow
 }
 
 /** Per-request stream options. */

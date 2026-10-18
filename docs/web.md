@@ -160,8 +160,12 @@ fallback. All provider/default mutations run through one serialized,
 persist-before-publish transaction.
 
 Every endpoint speaks the standard `POST {baseUrl}/chat/completions` SSE wire
-format (tool-call fragment accumulation, `reasoning_content` → thinking
-deltas); DeepSeek is simply one such endpoint. API keys are masked when
+format (tool-call fragment accumulation; `reasoning_content`, `reasoning` or
+`reasoning_text` → thinking deltas, replayed on later requests under the same
+field); DeepSeek is simply one such endpoint. An optional per-provider
+`compatibility: { reasoningField?, requireReasoning?, replayReasoning? }`
+overrides the field, whether empty reasoning is still sent, and whether
+reasoning is sent back at all. API keys are masked when
 serialized to the client (`keyMasked`), and the raw key leaves the server only
 through `GET /api/providers/:id/key`, on request from the paired browser
 session (the Settings eye toggle). When the active

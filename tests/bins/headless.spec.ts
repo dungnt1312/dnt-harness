@@ -340,17 +340,17 @@ describe('headless CLI', () => {
       expect(result.stderr).toContain(`provider config '${config}' could not be parsed`)
     }, 30_000)
 
-    it('PH4-A: real CLI + strict reasoning profile from providers.json: request 2 replays the streamed reasoning (phase-05)', async () => {
+    it('real CLI: request 2 replays the streamed reasoning under the configured field from providers.json', async () => {
       dataDir = await mkdtemp(path.join(tmpdir(), 'cli-reasoning-'))
       const root = fileURLToPath(new URL('../../', import.meta.url))
-      const bodies: { messages: { role: string; reasoning_content?: unknown; tool_calls?: { id: string }[] }[] }[] = []
+      const bodies: { messages: { role: string; vendor_reasoning?: unknown; tool_calls?: { id: string }[] }[] }[] = []
       const provider = createServer(async (req, res) => {
         let raw = ''
         for await (const chunk of req) raw += chunk
         bodies.push(JSON.parse(raw))
         const first = bodies.length === 1
         const frames = first
-          ? [{ choices: [{ index: 0, delta: { reasoning_content: 'CLI-THOUGHT' } }] }, { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'glob-1', type: 'function', function: { name: 'Glob', arguments: JSON.stringify({ pattern: 'package.json' }) } }] }, finish_reason: 'tool_calls' }] }]
+          ? [{ choices: [{ index: 0, delta: { vendor_reasoning: 'CLI-THOUGHT' } }] }, { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'glob-1', type: 'function', function: { name: 'Glob', arguments: JSON.stringify({ pattern: 'package.json' }) } }] }, finish_reason: 'tool_calls' }] }]
           : [{ choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] }]
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         res.end(`${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('')}data: [DONE]\n\n`)
@@ -361,8 +361,8 @@ describe('headless CLI', () => {
       await writeFile(config, JSON.stringify({
         version: 2,
         defaults: { provider: 'fake', model: 'm', thinkingLevel: null },
-        // A local relay is not api.deepseek.com: only the explicit typed profile makes it strict.
-        providers: [{ id: 'fake', name: 'fake', baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: 'k', models: ['m'], enabled: true, reasoning: { required: true } }],
+        // A vendor field outside the common ones is only read and written once configured.
+        providers: [{ id: 'fake', name: 'fake', baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: 'k', models: ['m'], enabled: true, compatibility: { reasoningField: 'vendor_reasoning' } }],
         aliases: [],
         aliasGeneration: 0,
       }))
@@ -371,7 +371,7 @@ describe('headless CLI', () => {
         expect(result.code).toBe(0)
         expect(bodies).toHaveLength(2)
         const replayed = bodies[1]!.messages.find((message) => message.role === 'assistant')
-        expect(replayed?.reasoning_content).toBe('CLI-THOUGHT')
+        expect(replayed?.vendor_reasoning).toBe('CLI-THOUGHT')
         expect(replayed?.tool_calls?.map((call) => call.id)).toEqual(['glob-1'])
         // The stored record is not printed a second time (only the streamed chunk is).
         expect(result.stdout.split('CLI-THOUGHT').length - 1).toBe(1)

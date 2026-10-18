@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import path from 'node:path'
-import type { ModelMessage, ToolSchema, ContentPart, ReasoningReplay } from '../llm/types.ts'
-import { selectReasoning, withoutReasoning } from '../llm/reasoning.ts'
+import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
+import { keepReplayableReasoning, withoutReasoning } from '../llm/reasoning.ts'
 import { textOnlyVisionFallback, withoutDescribeImage } from '../llm/adaptive-vision.ts'
 import { DESCRIBE_IMAGE_TOOL } from '../tools/describe-image.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
@@ -140,13 +140,6 @@ export interface BuildContextInput {
   readonly childSystemOverride?: string
   /** Bounded parent-conversation projection, when the child inherited one. */
   readonly inheritedContext?: string
-  /**
-   * Reasoning replay facts of the target route (`LlmService.reasoningReplay`).
-   * Only reasoning this route recorded, complete and inside its window, stays
-   * on history messages — and is counted in the budget. Absent (generic route):
-   * every reasoning record is dropped from the request (phase 05).
-   */
-  readonly reasoningReplay?: ReasoningReplay
   /**
    * The pre-rendered trusted `<environment_context>` block (date, platform,
    * workspace/git facts). Rendered by the host from
@@ -663,12 +656,9 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
   const window = historyWindow(input.events, mode.definition.sources.history, compaction)
   const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
   const describeAvailable = schemas.some((schema) => schema.name === DESCRIBE_IMAGE_TOOL)
-  // Reasoning projection for the target route: only what its adapter would
-  // replay stays (same route identity, complete, inside the window) and is
-  // counted below. A request without tools carries none — DeepSeek ignores the
-  // field there — and a generic route never carries any.
-  const replay = schemas.length > 0 ? input.reasoningReplay : undefined
-  const projectedHistory = selectReasoning(history.dated, replay)
+  // Complete reasoning rides on its message (the adapter picks the field) and
+  // is counted below; a cut-off record is dropped so it is neither sent nor counted.
+  const projectedHistory = keepReplayableReasoning(history.dated)
   let dated = input.nativeVision === false
     ? projectedHistory.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message], describeAvailable)[0]! }))
     : projectedHistory
@@ -1238,8 +1228,8 @@ function compactedHistoryMessage(compaction: { readonly summary: string; readonl
 function historyMessageCost(message: ModelMessage): number {
   let cost = estimateContentTokens(message.content)
   if (message.toolCalls !== undefined) cost += estimateTokens(JSON.stringify(message.toolCalls))
-  // Replayed reasoning is input like any other text (phase 05). The projection
-  // already dropped every record the request will not carry.
+  // Replayed reasoning is input like any other text. The projection already
+  // dropped every record the request will not carry.
   if (message.reasoning !== undefined) cost += estimateTokens(message.reasoning.text)
   return cost
 }
@@ -1254,12 +1244,10 @@ export function estimateConversationTokens(input: {
   readonly compaction?: { readonly summary: string; readonly coversSeq: number }
   readonly compactionRetainTokens?: number
   readonly attachments?: AttachmentLookup
-  /** Target route's replay facts; reasoning it would carry is counted (absent: none). */
-  readonly reasoningReplay?: ReasoningReplay
 }): number {
   const window = historyWindow(input.events, 'compact', input.compaction)
   let total = input.compaction !== undefined ? estimateContentTokens(compactedHistoryMessage(input.compaction).content) : 0
-  for (const entry of selectReasoning(historyMessages(input.events, window, input.compaction, input.compactionRetainTokens, input.attachments).dated, input.reasoningReplay)) {
+  for (const entry of keepReplayableReasoning(historyMessages(input.events, window, input.compaction, input.compactionRetainTokens, input.attachments).dated)) {
     total += historyMessageCost(entry.message)
   }
   return total

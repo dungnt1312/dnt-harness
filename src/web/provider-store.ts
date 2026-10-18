@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
 import { isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
-import { normalizeReasoningProfile, type ReasoningProfile } from '../harness/llm/reasoning.ts'
+import { legacyReasoningCompatibility, normalizeReasoningCompatibility, type ReasoningCompatibility } from '../harness/llm/reasoning.ts'
 
 /** Per-model operator overrides stored on one provider entry. */
 export interface ModelSettings {
@@ -35,23 +35,49 @@ export interface ProviderConfig {
   readonly enabled: boolean
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
   /**
-   * Explicit reasoning replay profile (phase 05), normalized here at the store
-   * boundary: a typed `{ field?, required, replayWindow? }`, never arbitrary
-   * body passthrough. Absent: detected from the endpoint (native DeepSeek only).
-   * An invalid stored profile is dropped (the entry keeps working generically).
+   * Reasoning overrides, opencode-style `{ reasoningField?, requireReasoning?,
+   * replayReasoning? }`, normalized here at the store boundary. Absent: the
+   * field is learned from each stream. Only the providers.json file sets it.
    */
-  readonly reasoning?: ReasoningProfile
+  readonly compatibility?: ReasoningCompatibility
+  /**
+   * The stored `compatibility` value exactly as written when it did not
+   * validate (or carried keys dnt does not use). Never applied; written back
+   * on save so a hand-edited entry is not erased by an unrelated mutation.
+   */
+  readonly rawCompatibility?: unknown
 }
 
-/** Normalize a stored/REST reasoning override; undefined when absent or invalid. */
-export function parseReasoningOverride(raw: unknown, providerId = '?'): ReasoningProfile | undefined {
-  if (raw === undefined || raw === null) return undefined
+/**
+ * Normalize the stored overrides. A phase-05 `reasoning: { field?, required }`
+ * entry is still read and rewritten as compatibility on the next save; when
+ * both exist, `compatibility` wins and a warning says so. An invalid value is
+ * warned about, not applied, and kept as `rawCompatibility`.
+ */
+export function parseCompatibility(candidate: Record<string, unknown>, providerId = '?'): { readonly compatibility?: ReasoningCompatibility; readonly rawCompatibility?: unknown } {
+  const raw = candidate['compatibility']
+  const legacy = candidate['reasoning']
+  const hasRaw = raw !== undefined && raw !== null
+  const hasLegacy = legacy !== undefined && legacy !== null
+  // The validation messages name keys/fields only, never values from the entry.
+  const warn = (message: string): void => console.warn(`provider-store: provider '${providerId}': ${message}`)
+  if (hasRaw && hasLegacy) warn("both 'compatibility' and legacy 'reasoning' are set; using 'compatibility'")
+  if (hasRaw) {
+    try {
+      const parsed = normalizeReasoningCompatibility(raw)
+      const keep = Object.keys(raw as object).some((key) => !(key in parsed)) ? { rawCompatibility: raw } : {}
+      return { ...(Object.keys(parsed).length > 0 ? { compatibility: parsed } : {}), ...keep }
+    } catch (error) {
+      warn(`ignoring invalid reasoning compatibility: ${error instanceof Error ? error.message : 'invalid'}`)
+      if (!hasLegacy) return { rawCompatibility: raw }
+    }
+  }
+  if (!hasLegacy) return {}
   try {
-    return normalizeReasoningProfile(raw)
+    return { compatibility: legacyReasoningCompatibility(legacy) }
   } catch (error) {
-    // The validation message names keys/fields only, never values from the entry.
-    console.warn(`provider-store: ignoring invalid reasoning profile for provider '${providerId}': ${error instanceof Error ? error.message : 'invalid'}`)
-    return undefined
+    warn(`ignoring invalid legacy reasoning entry: ${error instanceof Error ? error.message : 'invalid'}`)
+    return hasRaw ? { rawCompatibility: raw } : {}
   }
 }
 
@@ -234,10 +260,24 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
         if (Object.keys(value).length > 0) modelSettings[model] = { ...modelSettings[model], ...value }
       }
     }
-    const reasoning = parseReasoningOverride(candidate['reasoning'], id)
-    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...(reasoning !== undefined ? { reasoning } : {}) })
+    const compat = parseCompatibility(candidate, id)
+    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...compat })
   }
   return out
+}
+
+/**
+ * The on-disk shape: an unusable or partly unknown `compatibility` is written
+ * back exactly as it was read, so saving never erases what an operator wrote.
+ */
+function serializableStore(store: ProviderStore): unknown {
+  return {
+    ...store,
+    providers: store.providers.map(({ compatibility, rawCompatibility, ...rest }) => {
+      const value = rawCompatibility ?? compatibility
+      return value !== undefined ? { ...rest, compatibility: value } : rest
+    }),
+  }
 }
 
 /** Persist definitions and global defaults together through one atomic rename. */
@@ -247,7 +287,7 @@ export async function saveProviderStore(file: string, store: ProviderStore): Pro
   // the replacement file and parent directory before reporting a commit.
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
   try {
-    await new Promise<void>((resolve, reject) => writeFile(temp, JSON.stringify(store, null, 2), 'utf8', (error) => error === null ? resolve() : reject(error)))
+    await new Promise<void>((resolve, reject) => writeFile(temp, JSON.stringify(serializableStore(store), null, 2), 'utf8', (error) => error === null ? resolve() : reject(error)))
     const replacement = await open(temp, 'r')
     try { await flushIfSupported(replacement) } finally { await replacement.close() }
     await new Promise<void>((resolve, reject) => rename(temp, file, (error) => error === null ? resolve() : reject(error)))

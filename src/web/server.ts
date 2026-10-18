@@ -58,8 +58,8 @@ import { advertisedModelError, effectiveBudget } from '../harness/llm/effective-
 import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
-import type { LlmProvider, ModelMessage, ModelRequest, ReasoningPayload, ReasoningReplay, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
-import { handoffAnswerReasoning } from '../harness/llm/reasoning.ts'
+import type { LlmProvider, ModelMessage, ModelRequest, ReasoningPayload, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import { replayableReasoning } from '../harness/llm/reasoning.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -946,7 +946,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
       credentialHasher,
-      ...(entry.reasoning !== undefined ? { reasoning: entry.reasoning } : {}),
+      ...(entry.compatibility !== undefined ? { compatibility: entry.compatibility } : {}),
     })
 
   const injectionNames = (): readonly string[] =>
@@ -1508,10 +1508,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         if (entry === undefined) return 'no-fit'
         const events = entry.session.committedEvents
         const standing = recoverCanonicalCheckpoint(events)
-        // Reasoning the session's route would replay counts too (phase 05).
-        const route = resolveEffectiveModel(entry.session, entry.workspaceId)
-        const reasoningReplay = kernel.ctx.llm.reasoningReplay(route.provider ?? undefined, route.model ?? undefined)
-        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens, ...(reasoningReplay !== undefined ? { reasoningReplay } : {}) }
+        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens }
         const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
         const now = estimateConversationTokens({ ...shared, compaction: { summary: prepared.summary, coversSeq: prepared.cutoff } })
         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
@@ -1721,14 +1718,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    */
   /**
    * The final answer of a compaction handoff (captured snapshot, reconstructed
-   * snapshot, cache-aware summary): its reasoning rides along only where the
-   * request's route would replay it at that position (`handoffAnswerReasoning`:
-   * route source, completeness, window — `tool-loop` drops it, since the summary
-   * instruction is a new user message — and tools present). One rule, three paths.
+   * snapshot, cache-aware summary): its complete reasoning rides along exactly
+   * like any other assistant message of the request. One rule, three paths.
    */
-  const handoffAnswer = (request: { readonly messages: readonly ModelMessage[]; readonly tools?: readonly unknown[]; readonly providerName?: string; readonly model?: string }, answer: { readonly content: string; readonly reasoning?: ReasoningPayload }): ModelMessage => {
+  const handoffAnswer = (answer: { readonly content: string; readonly reasoning?: ReasoningPayload }): ModelMessage => {
     const message: ModelMessage = { role: 'assistant', content: answer.content, ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}) }
-    const reasoning = handoffAnswerReasoning(request.messages, message, kernel.ctx.llm.reasoningReplay(request.providerName, request.model), (request.tools?.length ?? 0) > 0)
+    const reasoning = replayableReasoning(message)
     return reasoning !== undefined ? { role: 'assistant', content: answer.content, reasoning } : { role: 'assistant', content: answer.content }
   }
 
@@ -1757,7 +1752,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         request: withoutAnswer,
         projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
         // Phase 05: the same handoff rule as capture (window, route, tools), applied to the log record.
-        finalAnswer: handoffAnswer(withoutAnswer, found.answer),
+        finalAnswer: handoffAnswer(found.answer),
         identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
         // The prefix's newest provider measurement calibrated this assembly; the fit check reuses it.
         ...(assembled.manifest.budget.measured?.ratio !== undefined ? { estimateRatio: assembled.manifest.budget.measured.ratio } : {}),
@@ -1899,7 +1894,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         const cachePrefixFits = previous !== undefined && JSON.stringify({ messages: previous.messages, tools: previous.tools }).length <= 200_000
         const cached = pair !== undefined && finalAnswer !== undefined && cachePrefixFits && previous?.providerName === pair.providerName && previous.model === pair.model
           // Phase 05: the same handoff rule as the snapshot paths.
-          ? createCacheAwareCompactionSummarizer(compactionStream, previous, handoffAnswer(previous, finalAnswer), { signal })
+          ? createCacheAwareCompactionSummarizer(compactionStream, previous, handoffAnswer(finalAnswer), { signal })
           : undefined
         const summarizer = cached === undefined ? fallback : async (input: Parameters<typeof fallback>[0]) => {
           try { return await cached() } catch (error) {
@@ -1971,7 +1966,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         turnId,
         pending,
         // Phase 05: one shared rule for every handoff path (see handoffAnswer).
-        finalAnswer: handoffAnswer(pending.request, answer),
+        finalAnswer: handoffAnswer(answer),
         identity: compactionIdentity(entry, requestPrefixHash({ messages: pending.request.messages, ...(pending.request.tools !== undefined ? { tools: pending.request.tools } : {}) })),
         store: snapshotStore,
       })
@@ -3929,11 +3924,6 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         : {}),
       ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
-      // Phase 05: only reasoning the target route recorded is kept and counted.
-      ...((): { reasoningReplay?: ReasoningReplay } => {
-        const replay = kernel.ctx.llm.reasoningReplay(effective.provider ?? undefined, effective.model ?? undefined)
-        return replay !== undefined ? { reasoningReplay: replay } : {}
-      })(),
       ...(scope?.childOf === undefined && scope?.role !== undefined
         ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
         : {}),

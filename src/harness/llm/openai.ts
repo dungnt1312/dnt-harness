@@ -6,10 +6,13 @@ import {
   outputCeiling, outputPolicy, outputTokenCap, routeIdentity, routeKey,
   type CredentialHasher, type MaxTokensField, type OutputCapSource, type RouteIdentity,
 } from './effective-model.ts'
-import type { ModelCompletion, ModelFinishReason, ProviderErrorReason, ReasoningReplay } from './types.ts'
+import type { ModelCompletion, ModelFinishReason, ProviderErrorReason } from './types.ts'
 import { messageText, ProviderError } from './types.ts'
 import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
-import { planReasoningReplay, REASONING_LIKE_KEYS, REASONING_REPLAY_REJECTED, REASONING_RESET_HINT, reasoningSourceKey, redactSecrets, resolveReasoningProfile, StreamRedactor, type ReasoningProfile } from './reasoning.ts'
+import {
+  defaultRequireReasoning, normalizeReasoningCompatibility, REASONING_FIELDS, REASONING_REPLAY_REJECTED, REASONING_RESET_HINT,
+  reasoningSourceFor, redactSecrets, StreamRedactor, wireReasoning, type ReasoningCompatibility, type WireReasoningPolicy,
+} from './reasoning.ts'
 
 interface StreamChoice {
   finish_reason?: unknown
@@ -42,14 +45,8 @@ interface WireMessage {
   content: WireContent
   tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
   tool_call_id?: string
-  /** The profile's reasoning field (validated, never a reserved key). */
+  /** The reasoning field (validated, never a reserved key). */
   [reasoningField: string]: unknown
-}
-
-/** Which assistant messages carry reasoning on the wire, and under which field. */
-interface WireReasoning {
-  readonly field: string
-  readonly eligible: ReadonlySet<number>
 }
 
 /**
@@ -73,13 +70,10 @@ function toWireContent(content: ModelMessage['content']): WireContent {
  * `toolCallId`. The inverse mapping happens on streamed `tool_calls` below,
  * so the internal vocabulary stays provider-neutral.
  */
-function toWireMessages(messages: readonly ModelMessage[], reasoning?: WireReasoning): WireMessage[] {
-  return messages.map((message, index) => {
-    // Reasoning rides only where the route's profile requires it and only for
-    // records the replay plan proved eligible (same route, complete, in window).
-    const thought = reasoning !== undefined && reasoning.eligible.has(index) && message.reasoning !== undefined
-      ? { [reasoning.field]: message.reasoning.text }
-      : {}
+function toWireMessages(messages: readonly ModelMessage[], reasoning: WireReasoningPolicy): WireMessage[] {
+  return messages.map((message) => {
+    const replay = message.role === 'assistant' ? wireReasoning(message, reasoning) : undefined
+    const thought = replay !== undefined ? { [replay.field]: replay.text } : {}
     if (message.role === 'assistant' && message.toolCalls !== undefined) {
       return {
         role: 'assistant',
@@ -141,12 +135,11 @@ export interface OpenAiCompletionsOptions {
    */
   readonly credentialHasher?: CredentialHasher
   /**
-   * Explicit reasoning replay profile (already normalized at the provider-store
-   * boundary). Unset: the native DeepSeek endpoint (`api.deepseek.com`) gets the
-   * strict DeepSeek profile, every other endpoint none. A model id merely
-   * containing `deepseek` never enables it.
+   * Reasoning overrides (opencode `compatibility`). Unset: reasoning is read
+   * from `reasoning_content` / `reasoning` / `reasoning_text` and replayed under
+   * the field it arrived in; DeepSeek routes also get `""` for turns without it.
    */
-  readonly reasoning?: ReasoningProfile
+  readonly compatibility?: ReasoningCompatibility
 }
 
 // Wire-compatibility detection and the output-cap policy live in the shared
@@ -252,12 +245,15 @@ export class OpenAiCompletionsProvider implements LlmProvider {
    */
   private readonly learnedCaps = new LearnedCaps()
   private readonly credential: string
+  private readonly compatibility: ReasoningCompatibility
 
   constructor(private readonly options: OpenAiCompletionsOptions) {
     this.name = options.name
     this.models = options.models ?? []
     this.fallbackModel = options.models?.[0] ?? 'default'
     this.credential = credentialGeneration(options.apiKey, options.credentialHasher)
+    // Validated here too: a programmatic caller never reaches the wire with a reserved field.
+    this.compatibility = options.compatibility === undefined ? {} : normalizeReasoningCompatibility(options.compatibility)
   }
 
   /**
@@ -289,15 +285,15 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     return routeIdentity({ baseUrl: this.options.baseUrl, model: model ?? this.fallbackModel, maxTokensField: this.maxTokensField, credentialGeneration: this.credential })
   }
 
-  /** The reasoning profile this endpoint requires, or undefined (generic: none). */
-  private get reasoningProfile(): ReasoningProfile | undefined {
-    return resolveReasoningProfile(this.options.reasoning, this.options.baseUrl)
-  }
-
-  reasoningReplay(model?: string): ReasoningReplay | undefined {
-    const profile = this.reasoningProfile
-    if (profile === undefined) return undefined
-    return { source: reasoningSourceKey(routeKey(this.routeIdentity(model ?? this.fallbackModel))), window: profile.replayWindow }
+  /** How assistant messages of a request for `model` carry their reasoning. */
+  private reasoningPolicy(model: string): WireReasoningPolicy {
+    const configuredField = this.compatibility.reasoningField
+    return {
+      ...(configuredField !== undefined ? { configuredField } : {}),
+      requireReasoning: this.compatibility.requireReasoning ?? defaultRequireReasoning({ provider: this.name, baseUrl: this.options.baseUrl, model, ...(configuredField !== undefined ? { configuredField } : {}) }),
+      ...(this.compatibility.replayReasoning === false ? { replay: false } : {}),
+      source: reasoningSourceFor(this.name, model),
+    }
   }
 
   /**
@@ -326,25 +322,12 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     const maxTokensField = this.maxTokensField
     const supportsStore = this.options.supportsStore ?? detectSupportsStore(this.name, this.options.baseUrl)
     const supportsPromptCacheKey = this.options.supportsPromptCacheKey ?? detectSupportsPromptCacheKey(this.options.baseUrl)
-    // Reasoning replay (phase 05): only a route whose profile requires it, and
-    // only with `tools` — DeepSeek documents that a request without tools
-    // ignores the field. The strict gate runs BEFORE the network: a tool-loop
-    // assistant message without complete reasoning of this exact route (another
-    // model/endpoint/credential, a cut-off reply, a pre-upgrade log) is an
-    // actionable error, never an empty string standing in for lost data.
-    const profile = this.reasoningProfile
-    const source = profile !== undefined ? reasoningSourceKey(routeKey(this.routeIdentity(model))) : undefined
-    let wireReasoning: WireReasoning | undefined
-    if (profile !== undefined && source !== undefined && hasTools) {
-      const plan = planReasoningReplay(request.messages, source, profile.replayWindow)
-      if (plan.missing > 0) {
-        throw new ProviderError(`reasoning replay unavailable: ${plan.missing} assistant message(s) of the current tool loop lack complete reasoning recorded on this route ('${model}' via ${this.name}); ${REASONING_RESET_HINT}`, { reason: 'unknown', phase: 'connect', classification: 'reasoning_replay_missing' })
-      }
-      wireReasoning = { field: profile.field, eligible: plan.eligible }
-    }
+    // Every assistant message carries its recorded reasoning, with or without
+    // tools: a field that comes and goes would also break the prompt-cache prefix.
+    const reasoning = this.reasoningPolicy(model)
     const body: Record<string, unknown> = {
       model,
-      messages: toWireMessages(request.messages, wireReasoning),
+      messages: toWireMessages(request.messages, reasoning),
       ...(hasTools
         ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
         : {}),
@@ -459,7 +442,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
           : classification === 'missing_required_cap'
             ? `endpoint requires an output cap (set maxOutputTokens for '${model}')`
             : REASONING_REPLAY_REJECTED.test(detail)
-              ? `endpoint requires reasoning replay this history cannot provide; ${REASONING_RESET_HINT}`
+              ? REASONING_RESET_HINT
               : reason
         const typed = classification === 'request' && REASONING_REPLAY_REJECTED.test(detail) ? 'reasoning_replay_rejected' as const : classification
         const error = new ProviderError(`provider HTTP ${response.status}: ${label}${excerpt === '' ? '' : `: ${excerpt}`}`, { reason, classification: typed, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
@@ -474,11 +457,12 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     }
 
     const calls: AccumulatedCall[] = []
-    // Thinking keys this stream reads: always `reasoning_content`, plus the
-    // profile's field when it names another one.
-    const thinkingKeys = profile !== undefined && profile.field !== 'reasoning_content' ? [profile.field, 'reasoning_content'] : ['reasoning_content']
+    // Thinking keys this stream reads, in lookup order: the configured field,
+    // then the common ones. The first that carries text names the field the
+    // reply's reasoning is replayed under (opencode `reasoningDelta`).
+    const thinkingKeys = [...new Set([...(reasoning.configuredField !== undefined ? [reasoning.configuredField] : []), ...REASONING_FIELDS])]
     const thinkingRedactor = new StreamRedactor(this.options.apiKey)
-    let reasoningProven = true
+    let reasoningField: string | undefined
     const reader = response.body.getReader()
     let finishReason: ModelFinishReason | undefined
     let boundary: 'done' | 'eof' = 'eof'
@@ -527,22 +511,17 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         const delta = choice?.delta
         const content = delta?.content
         const record = delta as Record<string, unknown> | undefined
-        // Thinking may arrive under `reasoning_content` (DeepSeek) and, for a
-        // profiled route, under the profile's own field (`delta.reasoning` on
-        // some relays). Both are validated like content.
+        // `reasoning_content` is validated like content (the historical
+        // contract); the other keys are looser across relays, so a non-string
+        // value there is ignored rather than failing the stream. One piece per
+        // delta: a relay mirroring the text under two keys is read once.
         const thinkingValues = thinkingKeys.map((key) => record?.[key])
-        if ((content !== undefined && content !== null && typeof content !== 'string') || thinkingValues.some((value) => value !== undefined && value !== null && typeof value !== 'string') || (delta?.tool_calls !== undefined && delta.tool_calls !== null && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
-        const thoughts = thinkingValues.filter((value): value is string => typeof value === 'string' && value !== '')
-        if (alreadyFinished && (delta?.content || thoughts.length > 0 || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
-        // One piece per delta: relays that mirror the same text under two keys
-        // are read once; two DIFFERENT texts cannot be ordered faithfully.
-        const thinking = thoughts[0]
-        if (thoughts.some((value) => value !== thinking)) reasoningProven = false
-        // A strict route must PROVE its record is whole: thinking under a
-        // reasoning-like key it does not parse means the record would be
-        // missing text, so no record is published at all (the gate then asks
-        // for a reset) — never an empty string standing in for lost reasoning.
-        if (profile !== undefined && record !== undefined && REASONING_LIKE_KEYS.some((key) => !thinkingKeys.includes(key) && record[key] !== undefined && record[key] !== null && record[key] !== '')) reasoningProven = false
+        const strictThinking = record?.['reasoning_content']
+        if ((content !== undefined && content !== null && typeof content !== 'string') || (strictThinking !== undefined && strictThinking !== null && typeof strictThinking !== 'string') || (delta?.tool_calls !== undefined && delta.tool_calls !== null && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
+        const thoughtIndex = thinkingValues.findIndex((value) => typeof value === 'string' && value !== '')
+        const thinking = thoughtIndex === -1 ? undefined : thinkingValues[thoughtIndex] as string
+        if (alreadyFinished && (delta?.content || thinking !== undefined || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
+        if (thinking !== undefined) reasoningField ??= thinkingKeys[thoughtIndex]
         outputBytes += encodedBytes(delta?.content ?? '') + encodedBytes(thinking ?? '')
         if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'model output exceeds limit')
         // Reasoning-capable models emit thinking separately from content:
@@ -610,7 +589,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       if (heldThinking !== '') yield { type: 'delta', delta: heldThinking, thinking: true }
       const completion: ModelCompletion = {
         type: 'completion', finishReason, transport: boundary, policy: boundary === 'done' ? 'strict' : 'finish-eof', transportSettled: true,
-        ...(source !== undefined && reasoningProven ? { reasoningSource: source } : {}),
+        ...(reasoningField !== undefined ? { reasoningSource: reasoning.source, reasoningField } : {}),
         ...(thinkingRedactor.changed ? { reasoningRedacted: true as const } : {}),
       }
       // A `length` finish reaches the agent loop, which recovers in-turn. Tool

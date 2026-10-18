@@ -40,41 +40,60 @@ backwards-readable.
   `fallbackMaxOutputTokens` were not implemented. The bounded-relearn
   behaviour above was kept.
 
-## Reasoning replay (DeepSeek thinking + tools)
+## Reasoning replay (any OpenAI-compatible provider)
 
-- The native endpoint (`api.deepseek.com`, exact host) uses a **strict
-  profile**: `{ field: 'reasoning_content', required: true, replayWindow:
-  'conversation' }`. Reasoning from the same route is sent back on requests
-  that carry tools. A model id containing `deepseek` on another endpoint does
-  **not** enable replay. A relay opts in through `providers.json`
-  `reasoning: { field, required, replayWindow }` (validated; reserved keys
-  refused; an invalid profile is dropped with a warning).
-- Missing reasoning is **never fabricated**. If the active tool loop (since the
-  last user message) lacks complete reasoning from this route, the request
-  fails **before the network** with *"start a new session, or explicitly reset
-  the context …"*. Causes: model/endpoint/key switch mid-loop, a reply cut off
-  at `length`, or a restart without the persisted route secret. A DeepSeek 400
-  ("`reasoning_content` … must be passed back") gets the same hint, with no
-  retry.
-- Legacy sessions (no stored reasoning) still open and list. Older turns are
-  left without the field. If the live endpoint rejects that, the actionable
-  400 above applies.
-- **`route-identity.secret`**: a new per-install file next to `providers.json`
-  (32 random bytes, mode 0600 on POSIX). It keys route fingerprints with
-  HMAC, so lineage survives restarts without storing credentials. It contains
-  no credential and is safe to delete; identities then change once, and an
-  open tool loop asks for a new session. If the data dir is unwritable, an
-  in-memory secret is used and lineage is process-local (never wrongly
-  reused).
-- Storage: `assistant/message` may carry an optional `reasoning` record.
-  Compaction snapshots become `v: 2` only when they include reasoning. v1
-  snapshots and digests validate unchanged. The SSE stream strips the stored
-  record; UI thinking display is unchanged.
+Modelled on opencode's OpenAI-chat adapter: no host list, no per-provider
+switch.
+
+- **Capture**: thinking is read from the configured field, then
+  `reasoning_content`, `reasoning`, `reasoning_text`. The first field that
+  carries text is stored with the reasoning (`reasoning.field`) on the
+  `assistant/message`, for every provider. A reply without thinking stores
+  no record (never an empty one).
+- **Replay**: every assistant message of every request (with or without
+  tools, so the prompt-cache prefix stays stable) carries its complete
+  reasoning. The field is chosen as configured field → the field observed on
+  this provider/model's own stream → `reasoning_content`. A session that only
+  ever used an endpoint without reasoning sends no reasoning field. Reasoning
+  is counted in the context budget, so thinking-heavy sessions reach
+  compaction sooner than before.
+- **`requireReasoning`**: a message with no reasoning still gets `""`. On by
+  default for DeepSeek (provider name `deepseek`, a `deepseek.com` base URL
+  or a model id containing `deepseek`) and whenever `reasoningField` is set;
+  off otherwise.
+- **Switching models**: the readable text crosses over to the new
+  provider/model under its configured field or `reasoning_content` (opencode
+  parity). A key rotation or a `baseUrl` edit keeps the provider id and so
+  keeps the observed field.
+- **Opt-out**: `replayReasoning: false` for an endpoint that streams reasoning
+  but refuses it as input. Reasoning is still recorded, never sent.
+- A reply cut off at `length` is stored as `complete: false` and never
+  replayed. There is no pre-network gate: an endpoint 400 such as
+  "`reasoning_content` … must be passed back" is classified
+  `reasoning_replay_rejected`, not retried, and suggests a new session.
+- **Configuration** (optional, `providers.json` only; no REST/UI field yet),
+  same names as opencode: `compatibility: { reasoningField?,
+  requireReasoning?, replayReasoning? }`. Reserved message keys (and the
+  structured `reasoning_details`) are refused. An invalid value is warned
+  about, not applied, and written back unchanged on save; keys dnt does not
+  use are kept too. A phase-05 `reasoning: { field, required: true }` entry
+  is read as `{ reasoningField: field, requireReasoning: true }`, and
+  `required: false` as `{ replayReasoning: false }`; it is rewritten as
+  `compatibility` on the next save.
+- **`route-identity.secret`** (per-install, next to `providers.json`) still
+  keys learned output caps. Reasoning no longer depends on it.
+- Storage: `assistant/message` may carry an optional `reasoning` record
+  (`text`, `field?`, `complete`, `source`, `redacted?`). Records written
+  before `field` existed stay valid. Compaction snapshots become `v: 2` only
+  when they include reasoning; v1 snapshots and digests validate unchanged.
+  The SSE stream strips the stored record; UI thinking display is unchanged.
 - **Rollback caveat:** older binaries ignore the unknown `reasoning` field, but
   their validators refuse v2 snapshot sidecars and fall back to fold/
-  re-summarize. Back up the data dir before a staged rollout, and roll back
-  before new writes accumulate if you need byte-identical behaviour.
-- Native thinking+tools support is **not claimed** until the opt-in live smoke
+  re-summarize. Since any provider that streams reasoning now writes v2
+  snapshots (not only DeepSeek with tools), more sessions are affected. Back
+  up the data dir before a staged rollout. A phase-05 binary also reads
+  `compatibility` as unknown and loses a migrated `reasoning` override.
+- Live behaviour is **not claimed** until the opt-in smoke
   (`scripts/smoke-deepseek-reasoning.ts`, needs `DEEPSEEK_API_KEY`) passes.
 
 ## Terminal teardown

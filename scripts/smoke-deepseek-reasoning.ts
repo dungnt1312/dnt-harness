@@ -1,6 +1,6 @@
 /**
- * PH4-G (phase 05, plans/261017-runtime-provider-hardening): opt-in LIVE smoke
- * of native DeepSeek thinking + tools through the real adapter and agent loop.
+ * Opt-in LIVE smoke of DeepSeek thinking + tools through the real adapter and
+ * agent loop (the provider-agnostic reasoning round-trip, on one real endpoint).
  *
  *   DEEPSEEK_API_KEY=… bun scripts/smoke-deepseek-reasoning.ts [model]
  *

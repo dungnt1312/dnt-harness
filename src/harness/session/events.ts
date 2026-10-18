@@ -35,9 +35,9 @@ export type SessionEvent =
   | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' | 'hook'; readonly summary?: string } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
-  // `reasoning` (phase 05): the attempt's thinking text, recorded only for a
-  // route whose profile requires reasoning replay. Absent on legacy logs and
-  // generic routes. Never part of `content`, child reports or delegation text.
+  // `reasoning`: the attempt's thinking text and the field it streamed under,
+  // for any provider that streamed some. Absent on legacy logs and replies
+  // without thinking. Never part of `content`, child reports or delegation text.
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls; readonly reasoning?: ReasoningPayload } & SessionEventStamp)
   | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly executionId?: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
   // A tool run by host prompt expansion before the first model step (Claude
@@ -451,9 +451,8 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
         messages.push({ role: 'user', content: userMessageContent(event.content, event.attachments, attachments) })
         break
       case 'assistant/message':
-        // Reasoning rides along as recorded; which of it a request may keep is
-        // decided per target route by the context builder (`selectReasoning`)
-        // and again, authoritatively, by the adapter's replay plan.
+        // Reasoning rides along as recorded; the context builder drops cut-off
+        // records and the adapter picks the wire field.
         messages.push({
           role: 'assistant',
           content: event.content,

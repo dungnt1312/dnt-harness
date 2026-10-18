@@ -7,7 +7,7 @@ import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from
 import { canonicalCall } from '../tools/names.ts'
 import { LogicalRequest } from '../llm/request-lifecycle.ts'
 import { encodedBytes, protocolError, validateCompletion, validateToolBatch, WIRE_LIMITS } from '../llm/completion.ts'
-import { capturedReasoning, StreamRedactor } from '../llm/reasoning.ts'
+import { capturedReasoning, reasoningSourceFor, StreamRedactor } from '../llm/reasoning.ts'
 import type { ReasoningPayload } from '../llm/types.ts'
 import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
@@ -664,12 +664,12 @@ export class Agent {
     // request as too large would be sent the identical request forever.
     let full = ''
     let calls: readonly ToolCall[] = []
-    // Thinking text of the CURRENT attempt only (phase 05): reset with
-    // `full`/`calls`, so an abandoned or retried attempt never leaks into the
-    // answer that finally succeeds. Published only on a valid completion whose
-    // adapter named the route the reasoning must be replayed to.
+    // Thinking text of the CURRENT attempt only: reset with `full`/`calls`, so
+    // an abandoned or retried attempt never leaks into the answer that finally
+    // succeeds. Published only on a valid completion.
     let thinking = ''
     let reasoningSource: string | undefined
+    let reasoningField: string | undefined
     let thinkingRedacted = false
     let thinkingRedactor = new StreamRedactor()
     // The reply ended at the model's output-token limit (finish `length`).
@@ -715,6 +715,7 @@ export class Agent {
       calls = []
       thinking = ''
       reasoningSource = undefined
+      reasoningField = undefined
       thinkingRedacted = false
       // Per attempt: an abandoned attempt's held tail is dropped, never persisted.
       thinkingRedactor = new StreamRedactor()
@@ -768,9 +769,8 @@ export class Agent {
                 thinking += held
                 this.session.append({ type: 'assistant/chunk', stepId, delta: held, thinking: true })
               }
-              // The adapter names a source only when it proved the reasoning it
-              // parsed is the whole reasoning; otherwise nothing is recorded.
               if (typeof event.reasoningSource === 'string' && event.reasoningSource !== '') reasoningSource = event.reasoningSource
+              if (typeof event.reasoningField === 'string' && event.reasoningField !== '') reasoningField = event.reasoningField
               if (event.reasoningRedacted === true) thinkingRedacted = true
               if (calls.length > 0) emitted = true
               continue
@@ -880,11 +880,15 @@ export class Agent {
         stepId,
         content: full,
         ...(calls.length > 0 ? { toolCalls: calls } : {}),
-        // A `length` cutoff proves nothing about the reasoning being whole:
-        // it is kept as `complete: false` and never replayed as complete.
+        // Any provider's thinking is kept for replay. No thinking, no record:
+        // an empty string is never stored as if it had been streamed. A
+        // `length` cutoff is kept as `complete: false` and never replayed.
         ...((): { reasoning?: ReasoningPayload } => {
-          if (reasoningSource === undefined) return {}
-          const record = capturedReasoning(thinking, !truncated, reasoningSource, { redacted: thinkingRedacted || thinkingRedactor.changed })
+          if (thinking === '') return {}
+          // Same model resolution as the adapter: the request's, else the provider's fallback.
+          const model = request.model ?? (provider !== undefined ? safeProviderModels(this.ctx, provider)[0] : undefined) ?? 'default'
+          const source = reasoningSource ?? reasoningSourceFor(provider ?? '', model)
+          const record = capturedReasoning(thinking, !truncated, source, { redacted: thinkingRedacted || thinkingRedactor.changed, ...(reasoningField !== undefined ? { field: reasoningField } : {}) })
           return record !== undefined ? { reasoning: record } : {}
         })(),
         ...(request.model !== undefined || provider !== undefined
@@ -1089,6 +1093,14 @@ function matchClaimedContents(contents: readonly string[], claimed: readonly Inb
     }
   }
   return matched
+}
+
+function safeProviderModels(ctx: Context, provider: string): readonly string[] {
+  try {
+    return (ctx.get('llm') as { providerModels?: (name: string) => readonly string[] } | undefined)?.providerModels?.(provider) ?? []
+  } catch {
+    return []
+  }
 }
 
 function safeProviderName(ctx: Context): string | undefined {

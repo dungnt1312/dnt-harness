@@ -60,8 +60,8 @@ export function createCacheAwareCompactionSummarizer(
   finalAnswer: string | ModelMessage,
   streamOptions?: StreamOptions,
 ): () => Promise<string> {
-  // A message form keeps the answer's recorded reasoning (phase 05): a strict
-  // route then replays it like every other assistant turn of the prefix.
+  // A message form keeps the answer's recorded reasoning: it is replayed like
+  // every other assistant turn of the prefix.
   const answer: ModelMessage = typeof finalAnswer === 'string' ? { role: 'assistant', content: finalAnswer } : finalAnswer
   return async () => {
     // COMPACT_SUMMARY_PROMPT names a <conversation> envelope and <earlier-summary>;
