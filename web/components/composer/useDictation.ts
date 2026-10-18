@@ -15,7 +15,10 @@ function configured(): Promise<boolean> {
   return new Promise((resolve) => {
     configuredWaiters.push((value) => resolve(value))
     if (configuredWaiters.length > 1) return
-    void getSpeechToTextSettings()
+    // Started inside a promise chain so a lookup that throws, however it
+    // fails, still settles every waiter (mic hidden) instead of escaping.
+    void Promise.resolve()
+      .then(() => getSpeechToTextSettings())
       .then((settings) => { configuredCache = settings.provider !== null && settings.model !== null })
       .catch(() => { configuredCache = false })
       .finally(() => { const value = configuredCache === true; const waiters = [...configuredWaiters]; configuredWaiters.length = 0; for (const waiter of waiters) waiter(value) })
