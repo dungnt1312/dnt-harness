@@ -303,6 +303,16 @@ The response is `{ days: [{ date, model, input, cached, cacheableInput, cacheRep
 
 Four provider/model references behind **Settings → Providers & Models** (the **Images** sub-tab holds the first two, **Videos** the third, **Git** the fourth), all with one contract (`src/web/model-pair-store.ts`). `image-generation` serves the `GenerateImage` and `EditImage` tools, `video-generation` serves `GenerateVideo` (see `docs/capabilities.md`). The body and response are `{ provider, model }`, both strings, or both `null` when the feature is off. `PUT` answers `400` for an unknown provider id or a half-filled pair. Each pair is stored in its own file (`image-generation.json`, `image-understanding.json`, `video-generation.json`, `commit-message.json`) beside `providers.json`; the key and base URL stay on the provider entry. `image-understanding` serves `DescribeImage` when the active chat model has effective `vision: false`; unlike the other two, its model must accept image input through chat completions rather than an Images or Videos endpoint. `commit-message` serves the Git panel's Generate Commit Message button; a pair that is set but unusable is reported as its own error, never silently replaced, and with no pair the `fast` model alias stands in.
 
+### `GET/PUT /api/speech-to-text`, `POST /api/speech-to-text/transcribe`
+
+Composer dictation. `GET/PUT /api/speech-to-text` is a fifth provider/model pair with the same `{ provider, model }` contract as above (the **Voice** panel in Settings), but its `PUT` accepts only a provider that serves the `stt` kind; every other pair accepts only `chat` providers. The pair is stored beside `providers.json` like the others.
+
+`POST /api/speech-to-text/transcribe` takes the raw audio bytes as the request body (capped by the `maxAttachmentBytes` limit) and an optional `?language=` two-letter hint such as `vi`. The server forwards them as one multipart `POST {baseUrl}/audio/transcriptions` to the configured provider (the OpenAI-compatible Transcriptions API, so OpenAI, Groq and Mistral work by configuration alone; 60 s timeout, 25 MB per file) and answers `{ text }`. It does not store the audio. An unconfigured pair, a provider that no longer exists, is disabled, lacks the `stt` kind or has no base URL answers `400` with the Settings fix; a provider or transport failure answers `502`.
+
+A provider's optional `kinds` field (`'chat'` and/or `'stt'`; absent means chat only) says what it serves. An `stt`-only provider never enters the chat model registry or any chat picker; it is still listed by `GET /api/providers` so the Voice panel can choose it.
+
+In the client, the composer shows a push-to-talk mic button (`web/components/composer/useDictation.ts`) only when the browser can record and the pair is set. It records with `MediaRecorder`, sends the blob on stop, and inserts the returned text at the caret. A failure leaves the draft untouched and reports the reason.
+
 ### `GET|HEAD /api/workspaces/:wid/videos/:id`
 
 Streams a video stored by `GenerateVideo`. It is read-only, and there is no upload route. The id is the sha256 of the bytes, and the type is sniffed from them. A single `Range` is honored with `206` and an unsatisfiable one answers `416`. An unknown id or an id that is not a digest answers `404`. The response is immutable and cacheable.
@@ -682,6 +692,12 @@ type WebEnvelope =
   registrations.
 - The browser client (`web/lib/api.ts`) uses `EventSource` and reconnects on its
   own; the UI derives the connection state (`connecting` / `open` / `reconnecting`).
+- `?view=delegations` is an opt-in projection: the snapshot or resume replay
+  and every live `session` frame keep only `agent/child-spawn`,
+  `agent/child-resume` and `agent/child-result` events. It is meant for a
+  parent the client reads only delegation facts from (`useSessionStream`'s
+  `delegationsOnly`), so it skips the full history replay. The stored log and
+  default clients are unchanged, and `approval` frames are not filtered.
 - Thinking-capable models stream `assistant/chunk` frames marked
   `"thinking": true`; the client renders them in a collapsible thinking panel
   and they never enter model history.
