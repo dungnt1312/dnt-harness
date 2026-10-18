@@ -1,3 +1,7 @@
+---
+status: completed
+---
+
 # Session switch patch SDD completion
 
 ## Scope and constraints

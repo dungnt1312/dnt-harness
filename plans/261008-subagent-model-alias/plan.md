@@ -1,7 +1,7 @@
 ---
 title: "Global subagent model aliases"
 description: "Triển khai alias model toàn cục cho role và hai bề mặt spawn, với persistence nguyên tử, phân giải fail-closed và UI quản trị."
-status: pending
+status: completed
 priority: P1
 effort: 14h
 branch: feat/subagent-model-alias

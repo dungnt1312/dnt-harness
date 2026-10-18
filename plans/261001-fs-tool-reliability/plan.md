@@ -1,6 +1,6 @@
 # File tool reliability (Read / Write / Edit)
 
-Status: implemented (uncommitted), live on PM2 · 2026-10-01
+Status: completed (merged on dev; spec tests/capabilities/fs-text-document.spec.ts tracked) · 2026-10-01
 
 Verification: full suite 1284/1284, `tsc --noEmit` clean, new
 `tests/capabilities/fs-text-document.spec.ts` (17 cases); Read-format
