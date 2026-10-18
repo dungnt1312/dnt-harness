@@ -1,0 +1,164 @@
+name: Windows smoke
+
+# Windows release smoke of the packed npm tarball, installed globally with
+# Bun 1.4.3: launcher version, PM2 launch (absolute Bun interpreter),
+# /api/health, workbench terminals over HTTP, bun-pty ConPTY smoke, the
+# reviewed bun-pty DLL hashes, pm2 restart/stop budget, and a headless chat
+# against a local fake OpenAI-compatible gateway (no provider secret).
+# See docs/release-checklist.md.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/windows-smoke.yml
+      - bin/**
+      - scripts/pm2-smoke-windows.mjs
+      - scripts/pty-smoke-windows.mjs
+      - scripts/e2e/fake-gateway.mjs
+      - src/web/terminals.ts
+      - src/capabilities/shell/**
+      - package.json
+      - bun.lock
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-smoke:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      APP: dnt-smoke
+      PORT: '3982'
+      GATEWAY_PORT: '6790'
+    steps:
+      # Pinned to commit SHAs: this workflow is also called by release.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.20.0
+      - run: bun install --frozen-lockfile
+      - name: Host
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          bun --version
+          node --version
+
+      - name: npm pack and install the tarball globally with Bun
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'pack'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          npm pack --pack-destination $out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $tarballs = @(Get-ChildItem $out -Filter *.tgz)
+          if ($tarballs.Count -ne 1) { throw "expected one tarball, found $($tarballs.Count)" }
+          bun add -g $tarballs[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $bin = (bun pm bin -g).Trim()
+          Add-Content $env:GITHUB_PATH $bin
+          "global bin: $bin"
+
+      - name: dnt-harness --version equals package.json version
+        run: |
+          $expected = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $actual = (dnt-harness --version).Trim()
+          "installed: $actual, package.json: $expected"
+          if ($actual -ne $expected) { throw "version mismatch" }
+
+      - name: Installed bun-pty DLLs match the reviewed hashes (bun-pty 0.5.1)
+        run: |
+          $reviewed = @{
+            'rust_pty.dll'       = '6F45D637E26365BD72A16964453047E2D563F2E3FD0D374A9182C0F38C6F5CFC'
+            'rust_pty_arm64.dll' = 'CA64B48DBC617DD5684D405DDE4A605470F05B952153C36EF08A2E39B1D15E76'
+          }
+          $bunHome = if ($env:BUN_INSTALL) { $env:BUN_INSTALL } else { Join-Path $env:USERPROFILE '.bun' }
+          $global = Join-Path $bunHome 'install\global'
+          $dlls = @(Get-ChildItem $global -Recurse -File -Filter 'rust_pty*.dll' | Where-Object { $_.FullName -match '[\\/]bun-pty[\\/]' })
+          if ($dlls.Count -eq 0) { throw "no bun-pty DLL found under $global" }
+          $failed = $false
+          foreach ($name in $reviewed.Keys) {
+            $copies = @($dlls | Where-Object Name -eq $name)
+            if ($copies.Count -eq 0) { "MISSING $name"; $failed = $true }
+            foreach ($dll in $copies) {
+              $hash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash
+              $ok = $hash -eq $reviewed[$name]
+              "$(if ($ok) { 'OK  ' } else { 'BAD ' }) $hash $($dll.FullName)"
+              if (-not $ok) { $failed = $true }
+            }
+          }
+          foreach ($dll in $dlls) {
+            if (-not $reviewed.ContainsKey($dll.Name)) { "UNREVIEWED $($dll.FullName)"; $failed = $true }
+          }
+          if ($failed) { throw 'bun-pty DLL does not match the reviewed hashes' }
+
+      - name: Bun PTY (ConPTY) smoke from the checkout
+        run: bun scripts/pty-smoke-windows.mjs --require
+        timeout-minutes: 5
+
+      - name: Install pm2
+        run: |
+          npm install -g pm2@7.0.4
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pm2 -v
+
+      - name: dnt-harness start pm2
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'smoke-root'
+          New-Item -ItemType Directory -Force $work, (Join-Path $env:RUNNER_TEMP 'smoke-data') | Out-Null
+          Set-Location $work
+          dnt-harness start pm2 --name $env:APP --port $env:PORT --data-dir (Join-Path $env:RUNNER_TEMP 'smoke-data')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: PM2 interpreter, health, terminals, restart and stop
+        run: bun scripts/pm2-smoke-windows.mjs --name $env:APP --port $env:PORT
+        timeout-minutes: 5
+
+      - name: Headless chat against a local fake OpenAI-compatible gateway
+        timeout-minutes: 5
+        run: |
+          $gateway = Start-Process node -ArgumentList 'scripts/e2e/fake-gateway.mjs', $env:GATEWAY_PORT, 'plain' -PassThru -NoNewWindow
+          try {
+            $up = $false
+            for ($i = 0; $i -lt 100 -and -not $up; $i++) {
+              try { $up = (Invoke-WebRequest "http://127.0.0.1:$($env:GATEWAY_PORT)/health" -UseBasicParsing).StatusCode -eq 200 } catch { Start-Sleep -Milliseconds 100 }
+            }
+            if (-not $up) { throw 'fake gateway never became healthy' }
+            $dir = Join-Path $env:RUNNER_TEMP 'chat'
+            New-Item -ItemType Directory -Force (Join-Path $dir 'ws'), (Join-Path $dir 'data') | Out-Null
+            $config = Join-Path $dir 'providers.json'
+            @{
+              version = 2
+              defaults = @{ provider = 'fakegw'; model = 'fake-model'; thinkingLevel = $null }
+              providers = @(@{ id = 'fakegw'; name = 'fakegw'; baseUrl = "http://127.0.0.1:$($env:GATEWAY_PORT)/v1"; apiKey = ''; models = @('fake-model'); enabled = $true })
+              aliases = @()
+              aliasGeneration = 0
+            } | ConvertTo-Json -Depth 5 | Set-Content $config -Encoding utf8
+            $reply = dnt-harness chat --message 'hello' --config $config --root (Join-Path $dir 'ws') --data-dir (Join-Path $dir 'data') 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $reply
+            if ($code -ne 0) { throw "chat exited with $code" }
+            if ($reply -notmatch 'e2e-plain-ok') { throw 'chat reply did not reach stdout' }
+          } finally {
+            Stop-Process -Id $gateway.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: PM2 logs
+        if: failure()
+        run: pm2 logs $env:APP --lines 200 --nostream
+      - name: Remove the PM2 app
+        if: always()
+        run: |
+          if (Get-Command pm2 -ErrorAction SilentlyContinue) {
+            pm2 delete $env:APP
+            pm2 kill
+          }
+          exit 0
