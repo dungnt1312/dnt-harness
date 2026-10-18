@@ -190,3 +190,125 @@ describe('MCP mutation linearization', () => {
     expect(await livePids(started)).toEqual([Number(queryPid)])
   }, 40_000)
 })
+
+/** A plain Streamable HTTP MCP server that records the path and bearer of every request. */
+async function startHttpMcp(): Promise<{ readonly origin: string; readonly seen: Array<{ path: string; auth: string }> }> {
+  const seen: Array<{ path: string; auth: string }> = []
+  http = createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk: Buffer) => { body += chunk.toString('utf8') })
+    req.on('end', () => {
+      seen.push({ path: req.url ?? '', auth: req.headers.authorization ?? '' })
+      if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+      const rpc = JSON.parse(body) as { id?: number; method: string }
+      if (rpc.id === undefined) { res.writeHead(202); res.end(); return }
+      const result = rpc.method === 'initialize'
+        ? { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'http-fixture', version: '1' } }
+        : { tools: [{ name: 'ping', inputSchema: { type: 'object', properties: {} } }] }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }))
+    })
+  })
+  await new Promise<void>((resolve) => http!.listen(0, '127.0.0.1', resolve))
+  const address = http.address()
+  if (address === null || typeof address === 'string') throw new Error('no port')
+  return { origin: `http://127.0.0.1:${address.port}`, seen }
+}
+
+describe('MCP config reconciliation', () => {
+  it('command, env, limits, allowlist, transport, URL and auth changes each retire the old runtime and leave one current generation', async () => {
+    const { first: ws, stdio } = await boot()
+    const started = path.join(home, 'started.log')
+    const remote = await startHttpMcp()
+    expect((await ws.api('/secrets/TOK1', { value: 'one' }, 'PUT')).status).toBe(200)
+    expect((await ws.api('/secrets/TOK2', { value: 'two' }, 'PUT')).status).toBe(200)
+    const nodeLink = path.join(home, 'node-link')
+    await fs.symlink(process.execPath, nodeLink)
+    expect((await ws.api('/mcp/fx', stdio({ INIT_FILE: started }))).status).toBe(201)
+    expect((await ws.api('/mcp/fx/enable')).status).toBe(200)
+    let generation = (await ws.row('fx'))!.generation
+    let runningPid = (await livePids(started))[0]!
+
+    /** Save a change, check the old runtime is gone, then bring it back up once. */
+    const change = async (patch: Record<string, unknown>): Promise<void> => {
+      const current = await ws.stored('fx')
+      expect((await ws.api('/mcp/fx', { ...current, ...patch })).status).toBe(201)
+      const saved = await ws.row('fx')
+      expect(saved?.generation).toBeGreaterThan(generation)
+      expect(saved?.status).toBe('idle')
+      expect(saved?.discoveredTools).toEqual([])
+      if (runningPid !== 0) expect(alive(runningPid)).toBe(false)
+      const reconnected = await ws.api('/mcp/fx/reconnect')
+      expect(reconnected.status).toBe(200)
+      const row = await ws.row('fx')
+      expect(row?.status).toBe('ready')
+      // Reconnecting does not move the generation: one runtime per committed config.
+      expect(row?.generation).toBe(saved?.generation)
+      generation = row!.generation
+      const live = await livePids(started)
+      expect(live.length).toBeLessThanOrEqual(1)
+      runningPid = live[0] ?? 0
+    }
+
+    await change({ env: { INIT_FILE: started, EXTRA: 'a' } })
+    await change({ command: nodeLink })
+    await change({ resourceLimits: { maxLifetimeMs: 600_000, enforcement: 'best_effort' } })
+    await change({ allowedTools: ['query'] })
+    expect((await ws.row('fx'))?.discoveredTools).toContain('query')
+
+    // stdio -> HTTP: the process is gone and only the HTTP runtime answers.
+    await change({ transport: 'http', url: `${remote.origin}/a`, auth: { type: 'bearer', token: '${TOK1}' }, command: undefined, args: undefined, env: undefined, resourceLimits: undefined })
+    expect(await livePids(started)).toEqual([])
+    expect(remote.seen.some((request) => request.path === '/a' && request.auth === 'Bearer one')).toBe(true)
+
+    let mark = remote.seen.length
+    await change({ url: `${remote.origin}/b` })
+    expect(remote.seen.slice(mark).length).toBeGreaterThan(0)
+    expect(remote.seen.slice(mark).every((request) => request.path === '/b')).toBe(true)
+
+    mark = remote.seen.length
+    await change({ auth: { type: 'bearer', token: '${TOK2}' } })
+    expect(remote.seen.slice(mark).length).toBeGreaterThan(0)
+    expect(remote.seen.slice(mark).every((request) => request.auth === 'Bearer two')).toBe(true)
+  }, 60_000)
+})
+
+describe('retired MCP runtimes', () => {
+  it('list-change refreshes of a fenced, disabled or deleted runtime never republish its tools or restart it', async () => {
+    const { first: ws, stdio, requests } = await boot()
+    const busy = (name: string) => stdio({
+      INIT_FILE: path.join(home, `${name}-started.log`), LIST_FILE: path.join(home, `${name}-lists.log`),
+      LIST_CHANGED_EVERY_MS: '40', LIST_DELAY_MS: '150',
+    })
+    const listings = (name: string) => lines(path.join(home, `${name}-lists.log`))
+    const started = (name: string) => path.join(home, `${name}-started.log`)
+    for (const name of ['saved', 'off', 'gone']) {
+      expect((await ws.api(`/mcp/${name}`, busy(name))).status).toBe(201)
+      expect((await ws.api(`/mcp/${name}/enable`)).status).toBe(200)
+      // Refreshes triggered by the notifications are now running.
+      await expect.poll(async () => (await listings(name)).length, { timeout: 10_000, interval: 25 }).toBeGreaterThan(2)
+    }
+
+    // A save fences `saved`, a disable and a delete retire the other two, each
+    // while a slow refresh of the old runtime is in flight.
+    expect((await ws.api('/mcp/saved', { ...await ws.stored('saved'), timeoutMs: 20_000 })).status).toBe(201)
+    expect((await ws.api('/mcp/off/disable')).status).toBe(200)
+    expect((await ws.api('/mcp/gone', undefined, 'DELETE')).status).toBe(200)
+    const counts = await Promise.all(['saved', 'off', 'gone'].map(async (name) => (await listings(name)).length))
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+
+    // Nothing of the old runtimes came back: no listing, no process, no client.
+    expect(await Promise.all(['saved', 'off', 'gone'].map(async (name) => (await listings(name)).length))).toEqual(counts)
+    for (const name of ['saved', 'off', 'gone']) expect(await livePids(started(name))).toEqual([])
+    const rows = await ws.rows()
+    expect(rows.find((row) => row.name === 'saved')).toMatchObject({ status: 'idle', discoveredTools: [] })
+    expect(rows.find((row) => row.name === 'off')).toMatchObject({ status: 'disabled', discoveredTools: [] })
+    expect(rows.some((row) => row.name === 'gone')).toBe(false)
+
+    // A turn offers only what the current config starts: `saved` again, never `off` or `gone`.
+    await ws.say(await ws.session(), 'hello')
+    const offered = (requests.at(-1)?.tools ?? []).map((tool) => tool.name).filter((name) => name.startsWith('mcp__'))
+    expect(offered.some((name) => name.startsWith('mcp__off__') || name.startsWith('mcp__gone__'))).toBe(false)
+    expect(offered).toContain('mcp__saved__query')
+  }, 60_000)
+})

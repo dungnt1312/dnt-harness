@@ -341,3 +341,25 @@ describe('MCP client audit regressions', () => {
     await expect(httpClient().listTools()).rejects.toThrow(/schema is too deep/)
   })
 })
+
+describe('a retired client publishes nothing', () => {
+  it('a tools/list_changed refresh in flight when the generation is retired never calls back into the host', async () => {
+    const fixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
+    const client = new McpServerClient('fx', { name: 'fx', transport: 'stdio', command: process.execPath, args: [fixture], enabled: true }, {
+      env: { LIST_CHANGED_EVERY_MS: '30', LIST_DELAY_MS: '200' },
+    }, () => {})
+    clients.push(client)
+    await client.listTools()
+    const published = vi.fn(async () => {})
+    client.startHealthChecks(published)
+    await expect.poll(() => published.mock.calls.length, { timeout: 5_000, interval: 10 }).toBeGreaterThan(0)
+    // A refresh is in flight (the listing takes 200 ms; notifications keep coming).
+    await expect.poll(() => client.toolRefreshes, { timeout: 5_000, interval: 10 }).toBeGreaterThan(published.mock.calls.length)
+    // The host retires the generation first and stops the transport after;
+    // the transport is still up here, as it is between those two steps.
+    client.retire()
+    const atRetire = published.mock.calls.length
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(published.mock.calls.length).toBe(atRetire)
+  }, 15_000)
+})

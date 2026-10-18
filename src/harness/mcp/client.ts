@@ -1111,6 +1111,8 @@ export class McpServerClient {
    * another pass, which then sees everything they announced.
    */
   private refreshToolsFromNotification(): void {
+    // A retired generation's notifications are noise: it must not publish.
+    if (this.retired) return
     if (this.refreshing !== undefined) {
       this.refreshAgain = true
       return
@@ -1121,6 +1123,8 @@ export class McpServerClient {
         this.toolRefreshes += 1
         try {
           this.toolsCache = await this.fetchAllTools(this.config.timeoutMs ?? 15_000)
+          // Retired while the listing was out: the host has moved on.
+          if (this.retired) return
           await this.onReconnected?.()
           this.onAudit({ kind: 'reconnect', detail: `${this.serverName}: tools/list_changed`, durationMs: 0, isError: false })
         } catch {

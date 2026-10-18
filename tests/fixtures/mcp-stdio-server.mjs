@@ -6,6 +6,13 @@ const rl = readline.createInterface({ input: process.stdin })
 const send = (id, result) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`)
 const fail = (id, code, message) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } })}\n`)
 
+let listings = 0
+// LIST_CHANGED_EVERY_MS: keep announcing tools/list_changed, so a refresh is nearly always in flight.
+const listChangedEvery = Number(process.env.LIST_CHANGED_EVERY_MS ?? 0)
+if (listChangedEvery > 0) {
+  setInterval(() => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`), listChangedEvery)
+}
+
 rl.on('line', async (line) => {
   let msg
   try { msg = JSON.parse(line) } catch { return }
@@ -20,6 +27,14 @@ rl.on('line', async (line) => {
     return
   }
   if (msg.method === 'tools/list') {
+    // LIST_FILE logs every listing; LIST_DELAY_MS slows every listing after the first.
+    if (process.env.LIST_FILE) {
+      const { appendFileSync } = await import('node:fs')
+      appendFileSync(process.env.LIST_FILE, `${process.pid}\n`, 'utf8')
+    }
+    listings += 1
+    const listDelay = Number(process.env.LIST_DELAY_MS ?? 0)
+    if (listings > 1 && listDelay > 0) await new Promise((resolve) => setTimeout(resolve, listDelay))
     send(msg.id, { tools: [
       // QUERY_PROP renames the argument, so two configs can expose different schemas under one tool name.
       { name: 'query', description: 'Query fixture data', inputSchema: { type: 'object', properties: { [process.env.QUERY_PROP ?? 'q']: { type: 'string' } }, required: [process.env.QUERY_PROP ?? 'q'] }, annotations: { readOnlyHint: true } },
