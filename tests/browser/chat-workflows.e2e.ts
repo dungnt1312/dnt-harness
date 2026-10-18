@@ -206,6 +206,9 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/children\/[^/]+$/.test(path) && method === 'GET') {
       return json(route, { childSessionId: 'child', status: 'completed', definitionName: 'explorer', startedAt: 0, endedAt: 1, result: { report: 'Mapped the app.', filesTouched: [] } })
     }
+    if (path === '/api/workspaces/w/commands' && method === 'GET') return json(route, { commands: [], errors: [] })
+    // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
+    if (path === '/api/speech-to-text' && method === 'GET') return json(route, { provider: null, model: null })
     if (path === '/api/workspaces/w/skills/sources') return json(route, { rules: [{ id: 'workspace', kind: 'workspace', enabled: true }] })
     if (path === '/api/workspaces/w/skills/fixture-skill/files') return json(route, { files: [{ path: 'SKILL.md', bytes: 64 }] })
     throw new Error(`Unexpected fixture API request: ${method} ${url.href}`)
@@ -277,7 +280,8 @@ for (const width of [320, 375, 768, 1024, 1440]) {
         await expect(dialog.getByRole('heading', { name: label, exact: true }).first()).toBeVisible()
       }
     } else {
-      const providers = dialog.getByRole('tab', { name: /Providers/ })
+      // Providers & Models also has its own Providers sub-tab; the rail entry comes first.
+      const providers = dialog.getByRole('tab', { name: /Providers/ }).first()
       await providers.focus()
       await page.keyboard.press('ArrowDown')
       await expect(dialog.getByRole('tab', { name: /Advanced/ })).toBeFocused()
