@@ -67,9 +67,9 @@ describe('default base prompt', () => {
 /**
  * Behavioral fixtures (string-level). Each scenario names the prompt clauses a
  * model needs to take the right action. This checks that the guidance exists,
- * not how a live model behaves: there is no model-in-the-loop eval in CI. A
- * live recall/tool-count eval of these three cases is a manual follow-up
- * (scripts/bench `nonexistent-api` covers the true-absence case).
+ * not how a live model behaves. The opt-in live eval of the first three cases,
+ * scoring recall together with tool count, is `scripts/prompt-eval/run.ts`
+ * (scorer tests: tests/scripts/prompt-eval-score.spec.ts).
  */
 describe('prompt behavioral fixtures (string-level)', () => {
   const scenarios: Array<{ name: string; needs: RegExp[]; forbids: RegExp[] }> = [
