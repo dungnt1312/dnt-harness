@@ -15,6 +15,7 @@ import { childRecoveryFacts } from './child-recovery-facts.ts'
 import { deriveTitle } from './title.ts'
 import {
   FileSessionStore,
+  type ModeFacts,
   type SessionStore,
   type SessionSummary,
 } from '../storage/file-session-store.ts'
@@ -216,6 +217,7 @@ export class SessionsService extends Service {
           summary.parentSessionId === undefined ||
           summary.lastUserActivityAt === undefined ||
           summary.childRecovery === undefined ||
+          summary.modeFacts === undefined ||
           (tail !== undefined && summary.lastSeq !== tail)
         ) {
           // Deleting derived state must never hide a canonical session:
@@ -593,6 +595,7 @@ export class SessionsService extends Service {
         parentSessionId: lastRecorded(events, parentOf, null),
         lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? 0),
         childRecovery: childRecoveryFacts(events),
+        modeFacts: modeFactsOf(events),
       }
       await store.writeSummary(id, summary)
       return summary
@@ -704,6 +707,7 @@ export class SessionsService extends Service {
       parentSessionId: lastRecorded(events, parentOf, null),
       lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? this.now()),
       childRecovery: childRecoveryFacts(events),
+      modeFacts: modeFactsOf(events),
     }
   }
 }
@@ -720,6 +724,13 @@ function lastRecorded<T>(events: readonly SessionEvent[], pick: (event: SessionE
     if (value !== undefined) return value
   }
   return fallback
+}
+
+function modeFactsOf(events: readonly SessionEvent[]): ModeFacts {
+  return {
+    child: events.some((event) => event.type === 'session/child-meta'),
+    hasMode: events.some((event) => event.type === 'session/mode'),
+  }
 }
 
 /** Project binding: an explicit `session/project` wins; a subagent inherits its spawn record's binding. */

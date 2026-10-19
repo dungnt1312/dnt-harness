@@ -74,6 +74,13 @@ const lastSeqOf = (events: readonly { readonly seq: number }[]): number => event
  * A stopped migration resumes by checking the canonical session/mode record,
  * never by trusting a derived checkpoint alone.
  *
+ * The one derived record it does trust is an unloaded session's summary, and
+ * only in the direction logs cannot undo: boot reconciled that summary with
+ * the canonical tail (or rebuilt it from the log), so `modeFacts` saying the
+ * log holds a child-meta or a mode record is what the canonical read would
+ * find. A missing, older or negative fact still reads the canonical log, and
+ * only that path writes.
+ *
  * After a pass completes, `root-mode-migration.json` in the data home records
  * the sessions it resolved; later boots read only sessions outside that set.
  * A pass that throws leaves the previous marker (if any) untouched.
@@ -107,6 +114,16 @@ export async function migrateRootModes(
       continue
     }
     examined += 1
+    const durable = sessions.durableSummary(id)
+    if (durable?.modeFacts?.child === true) {
+      skippedChildren += 1
+      verified.push({ id, lastSeq: durable.lastSeq, child: true })
+      continue
+    }
+    if (durable?.modeFacts?.hasMode === true) {
+      verified.push({ id, lastSeq: durable.lastSeq })
+      continue
+    }
     // Canonical reads (rather than summary projections) decide both child
     // identity and whether a previous interrupted attempt already landed.
     const events = await sessions.readCanonicalEvents(id)

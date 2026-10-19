@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createWebServer, Kernel, SessionsService, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, FileSessionStore, Kernel, SessionsService, type LlmProvider, type WebServer } from 'dnt-harness'
 import { migrateRootModes } from '../../src/harness/modes/root-migration.ts'
 import { DEFAULT_MODE_ID, ModesService } from '../../src/harness/modes/service.ts'
 import type { SessionId, WorkspaceId } from '../../src/util/brand.ts'
@@ -221,7 +221,7 @@ describe('legacy root mode migration', () => {
     expect((await readMarker()).verified.map((entry) => entry.id).sort()).toEqual([...roots].sort())
   })
 
-  it('rescans every session when the marker is missing, older or unreadable', async () => {
+  it('ignores a missing, older or unreadable marker and asks each verified summary', async () => {
     const { wsId, roots } = await seed(2)
     const ids = roots.map((id) => ({ id, lastSeq: 1 }))
     const stale = [
@@ -237,11 +237,98 @@ describe('legacy root mode migration', () => {
       await stripMode(wsId, roots[0]!)
       const reads = spyMigrationReads()
       await (await boot()).close()
-      expect([...new Set(reads)].sort()).toEqual([...roots].sort())
+      // The stripped root's shortened log rebuilt its summary, which no longer
+      // shows a mode: only that root is read. The other one's summary does.
+      expect([...new Set(reads)]).toEqual([roots[0]])
       expect(await modeCount(wsId, roots[0]!)).toBe(1)
       vi.restoreAllMocks()
-      expect((await readMarker()).version).toBe(2)
+      const record = await readMarker()
+      expect(record.version).toBe(2)
+      expect(record.verified.map((entry) => entry.id).sort()).toEqual([...roots].sort())
     }
+  })
+
+  it('reaches the same verdicts from verified summaries as from reading every log', async () => {
+    const { wsId, roots } = await seed(3, { child: true })
+    // Shapes on one home: stamped roots, a legacy root, a child without a
+    // mode, a child that recorded one, and a stamped root whose summary is gone.
+    await stripMode(wsId, roots[0]!)
+    const modedChild = 'session-moded-child'
+    await fs.mkdir(path.dirname(log(wsId, modedChild)), { recursive: true })
+    const modeRecord = (await fs.readFile(log(wsId, roots[1]!), 'utf8')).trim().split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((record) => record['type'] === 'session/mode')!
+    await fs.writeFile(log(wsId, modedChild), [
+      { v: 1, seq: 1, timestamp: 1, type: 'session/child-meta', parentSessionId: roots[1], parentTurnId: 'turn-old', definition: 'explorer', brief: 'moded' },
+      { ...modeRecord, seq: 2 },
+    ].map((record) => JSON.stringify(record) + '\n').join(''))
+    await fs.rm(path.join(path.dirname(log(wsId, roots[2]!)), 'summary.json'))
+    await fs.rm(marker())
+    const canonicalHome = `${home}-canonical`
+    await fs.cp(home, canonicalHome, { recursive: true })
+
+    const run = async (dataHome: string, trustSummaries: boolean) => {
+      const reads = spyMigrationReads()
+      const kernel = new Kernel()
+      kernel.ctx.plugin((ctx) => { new SessionsService(ctx, 'sessions', { home: dataHome }) })
+      try {
+        await kernel.ctx.sessions.boot()
+        const sessions = trustSummaries
+          ? kernel.ctx.sessions
+          : Object.create(kernel.ctx.sessions, { durableSummary: { value: () => undefined } }) as SessionsService
+        const modes = new ModesService(dataHome)
+        const fallback = await modes.resolve(wsId as WorkspaceId, DEFAULT_MODE_ID)
+        const result = await migrateRootModes(dataHome, sessions, modes, () => fallback)
+        const verified = (JSON.parse(await fs.readFile(path.join(dataHome, 'root-mode-migration.json'), 'utf8')) as MarkerRecord).verified
+        const logs: Record<string, string[]> = {}
+        for (const id of [...roots, CHILD, modedChild]) {
+          logs[id] = (await fs.readFile(path.join(dataHome, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'utf8'))
+            .trim().split('\n').map((line) => (JSON.parse(line) as { type: string }).type)
+        }
+        return { result, verified: verified.sort((a, b) => a.id.localeCompare(b.id)), logs, reads: [...new Set(reads)].sort() }
+      } finally {
+        await kernel.stop()
+        vi.restoreAllMocks()
+      }
+    }
+    try {
+      const fromSummaries = await run(home, true)
+      const fromLogs = await run(canonicalHome, false)
+      expect(fromSummaries.result).toEqual(fromLogs.result)
+      expect(fromSummaries.result).toEqual({ migrated: 1, skippedChildren: 2, defaultedWorkspaces: [] })
+      expect(fromSummaries.verified).toEqual(fromLogs.verified)
+      expect(fromSummaries.logs).toEqual(fromLogs.logs)
+      expect(fromLogs.reads).toEqual([...roots, CHILD, modedChild].sort())
+      expect(fromSummaries.reads).toEqual([roots[0]])
+    } finally {
+      await fs.rm(canonicalHome, { recursive: true, force: true })
+    }
+  })
+
+  it('reads each log once on the first boot after summaries lose their derived facts', async () => {
+    const { wsId, roots } = await seed(3)
+    // An upgrade from a host that projected neither fact, before any marker.
+    await fs.rm(marker())
+    for (const root of roots) {
+      const file = path.join(path.dirname(log(wsId, root)), 'summary.json')
+      const { childRecovery: _recovery, modeFacts: _facts, ...older } = JSON.parse(await fs.readFile(file, 'utf8')) as Record<string, unknown>
+      await fs.writeFile(file, JSON.stringify(older))
+    }
+    const original = FileSessionStore.prototype.read
+    const parses: string[] = []
+    vi.spyOn(FileSessionStore.prototype, 'read').mockImplementation(function (this: FileSessionStore, id) {
+      parses.push(id)
+      return original.call(this, id)
+    })
+    await (await boot()).close()
+    expect(parses.sort()).toEqual([...roots].sort())
+    const store = new FileSessionStore({ dir: home, workspaceId: wsId as WorkspaceId })
+    for (const root of roots) {
+      const summary = await store.readSummary(root as SessionId)
+      expect(summary?.childRecovery).toEqual({ meta: null, boundProjectId: null, children: {} })
+      expect(summary?.modeFacts).toEqual({ child: false, hasMode: true })
+    }
+    expect((await readMarker()).verified.map((entry) => entry.id).sort()).toEqual([...roots].sort())
   })
 
   it('stamps the mode at creation for a root made through the legacy sessions route', async () => {

@@ -61,6 +61,21 @@ export interface SessionSummary {
    * before it was projected; those rebuild.
    */
   readonly childRecovery?: ChildRecoveryFacts
+  /**
+   * Facts the root-mode startup migration needs, so a verified summary answers
+   * without a canonical read. Absent in summaries written before it was
+   * projected; those rebuild.
+   */
+  readonly modeFacts?: ModeFacts
+}
+
+/**
+ * Whether one session's log holds a `session/child-meta` record (a subagent)
+ * and a `session/mode` record. Both only ever turn true as the log grows.
+ */
+export interface ModeFacts {
+  readonly child: boolean
+  readonly hasMode: boolean
 }
 
 /**
@@ -278,7 +293,8 @@ export class FileSessionStore implements SessionStore {
         (parsed['pinned'] !== undefined && typeof parsed['pinned'] !== 'boolean') ||
         (parsed['parentSessionId'] !== undefined && parsed['parentSessionId'] !== null && typeof parsed['parentSessionId'] !== 'string') ||
         (parsed['lastUserActivityAt'] !== undefined && !Number.isFinite(parsed['lastUserActivityAt'])) ||
-        (parsed['childRecovery'] !== undefined && !isChildRecoveryFacts(parsed['childRecovery']))
+        (parsed['childRecovery'] !== undefined && !isChildRecoveryFacts(parsed['childRecovery'])) ||
+        (parsed['modeFacts'] !== undefined && !isModeFacts(parsed['modeFacts']))
       ) return undefined
       return {
         id,
@@ -310,6 +326,8 @@ export class FileSessionStore implements SessionStore {
         ...(parsed['childRecovery'] !== undefined
           ? { childRecovery: parsed['childRecovery'] as ChildRecoveryFacts }
           : {}),
+        // Absent means the summary predates mode facts; boot rebuilds it.
+        ...(parsed['modeFacts'] !== undefined ? { modeFacts: parsed['modeFacts'] as ModeFacts } : {}),
       }
     } catch {
       return undefined
@@ -435,6 +453,10 @@ function isChildRecoveryFacts(value: unknown): value is ChildRecoveryFacts {
   const children = value['children']
   return isRecord(children) &&
     Object.values(children).every((state) => state === 'open' || state === 'settled' || state === 'reported')
+}
+
+function isModeFacts(value: unknown): value is ModeFacts {
+  return isRecord(value) && typeof value['child'] === 'boolean' && typeof value['hasMode'] === 'boolean'
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
