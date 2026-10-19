@@ -954,15 +954,27 @@ test('coarse pointer targets meet the minimum on header, composer, approval, con
   const context = await browser.newContext({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
   const page = await context.newPage()
   await fixture(page, 'approval')
-  // The composer's control row opts out of the 44px floor (data-compact-control,
-  // app.css) so its icon-only controls share one phone row; it keeps 36px.
-  for (const [selector, minimum] of [['header button', 44], ['form:has([data-composer-input]) button', 36], ['[aria-label="Pending approvals"] button', 44]] as const) {
+  // Only the composer's marked compact controls opt out of the 44px floor
+  // (data-compact-control, app.css) so its icon-only row fits one phone line;
+  // they keep 36px. Every other composer button keeps 44px.
+  const composer = 'form:has([data-composer-input])'
+  const targets = [
+    ['header button', 44],
+    [`${composer} button[data-compact-control]`, 36],
+    [`${composer} button:not([data-compact-control])`, 44],
+    ['[aria-label="Pending approvals"] button', 44],
+  ] as const
+  let compact = 0
+  for (const [selector, minimum] of targets) {
     for (const control of await page.locator(selector).filter({ visible: true }).all()) {
+      if (minimum === 36) compact += 1
       const box = await control.boundingBox()
-      expect(box?.height ?? 0).toBeGreaterThanOrEqual(minimum)
-      expect(box?.width ?? 0).toBeGreaterThanOrEqual(minimum)
+      const what = `${selector}: ${await control.evaluate((element) => element.outerHTML.slice(0, 160))}`
+      expect(box?.height ?? 0, what).toBeGreaterThanOrEqual(minimum)
+      expect(box?.width ?? 0, what).toBeGreaterThanOrEqual(minimum)
     }
   }
+  expect(compact).toBeGreaterThan(0)
   await openWorkbench(page)
   for (const control of await page.getByRole('dialog', { name: 'Workbench' }).locator('button').filter({ visible: true }).all()) {
     const box = await control.boundingBox(); expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
