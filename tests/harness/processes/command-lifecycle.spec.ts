@@ -75,8 +75,12 @@ it('root background has no child maximum and foreign kill cannot stop it', async
 
 it('foreground root exit does not turn a held pipe into a retained background tree', async () => {
   const r = registry()
-  const result = await bashTool({ processes: r, timeoutMs: 80 }).execute({ command: 'sleep 5 & exit 0' }, exec)
+  // The wait budget only has to cover a login-shell start on a loaded host;
+  // the call must settle on the root exit, never on the 5s pipe holder.
+  const started = Date.now()
+  const result = await bashTool({ processes: r, timeoutMs: 2_000 }).execute({ command: 'sleep 5 & exit 0' }, exec)
   expect(result).toContain('exit code: 0')
+  expect(Date.now() - started).toBeLessThan(4_000)
   expect(r.runningCount(exec.sessionId)).toBe(0)
 })
 
