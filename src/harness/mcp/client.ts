@@ -989,6 +989,10 @@ export class McpServerClient {
       void (async () => {
         try {
           this.breakerState = 'half-open'
+          // The open window ends here. Timers run on the event loop's cached
+          // clock, which can fire a few ms before Date.now() reaches the
+          // deadline; callers arriving during recovery must not see it as open.
+          this.breakerUntil = 0
           const previous = this.transport
           // Detach before awaiting teardown. A caller can connect during stop;
           // recovery must share that connect, never erase its new reference.

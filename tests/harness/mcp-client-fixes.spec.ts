@@ -195,6 +195,27 @@ describe('MCP client audit regressions', () => {
     expect(client.transportsStarted).toBe(started)
   })
 
+  it('admits callers once recovery starts even if the wall clock lags the recovery timer', async () => {
+    mockHttp()
+    const client = httpClient(undefined, { breakerDurationMs: 10, reconnectJitterMs: 0 })
+    await client.listTools()
+    const old = internal(client).transport!
+    // Timers run on the event loop's cached clock, which can be a few ms ahead
+    // of Date.now(); freeze the wall clock so the recovery timer fires "early".
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+    internal(client).openBreaker(async () => {})
+    internal(client).transport = old
+    const entered = barrier()
+    const release = barrier()
+    vi.spyOn(old, 'stop').mockImplementation(() => { entered.resolve(); return release.promise })
+    await entered.promise
+    const call = client.callTool('query', {}, 1_000)
+    release.resolve()
+    await expect(call).resolves.toBeDefined()
+    vi.mocked(Date.now).mockRestore()
+    await expect.poll(() => internal(client).recoveryRunning).toBe(false)
+  })
+
   it.each(['retired', 'noncurrent', 'dead'] as const)('late success on a %s transport does not close the breaker or revive state', async (mode) => {
     const fetch = mockHttp()
     const client = httpClient(undefined, { breakerDurationMs: 60_000 })
