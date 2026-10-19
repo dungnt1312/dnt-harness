@@ -645,7 +645,7 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
    * Anchored view of the terminal's session. A session token alone is not
    * proof of ownership, so:
    *  - if a process with the shell's PID exists with a different start time,
-   *    the session (or tty) was reused: treat it as empty and stop sweeping;
+   *    the session was reused: treat it as empty and stop sweeping;
    *  - a member is accepted only if it is already known (pid + start), or its
    *    parent chain inside the session reaches a known member. Known members
    *    are seeded from the shell and the pre-close snapshot.
@@ -672,6 +672,9 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
           // session is ours. With the shell already gone (natural exit, taken
           // within ms of the exit), only processes that cannot predate the
           // shell are seeded — Linux start times are comparable tick counts.
+          // macOS `lstart` is a date string, not a number, so this filter
+          // admits every member there: macOS membership rests on getsid(2)
+          // alone (the session id cannot be reallocated while a member lives).
           const ownedStart = startNumber(owned.start)
           for (const member of members) {
             const memberStart = startNumber(member.start)
@@ -692,7 +695,11 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
     }
   }
 
-  /** Members still alive. Linux rescans the (stable, anchored) session; macOS re-checks the pre-close snapshot only. */
+  /**
+   * Members still alive. With a stable session token (Linux and macOS both)
+   * the anchored session is rescanned; an inspector keyed on something
+   * reusable re-checks the pre-close snapshot only.
+   */
   async function remaining(view: ReturnType<typeof sessionView> | undefined, snapshot: readonly ProcessIdentity[]): Promise<ProcessIdentity[]> {
     if (inspector === null || view === undefined) return []
     if (inspector.sessionStable) return view.scan(false)
@@ -711,8 +718,9 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
     const shell = await live.identity
     const owned = shell?.owned === true ? shell.self : undefined
     const view = owned === undefined ? undefined : sessionView(owned)
-    // Snapshot before the PTY closes: on macOS the tty name stops identifying
-    // this session once it is released.
+    // Snapshot before the PTY closes, while the live shell still anchors the
+    // session: it seeds the known members that later rescans admit by descent,
+    // and is the only list an inspector without a stable session token trusts.
     let snapshot: ProcessIdentity[] = []
     if (view !== undefined) {
       try { snapshot = await view.scan(true) } catch (error) { errors.push(error) }
