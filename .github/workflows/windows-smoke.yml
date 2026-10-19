@@ -132,9 +132,14 @@ jobs:
               aliases = @()
               aliasGeneration = 0
             } | ConvertTo-Json -Depth 5 | Set-Content $config -Encoding utf8
-            $reply = dnt-harness chat --message 'hello' --config $config --root (Join-Path $dir 'ws') --data-dir (Join-Path $dir 'data') 2>&1 | Out-String
+            # stdout alone carries the reply; stderr goes to a file for diagnostics.
+            $stderrFile = Join-Path $dir 'chat-stderr.txt'
+            $reply = dnt-harness chat --message 'hello' --config $config --root (Join-Path $dir 'ws') --data-dir (Join-Path $dir 'data') 2> $stderrFile | Out-String
             $code = $LASTEXITCODE
+            "--- stdout ---"
             $reply
+            "--- stderr ---"
+            Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
             if ($code -ne 0) { throw "chat exited with $code" }
             if ($reply -notmatch 'e2e-plain-ok') { throw 'chat reply did not reach stdout' }
           } finally {
