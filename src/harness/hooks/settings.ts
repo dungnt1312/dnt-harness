@@ -148,13 +148,28 @@ function unknownFields(raw: Record<string, unknown>, known: ReadonlySet<string>)
 }
 
 /**
- * Parse the `hooks` section of one settings document. `strict` throws on the
- * first problem (app saves); otherwise problems become diagnostics and the
- * entry is skipped (loading files written for Claude Code). `preserveUnknown`
- * keeps fields this parser does not understand (newer Claude Code keys) on
- * their group or command untouched, so the editor's read-then-save loses none.
+ * One `type: "command"` hook, validated. Returns the problem (a suffix after
+ * the hook's location) when a field is malformed. `extra` carries fields this
+ * parser does not understand, copied as they are (editor saves only).
  */
-export function parseHooksSection(value: unknown, options: { strict?: boolean; label?: string; preserveUnknown?: boolean } = {}): { hooks: HooksSection; diagnostics: string[] } {
+function parseCommandHook(hookRaw: Record<string, unknown>, event: ClaudeHookEvent, keepUnknown: boolean): HookCommand | string {
+  if (typeof hookRaw['command'] !== 'string' || hookRaw['command'].trim() === '') return '.command must be a non-empty string'
+  const timeout = hookRaw['timeout']
+  if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0)) return '.timeout must be a positive number of seconds'
+  const modifiers = parseModifiers(hookRaw, event)
+  if (typeof modifiers === 'string') return modifiers
+  const extra = keepUnknown ? unknownFields(hookRaw, KNOWN_COMMAND_KEYS) : {}
+  return { ...extra, type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}), ...modifiers }
+}
+
+/**
+ * Parse the `hooks` section of one settings document. `strict` throws on the
+ * first problem; otherwise problems become diagnostics and the entry is
+ * skipped (loading files written for Claude Code). The skipped entries stay
+ * in their file: the editor saves through {@link validateEditorHooks}, which
+ * keeps them.
+ */
+export function parseHooksSection(value: unknown, options: { strict?: boolean; label?: string } = {}): { hooks: HooksSection; diagnostics: string[] } {
   const label = options.label ?? 'hooks'
   const diagnostics: string[] = []
   const problem = (message: string): void => {
@@ -195,16 +210,11 @@ export function parseHooksSection(value: unknown, options: { strict?: boolean; l
         const where = `${event}[${index}].hooks[${hookIndex}]`
         if (!isRecord(hookRaw)) { problem(`${where} must be an object`); continue }
         if (hookRaw['type'] !== 'command') { problem(`${where}: only type "command" hooks run in dnt-harness (got ${JSON.stringify(hookRaw['type'])})`); continue }
-        if (typeof hookRaw['command'] !== 'string' || hookRaw['command'].trim() === '') { problem(`${where}.command must be a non-empty string`); continue }
-        const timeout = hookRaw['timeout']
-        if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0)) { problem(`${where}.timeout must be a positive number of seconds`); continue }
-        const modifiers = parseModifiers(hookRaw, event as ClaudeHookEvent)
-        if (typeof modifiers === 'string') { problem(`${where}${modifiers}`); continue }
-        const extra = options.preserveUnknown === true ? unknownFields(hookRaw, KNOWN_COMMAND_KEYS) : {}
-        commands.push({ ...extra, type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}), ...modifiers })
+        const parsed = parseCommandHook(hookRaw, event as ClaudeHookEvent, false)
+        if (typeof parsed === 'string') { problem(`${where}${parsed}`); continue }
+        commands.push(parsed)
       }
-      const extra = options.preserveUnknown === true ? unknownFields(groupRaw, KNOWN_GROUP_KEYS) : {}
-      groups.push({ ...extra, ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks: commands })
+      groups.push({ ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks: commands })
     }
     out[event] = groups
   }
@@ -439,21 +449,60 @@ export function workspaceSettingsPath(workspaceDir: string): string {
   return path.join(workspaceDir, 'settings.json')
 }
 
-/** The workspace settings document's `hooks` section (strict view for the editor). */
-export async function readWorkspaceHooks(workspaceDir: string): Promise<{ hooks: HooksSection; disableAllHooks: boolean }> {
+/**
+ * The workspace `hooks` section as the editor saves it. Runnable command hooks
+ * are strictly validated (a problem throws). Everything dnt-harness does not
+ * run is kept exactly as written, in its place: an event it does not know,
+ * a hook of another type (`prompt`, `agent`, …), and fields it does not
+ * understand on a group or command. Saving from the app never drops an entry
+ * Claude Code may still use.
+ */
+export function validateEditorHooks(value: unknown): Record<string, unknown> {
+  const fail = (message: string): never => { throw new HookSettingsError(`hooks: ${message}`) }
+  if (value === undefined) return {}
+  if (!isRecord(value)) fail("'hooks' must be an object keyed by event name")
+  const out: Record<string, unknown> = {}
+  for (const [event, groupsRaw] of Object.entries(value as Record<string, unknown>)) {
+    if (!(CLAUDE_HOOK_EVENTS as readonly string[]).includes(event)) { out[event] = groupsRaw; continue }
+    if (!Array.isArray(groupsRaw)) fail(`${event} must be an array of matcher groups`)
+    out[event] = (groupsRaw as unknown[]).map((groupRaw, index) => {
+      if (!isRecord(groupRaw)) return fail(`${event}[${index}] must be an object`)
+      if (groupRaw['matcher'] !== undefined && typeof groupRaw['matcher'] !== 'string') fail(`${event}[${index}].matcher must be a string`)
+      if (!Array.isArray(groupRaw['hooks'])) fail(`${event}[${index}].hooks must be an array`)
+      const hooks = (groupRaw['hooks'] as unknown[]).map((hookRaw, hookIndex) => {
+        const where = `${event}[${index}].hooks[${hookIndex}]`
+        if (!isRecord(hookRaw)) return fail(`${where} must be an object`)
+        if (typeof hookRaw['type'] !== 'string') return fail(`${where}.type must be a string`)
+        if (hookRaw['type'] !== 'command') return hookRaw
+        const parsed = parseCommandHook(hookRaw, event as ClaudeHookEvent, true)
+        return typeof parsed === 'string' ? fail(`${where}${parsed}`) : parsed
+      })
+      return { ...unknownFields(groupRaw, KNOWN_GROUP_KEYS), ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks }
+    })
+  }
+  return out
+}
+
+/**
+ * The workspace settings document's `hooks` section as written, for the
+ * editor: entries dnt-harness does not run are included so a save keeps them.
+ */
+export async function readWorkspaceHooks(workspaceDir: string): Promise<{ hooks: Record<string, unknown>; disableAllHooks: boolean }> {
   await migrateLegacyHooksJson(workspaceDir).catch(() => undefined)
   const read = await readSettings(workspaceSettingsPath(workspaceDir))
   if (read.error !== undefined) throw new HookSettingsError(read.error)
   const doc = read.doc ?? {}
-  return { hooks: parseHooksSection(doc['hooks'], { preserveUnknown: true }).hooks, disableAllHooks: doc['disableAllHooks'] === true }
+  const hooks = doc['hooks']
+  if (hooks !== undefined && !isRecord(hooks)) throw new HookSettingsError(`${workspaceSettingsPath(workspaceDir)}: 'hooks' must be an object keyed by event name`)
+  return { hooks: isRecord(hooks) ? hooks : {}, disableAllHooks: doc['disableAllHooks'] === true }
 }
 
 /**
- * Replace the workspace `hooks` section (known fields strictly validated,
- * unknown ones kept as written), preserving every other key.
+ * Replace the workspace `hooks` section (see {@link validateEditorHooks}),
+ * preserving every other key of the settings document.
  */
 export async function writeWorkspaceHooks(workspaceDir: string, hooks: unknown, disableAllHooks?: boolean): Promise<void> {
-  const parsed = parseHooksSection(hooks, { strict: true, preserveUnknown: true }).hooks
+  const parsed = validateEditorHooks(hooks)
   const file = workspaceSettingsPath(workspaceDir)
   const read = await readSettings(file)
   if (read.error !== undefined) throw new HookSettingsError(read.error)

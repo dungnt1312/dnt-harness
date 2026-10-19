@@ -1397,8 +1397,8 @@ describe('context compaction + budget bar', () => {
     expect(saveHooks).not.toHaveBeenCalled()
   })
   it.each([
-    ['unknown event', '{"Nope":[]}', 'unknown hook event "Nope"'],
-    ['non-command hook', '{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"prompt","prompt":"x"}]}]}', 'type must be "command"'],
+    ['event that is not an array', '{"PreToolUse":{}}', 'PreToolUse must be an array'],
+    ['hook without a type', '{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":"x"}]}]}', 'type must be a string'],
   ])('hooks raw editor keeps %s verbatim/open and issues zero PUT', async (_case, draft, error) => {
     ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow())
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
@@ -1440,6 +1440,36 @@ describe('context compaction + budget bar', () => {
     await act(async () => setInput(host.querySelector<HTMLInputElement>('.hooks-binding input')!, 'Write|Edit'))
     await act(async () => button('Save changes').click())
     expect(saveHooks).toHaveBeenCalledWith('ws-1', { PreToolUse: [{ matcher: 'Write|Edit', note: 'kept', hooks: [hook] }] }, false)
+  })
+
+  it('hooks editor keeps a non-command hook in its place when the command beside it is edited', async () => {
+    const prompt = { type: 'prompt', prompt: 'Review the command', timeout: 30 }
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ PreToolUse: [{ matcher: 'Bash', hooks: [prompt, { type: 'command', command: 'node guard.mjs' }] }] }))
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    expect(host.querySelector('.hooks-kept')?.textContent).toContain('prompt')
+    await act(async () => setInput(host.querySelector<HTMLInputElement>('input[aria-label="Command of PreToolUse hook 1"]')!, 'node guard.mjs --strict'))
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', { PreToolUse: [{ matcher: 'Bash', hooks: [prompt, { type: 'command', command: 'node guard.mjs --strict' }] }] }, false)
+  })
+
+  it('hooks editor does not block Save on a group of only non-command hooks and saves it unchanged', async () => {
+    const hooks = { Stop: [{ hooks: [{ type: 'agent', prompt: 'Verify the tests pass' }] }] }
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow(hooks))
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Disable all hooks"]')!.click())
+    expect(host.textContent).not.toContain('Every hook needs a command')
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', hooks, true)
+  })
+
+  it('hooks editor keeps an event it does not know through a save', async () => {
+    const future = [{ matcher: 'x', hooks: [{ type: 'command', command: 'later' }] }]
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ FutureEvent: future, Stop: [{ hooks: [{ type: 'command', command: 'y' }] }] }))
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    expect(host.textContent).toContain('FutureEvent')
+    await act(async () => setInput(host.querySelector<HTMLInputElement>('input[aria-label="Command of Stop hook 1"]')!, 'y --v'))
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', { FutureEvent: future, Stop: [{ hooks: [{ type: 'command', command: 'y --v' }] }] }, false)
   })
 
   it('hooks raw editor applies and saves fields it does not understand untouched', async () => {

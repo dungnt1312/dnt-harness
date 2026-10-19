@@ -48,8 +48,12 @@ The retired `INSTRUCTIONS.md` files are no longer read.
 Sources — all merged, all run: `~/.claude/settings.json`,
 `<ws>/settings.json`, `<project>/.claude/settings.json`,
 `<project>/.claude/settings.local.json`. `disableAllHooks: true` anywhere turns
-every hook off. Loading is lenient (bad entries are skipped and listed in
-Settings → Hooks); saving the workspace layer is strict.
+every hook off. Loading is lenient (entries dnt-harness cannot run are not run
+and are listed in Settings → Hooks). Saving the workspace layer validates
+command hooks strictly and keeps everything else exactly as written, in its
+place: events dnt-harness does not know, hooks of other types (`prompt`,
+`agent`, …) and fields it does not understand. The editor shows such hooks
+read-only as "not run · kept"; change them in the raw JSON.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Write|Edit",

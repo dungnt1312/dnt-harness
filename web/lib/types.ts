@@ -635,11 +635,20 @@ export interface HookCommandRow {
   readonly [field: string]: unknown
 }
 
+/**
+ * A hook of a type dnt-harness does not run (`prompt`, `agent`, …). The
+ * editor shows it read-only and saves it back exactly as written.
+ */
+export interface KeptHookRow {
+  readonly type: string
+  readonly [field: string]: unknown
+}
+
 /** One Claude Code matcher group. */
 export interface HookMatcherGroupRow {
   /** Regex over the tool name / source / trigger; omitted or `*` matches all. */
   readonly matcher?: string
-  readonly hooks: readonly HookCommandRow[]
+  readonly hooks: readonly (HookCommandRow | KeptHookRow)[]
   /** Claude fields the editor does not model, saved back untouched. */
   readonly [field: string]: unknown
 }
@@ -659,8 +668,11 @@ export type HookEvent =
   /** Claude event dnt-harness keeps in the file but does not fire yet. */
   | 'PermissionRequest'
 
-/** The `hooks` section of a Claude Code settings file. */
-export type HooksSectionRow = Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>>
+/**
+ * The `hooks` section of a Claude Code settings file. Events dnt-harness does
+ * not know are carried as written so a save keeps them.
+ */
+export type HooksSectionRow = Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>> & { readonly [event: string]: unknown }
 
 export interface EffectiveHookRow {
   readonly id: string

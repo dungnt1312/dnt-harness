@@ -514,8 +514,8 @@ test('Hooks raw invalid stays intact and valid raw saves the exact whole documen
 })
 
 for (const invalid of [
-  { label: 'unknown event', draft: '{\n  "Bogus": []\n}', error: 'unknown hook event "Bogus"' },
-  { label: 'non-command hook type', draft: '{"PreToolUse":[{"matcher":"*","hooks":[{"type":"shell","command":"node guard.mjs"}]}]}', error: 'PreToolUse[0].hooks[0].type must be "command"' },
+  { label: 'event that is not an array', draft: '{\n  "PreToolUse": {}\n}', error: 'PreToolUse must be an array of matcher groups' },
+  { label: 'hook without a type', draft: '{"PreToolUse":[{"matcher":"*","hooks":[{"command":"node guard.mjs"}]}]}', error: 'PreToolUse[0].hooks[0].type must be a string' },
 ]) {
   test(`Hooks raw ${invalid.label} remains verbatim/open with zero PUT`, async ({ page }) => {
     const state = await fixture(page, 'settings')

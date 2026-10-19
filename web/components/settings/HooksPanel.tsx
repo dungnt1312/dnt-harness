@@ -10,7 +10,7 @@ import { TextInput } from '../ui/TextInput.tsx'
 import { fetchHooks, saveHooks, setHookActive } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
 import { SwitchTrack } from '../ui/Switch.tsx'
-import type { EffectiveHookRow, HookCommandRow, HookEvent, HookMatcherGroupRow, HooksConfigRow, HooksSectionRow } from '../../lib/types.ts'
+import type { EffectiveHookRow, HookCommandRow, HookEvent, HookMatcherGroupRow, HooksConfigRow, HooksSectionRow, KeptHookRow } from '../../lib/types.ts'
 import { CodeArea, Disclosure, InlineConfirm, IsolationNote, LoadFailed, Notice, SaveBar, PanelBody, PanelIntro, Section, WorkspaceRequired, useActionRunner, type NoticeState } from './settings-kit.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
 
@@ -42,25 +42,32 @@ const KNOWN_COMMAND_KEYS = new Set<string>(['type', 'command', 'timeout'])
 const unknownFields = (raw: Record<string, unknown>, known: ReadonlySet<string>): Record<string, unknown> =>
   Object.fromEntries(Object.entries(raw).filter(([key]) => !known.has(key)))
 
+/** A hook the form edits; anything else in a group is kept as written. */
+export const isCommandHook = (hook: HookCommandRow | KeptHookRow): hook is HookCommandRow => hook.type === 'command'
+
 /**
  * Validate an untrusted Claude Code `hooks` section before it enters typed
- * editor state or is saved. Fields it does not understand are kept as they are.
+ * editor state or is saved. Command hooks are validated; everything the
+ * editor does not run or understand — an unknown event, a hook of another
+ * type (`prompt`, `agent`, …), an unknown field — is kept exactly as written,
+ * in its place, so a save never drops it.
  */
 export function validateHooksSection(value: unknown): HooksSectionRow {
   if (!isRecord(value)) throw new Error('Hooks validation error: "hooks" must be an object keyed by event.')
-  const out: Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>> = {}
+  const out: Record<string, unknown> = {}
   for (const [event, rawGroups] of Object.entries(value)) {
-    if (!HOOK_EVENT_KEYS.has(event)) throw new Error(`Hooks validation error: unknown hook event "${event}".`)
+    if (!HOOK_EVENT_KEYS.has(event)) { out[event] = rawGroups; continue }
     if (!Array.isArray(rawGroups)) throw new Error(`Hooks validation error: ${event} must be an array of matcher groups.`)
-    out[event as HookEvent] = rawGroups.map((rawGroup, index): HookMatcherGroupRow => {
+    out[event] = rawGroups.map((rawGroup, index): HookMatcherGroupRow => {
       const at = `${event}[${index}]`
       if (!isRecord(rawGroup)) throw new Error(`Hooks validation error: ${at} must be an object.`)
       if (rawGroup.matcher !== undefined && typeof rawGroup.matcher !== 'string') throw new Error(`Hooks validation error: ${at}.matcher must be a string.`)
       if (!Array.isArray(rawGroup.hooks)) throw new Error(`Hooks validation error: ${at}.hooks must be an array.`)
-      const hooks = rawGroup.hooks.map((rawHook, hookIndex): HookCommandRow => {
+      const hooks = rawGroup.hooks.map((rawHook, hookIndex): HookCommandRow | KeptHookRow => {
         const where = `${at}.hooks[${hookIndex}]`
         if (!isRecord(rawHook)) throw new Error(`Hooks validation error: ${where} must be an object.`)
-        if (rawHook.type !== 'command') throw new Error(`Hooks validation error: ${where}.type must be "command".`)
+        if (typeof rawHook.type !== 'string') throw new Error(`Hooks validation error: ${where}.type must be a string.`)
+        if (rawHook.type !== 'command') return rawHook as KeptHookRow
         if (typeof rawHook.command !== 'string') throw new Error(`Hooks validation error: ${where}.command must be a string.`)
         if (rawHook.timeout !== undefined && (typeof rawHook.timeout !== 'number' || !Number.isFinite(rawHook.timeout) || rawHook.timeout <= 0)) throw new Error(`Hooks validation error: ${where}.timeout must be a positive number of seconds.`)
         return { ...unknownFields(rawHook, KNOWN_COMMAND_KEYS), type: 'command', command: rawHook.command, ...(typeof rawHook.timeout === 'number' ? { timeout: rawHook.timeout } : {}) }
@@ -68,7 +75,7 @@ export function validateHooksSection(value: unknown): HooksSectionRow {
       return { ...unknownFields(rawGroup, KNOWN_GROUP_KEYS), ...(typeof rawGroup.matcher === 'string' ? { matcher: rawGroup.matcher } : {}), hooks }
     })
   }
-  return out
+  return out as HooksSectionRow
 }
 
 /** Back-compat name used by older callers/tests: validates a `{ hooks }` document. */
@@ -129,7 +136,9 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
   }
 
   const dirty = JSON.stringify(hooks) !== JSON.stringify(original) || disableAll !== originalDisableAll
-  const commandMissing = Object.values(hooks).some((groups) => groups?.some((group) => group.hooks.length === 0 || group.hooks.some((hook) => hook.command.trim() === ''))) === true
+  // Only commands the form edits can be missing; kept hooks never block Save.
+  const commandMissing = HOOK_EVENTS.some(({ key }) => (hooks[key] ?? []).some((group) => group.hooks.some((hook) => isCommandHook(hook) && hook.command.trim() === '')))
+  const keptEvents = Object.keys(hooks).filter((event) => !HOOK_EVENT_KEYS.has(event))
 
   const update = (mutate: (current: HooksSectionRow) => HooksSectionRow): void => {
     setHooks((current) => (current === null ? current : mutate(current)))
@@ -148,7 +157,7 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
     setGroups(event, (groups) => groups.map((group, i) => (i === index ? map(group) : group)))
   }
   const updateCommand = (event: HookEvent, index: number, hookIndex: number, map: (hook: HookCommandRow) => HookCommandRow): void => {
-    updateGroup(event, index, (group) => ({ ...group, hooks: group.hooks.map((hook, i) => (i === hookIndex ? map(hook) : hook)) }))
+    updateGroup(event, index, (group) => ({ ...group, hooks: group.hooks.map((hook, i) => (i === hookIndex && isCommandHook(hook) ? map(hook) : hook)) }))
   }
 
   const save = (): Promise<void> => run('save', async () => {
@@ -230,7 +239,10 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
       </div>
 
       {loaded.diagnostics.length > 0 ? (
-        <Notice kind="info" text={`Skipped entries: ${loaded.diagnostics.join(' · ')}`} />
+        <Notice kind="info" text={`Not run by dnt-harness, kept in their files as written: ${loaded.diagnostics.join(' · ')}`} />
+      ) : null}
+      {keptEvents.length > 0 ? (
+        <Notice kind="info" text={`Events dnt-harness does not know, kept in this workspace's settings.json as written: ${keptEvents.join(', ')}.`} />
       ) : null}
       {unsupportedEvents.length > 0 ? (
         <Notice kind="info" text={`Kept but not run by dnt-harness: ${unsupportedEvents.join(', ')}.`} />
@@ -276,6 +288,7 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
                 />
               ))}
               {groups.flatMap((group, index) => group.hooks.map((hook, hookIndex) => {
+                if (!isCommandHook(hook)) return <KeptHookItem key={`ws-${index}-${hookIndex}`} hook={hook} matcher={entry.matcher !== undefined ? group.matcher ?? '' : undefined} />
                 const own = ownRow(entry.key, group.matcher, hook.command)
                 return (
                   <li key={`ws-${index}-${hookIndex}`} className="hooks-binding flex min-w-0 flex-col gap-2 py-2">
@@ -364,6 +377,20 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
         onDiscard={() => { if (original !== null) { setHooks(original); setDisableAll(originalDisableAll); setNotice(null) } }}
       />
     </PanelBody>
+  )
+}
+
+/** A workspace hook of a type dnt-harness does not run: read-only, saved back as written. */
+function KeptHookItem({ hook, matcher }: { readonly hook: KeptHookRow; readonly matcher: string | undefined }) {
+  const summary = typeof hook['prompt'] === 'string' ? hook['prompt'] : JSON.stringify(hook)
+  return (
+    <li className="hooks-binding hooks-kept flex min-w-0 items-center gap-2 py-2" title="dnt-harness does not run this hook type; it stays in settings.json exactly as written. Edit it in the raw JSON.">
+      <Badge tone="blue">workspace</Badge>
+      {matcher !== undefined ? <code className="w-40 shrink-0 truncate font-mono text-xs text-fg-muted">{matcher === '' ? '*' : matcher}</code> : null}
+      <Badge>{hook.type}</Badge>
+      <span className="min-w-0 flex-1 truncate text-[13px] text-fg-muted">{summary}</span>
+      <Badge>not run · kept</Badge>
+    </li>
   )
 }
 
