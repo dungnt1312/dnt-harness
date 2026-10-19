@@ -17,11 +17,46 @@ interface MigrationResult {
 const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex')
 
 /**
+ * Completion marker version. Bump it whenever the migration's decision logic
+ * changes: an older (or newer, or unreadable) marker is ignored and the next
+ * boot rescans every canonical log.
+ */
+export const ROOT_MODE_MIGRATION_VERSION = 1
+
+interface MigrationMarker {
+  readonly version: number
+  readonly completedAt: number
+  /**
+   * Sessions a completed pass resolved: roots that hold a mode snapshot and
+   * children (child identity is permanent in an append-only log). A session
+   * absent from this set (created later by a path that stamps no snapshot,
+   * forked from a legacy root, or written by an older host) is still read.
+   */
+  readonly verified: readonly string[]
+}
+
+/** The verified set of a current marker; undefined means "scan everything". */
+async function readMarker(file: string): Promise<ReadonlySet<string> | undefined> {
+  try {
+    const record = JSON.parse(await fs.readFile(file, 'utf8')) as Partial<MigrationMarker>
+    if (record.version !== ROOT_MODE_MIGRATION_VERSION || !Array.isArray(record.verified)) return undefined
+    return new Set(record.verified.filter((id): id is string => typeof id === 'string'))
+  } catch {
+    // Missing or unreadable: derived state only, so fall back to a full scan.
+    return undefined
+  }
+}
+
+/**
  * A data-home startup migration. Call after SessionsService.boot() but before
  * the HTTP listener begins accepting requests. The host already holds the
  * data-home ownership lock; no second process may append concurrently.
  * A stopped migration resumes by checking the canonical session/mode record,
  * never by trusting a derived checkpoint alone.
+ *
+ * After a pass completes, `root-mode-migration.json` in the data home records
+ * the sessions it resolved; later boots read only sessions outside that set.
+ * A pass that throws leaves the previous marker (if any) untouched.
  */
 export async function migrateRootModes(
   home: string,
@@ -30,6 +65,10 @@ export async function migrateRootModes(
   defaultMode: (workspaceId: WorkspaceId) => ResolvedMode,
 ): Promise<MigrationResult> {
   const backupDir = path.join(home, 'root-mode-backups')
+  const markerFile = path.join(home, 'root-mode-migration.json')
+  const previouslyVerified = await readMarker(markerFile)
+  const verified: string[] = []
+  let examined = 0
   const snapshots = new Map<WorkspaceId, ResolvedMode>()
   const defaultedWorkspaces = new Set<string>()
   let migrated = 0
@@ -39,15 +78,24 @@ export async function migrateRootModes(
     const id = summary.id as SessionId
     const workspaceId = sessions.workspaceOf(id)
     if (workspaceId === undefined) continue
+    if (previouslyVerified?.has(id) === true) {
+      verified.push(id)
+      continue
+    }
+    examined += 1
     // Canonical reads (rather than summary projections) decide both child
     // identity and whether a previous interrupted attempt already landed.
     const events = await sessions.readCanonicalEvents(id)
     if (events === undefined) throw new Error(`root-mode migration: no canonical log for '${id}'`)
     if (events.some((event) => event.type === 'session/child-meta')) {
       skippedChildren += 1
+      verified.push(id)
       continue
     }
-    if (sessionModeOf(events) !== undefined) continue
+    if (sessionModeOf(events) !== undefined) {
+      verified.push(id)
+      continue
+    }
     let selected = snapshots.get(workspaceId)
     if (selected === undefined) {
       const workspaceDefault = defaultMode(workspaceId)
@@ -93,6 +141,13 @@ export async function migrateRootModes(
       migrated += 1
     }
     await replaceFileAtomic(manifestFile, JSON.stringify({ v: 1, sessionId: id, workspaceId, originalSha256: digest(await fs.readFile(backupFile)), completed: true }))
+    verified.push(id)
+  }
+  // Rewrite only when the set changed: no current marker, a new session was
+  // resolved, or a verified one no longer exists.
+  if (previouslyVerified === undefined || examined > 0 || verified.length !== previouslyVerified.size) {
+    const marker: MigrationMarker = { version: ROOT_MODE_MIGRATION_VERSION, completedAt: Date.now(), verified }
+    await replaceFileAtomic(markerFile, JSON.stringify(marker))
   }
   return { migrated, skippedChildren, defaultedWorkspaces: [...defaultedWorkspaces] }
 }
