@@ -50,13 +50,33 @@ terminals.subscribe(WS, (event) => {
   if (event.kind === 'exit') exits.set(event.terminalId, [...(exits.get(event.terminalId) ?? []), event])
 })
 
+/**
+ * Wait until the shell has drawn its prompt: some output, then 300 ms of
+ * quiet (bounded). A cold PowerShell can take seconds to start; typing
+ * before it reads input loses the keystrokes.
+ */
+async function shellReady(id, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  let seen = ''
+  let quietSince = Date.now()
+  while (Date.now() < deadline) {
+    const now = output.get(id) ?? ''
+    if (now !== seen) { seen = now; quietSince = Date.now() }
+    else if (seen !== '' && Date.now() - quietSince >= 300) return true
+    await sleep(50)
+  }
+  return false
+}
+
 const pidOf = new Map()
 const shells = terminals.shells()
 console.log(`shells: ${shells.map((s) => s.id).join(', ')}`)
 
 for (const shell of shells) {
   const info = await terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: shell.id, cols: 80, rows: 24 })
-  await sleep(1500)
+  const started = Date.now()
+  const ready = await shellReady(info.id)
+  console.log(`${shell.id}: prompt ${ready ? 'ready' : 'not seen'} after ${Date.now() - started} ms`)
   terminals.write(info.id, shell.id.includes('powershell') || shell.id.includes('pwsh') ? 'Write-Output "SMOKE-$((6*7))"\r' : 'echo SMOKE-42\r')
   const echoed = await until(() => (output.get(info.id) ?? '').includes('SMOKE-42'), 5000)
   record(`${shell.id}: input → output`, echoed)
@@ -70,7 +90,7 @@ for (const shell of shells) {
 {
   const shell = shells.find((s) => s.id === 'cmd') ?? shells[0]
   const info = await terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: shell.id })
-  await sleep(1500)
+  await shellReady(info.id)
   terminals.write(info.id, shell.id === 'cmd' ? 'start /b ping -n 120 127.0.0.1 > nul\r' : 'sleep 120 &\r')
   await sleep(1500)
   // The terminal record does not expose the PID, so find the shell by its child.
@@ -99,7 +119,7 @@ for (const shell of shells) {
   const shell = shells.find((s) => s.id === 'cmd') ?? shells[0]
   const ids = []
   for (let i = 0; i < 5; i++) ids.push((await terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: shell.id })).id)
-  await sleep(1500)
+  await Promise.all(ids.map((id) => shellReady(id)))
   for (const id of ids) terminals.write(id, 'exit\r')
   await until(() => ids.every((id) => (exits.get(id) ?? []).length === 1), 5000)
   await until(() => consoleHosts() <= before, 3000)
