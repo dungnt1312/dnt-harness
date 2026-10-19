@@ -492,15 +492,16 @@ export class ChildExecutor {
         }
         this.indexChild(parentId, childId)
         recovered += 1
+        if (parentEvents === undefined) continue
+        // Only the current run counts: a resumed child is judged by the
+        // records since its newest spawn/resume, not by an earlier result.
+        const run = currentRun(parentEvents, childEvents, childId)
         // A settled background run whose report never reached the root as queued
         // input stays owed to its next join or wait, across the restart.
-        if (parentEvents !== undefined && meta.background === true) {
-          const run = currentRun(parentEvents, childEvents, childId)
-          if (run.result !== undefined && isTerminalStatus(run.result.status) && !reportQueuedAfter(parentEvents, childId, run.result.seq)) {
-            const owed = this.owedBackground.get(parentId) ?? new Set<SessionId>()
-            owed.add(childId)
-            this.owedBackground.set(parentId, owed)
-          }
+        if (meta.background === true && run.result !== undefined && isTerminalStatus(run.result.status) && !reportQueuedAfter(parentEvents, childId, run.result.seq)) {
+          const owed = this.owedBackground.get(parentId) ?? new Set<SessionId>()
+          owed.add(childId)
+          this.owedBackground.set(parentId, owed)
         }
         // A crash between the committed spawn and the child's settlement leaves
         // the parent's log result-less forever, and every projection reads that
@@ -510,16 +511,11 @@ export class ChildExecutor {
         // parent. A terminal completed/cancelled/failed child turn stays
         // untouched: it proves the child stopped, never that the parent
         // accepted its result, so that contract remains `uncertain`.
-        if (parentEvents !== undefined) {
-          // Only the current run counts: a resumed child is judged by the
-          // records since its newest spawn/resume, not by an earlier result.
-          const run = currentRun(parentEvents, childEvents, childId)
-          const prior = run.result
-          const terminal = terminalTurnReason(childEvents.slice(run.start))
-          if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
-            const workspace = sessions.workspaceOf(childId)
-            if (workspace !== undefined) await this.reconcile(workspace, childId)
-          }
+        const prior = run.result
+        const terminal = terminalTurnReason(childEvents.slice(run.start))
+        if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
+          const workspace = sessions.workspaceOf(childId)
+          if (workspace !== undefined) await this.reconcile(workspace, childId)
         }
       }
     }
