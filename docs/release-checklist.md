@@ -11,7 +11,7 @@ only when all of these hold:
      effective-model, provider-error-classification, reasoning-round-trip,
      llm-openai, bench-metrics, base-prompt-guidance, plus the suites promoted
      below).
-   - `linux-runtime-probes` (`runtime-probes.yml` via `workflow_call`): Bun
+   - `runtime-probes` (`runtime-probes.yml` via `workflow_call`): Bun
      1.4.3 runtime/Undici/DNS probes and `bun scripts/pty-probes.mjs --require`
      (real bash PTY teardown) on Linux, plus the `macos-pty-probes` job:
      the same probes with `--shell zsh` and `--shell bash` on macos-15.
@@ -26,13 +26,17 @@ only when all of these hold:
    `npm publish <tarball> --ignore-scripts` under Node 24.22.0 (npm 11.19.1;
    trusted publishing needs npm ≥ 11.5.1). No checkout, no install.
 
-All gates are wired but **pending their first green CI run**; until a real
-tag run passes, treat them as unproven.
+Every gate except the tag-only steps (tag equals version, `publish`) is green
+on the release pull request, and a pull request that touches `release.yml`
+runs the gate jobs and `pack` as a dry run without `publish`. The first real
+tag run is still the final proof; link its gate runs under "Manual evidence".
+Release notes: [CHANGELOG.md](../CHANGELOG.md).
 
 ### Linux full suite and promoted suites
 
 `.github/workflows/linux-suite.yml` (ubuntu-24.04, Node 22.20, Bun 1.4.3) runs
-the whole `bun run test` suite on every pull request and on `workflow_dispatch`.
+the whole `bun run test` suite on every pull request, on every push to `main`
+(so the commit a tag is cut from has a run) and on `workflow_dispatch`.
 While promoting, it also had a `candidate-suites` job that ran each suite below
 in its own Vitest process, three times in parallel. Three consecutive green runs on
 `a625583` ([run 39181016471](https://github.com/dungnt1312/dnt-harness/actions/runs/39181016471),
@@ -63,26 +67,31 @@ has none; `macos-pty-probes` covers zsh).
 The workflow cannot enforce these itself. They must exist before anyone relies
 on tag-triggered publish:
 
-- [ ] Settings → Environments → `release`: required reviewers (≥ 1), "Prevent
-      self-review" on, deployment restricted to `v*` tags.
-- [ ] Settings → Rules → tag ruleset for `v*`: only maintainers may create,
-      update or delete release tags (tag protection).
-- [ ] npm trusted publisher configured for this repository, workflow
+- [x] Settings → Environments → `release`: required reviewer `dungnt1312`,
+      deployment restricted to `v*` tags. "Prevent self-review" is **off**
+      (sole maintainer, who is also the tag author and reviewer).
+- [x] Tag ruleset `release-tags` (id 25362958) for `v*`: only maintainers may
+      create, update or delete release tags.
+- [ ] **User:** npm trusted publisher configured for this repository, workflow
       `release.yml`, environment `release`.
-- [ ] Workflow actions stay pinned to full commit SHAs (version comment beside
-      each). Update them deliberately, never to a moving tag.
+- [x] Workflow actions stay pinned to full commit SHAs (version comment beside
+      each). Update them deliberately, never to a moving tag. (Done.)
 
 ## Before tagging (maintainer, local)
 
-- [ ] `bun run preflight:node` (Node >= 22.19) and `bun run probe:runtime`
-      (Bun 1.4.3) pass.
-- [ ] Full suite run on a supported host (a green `linux-suite.yml` run on the
-      tagged commit counts). Any failure is either on the pinned
+- [x] `bun run preflight:node` (Node >= 22.19) and `bun run probe:runtime`
+      (Bun 1.4.3) pass. Local, macOS arm64: Node 24.15.0, probes 8/8.
+- [x] Full suite run on a supported host (a green `linux-suite.yml` run on the
+      tagged commit counts). Linux run: LINUX_RUN; local macOS (Node 24.15.0, `--maxWorkers=3`): 374 files, 5160 passed, 2 skipped. Any failure is either on the pinned
       baseline inventory (`plans/261017-runtime-provider-hardening/reports/phase-00-baseline.md`)
       or classified (isolated rerun: flake vs regression). Never "all green"
       by footnote.
-- [ ] `npm pack --dry-run`: no secrets, transcripts, `.env`, data dirs or
-      `route-identity.secret` in the tarball.
+- [x] `npm pack --dry-run`: no secrets, transcripts, `.env`, data dirs or
+      `route-identity.secret` in the tarball. Audited on the release commit:
+      1955 files (`bin`, `src`, `web-dist`, `skills`, `commands`, `README.md`,
+      `package.json`), no `.env`, key material, token-shaped strings, data
+      directories, tests, plans or transcripts; the only file names containing
+      "secret" or "transcript" are source modules.
 
 ## Manual evidence (attach links/logs to the environment approval)
 
@@ -121,6 +130,7 @@ Green on `dev` (windows-2025, Windows Server 2025 10.0.26100): ConPTY smoke
 [run 39178325530](https://github.com/dungnt1312/dnt-harness/actions/runs/39178325530)
 and [run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
 
+- [x] `windows-smoke` green on the release pull request head (WIN_RUN).
 - [ ] `windows-smoke` green on the release tag (link the run).
 
 Still manual (not covered by the job):
@@ -134,9 +144,10 @@ Still manual (not covered by the job):
 
 ### Linux (required, automated)
 
-- [ ] `linux-runtime-probes` job green on the release tag (link the run).
-      Linux terminal support is not claimed without this. (Pending its first
-      green CI run.)
+- [x] `linux-probes` (probes 8/8, PTY probes) green on the release pull request
+      head (PROBE_RUN).
+- [ ] `runtime-probes` gate green on the release tag (link the run). Linux
+      terminal support is not claimed without this.
 
 ### macOS (claimed: zsh and Bash terminals)
 
@@ -150,21 +161,52 @@ macOS terminal support **is claimed** for this release. Evidence:
       `macos-pty-probes` job (macos-15 arm64, macOS 15.7), 11/11 for both
       shells, green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
 - [x] README.md, docs/web.md and docs/guides.md say macOS is supported.
+- [x] `macos-pty-probes` green on the release pull request head (PROBE_RUN).
 - [ ] `macos-pty-probes` green on the release tag (link the run). If it is not,
       drop the macOS claim from those docs before publishing.
 
 ### Optional live smokes (needed before the matching support claim)
 
-- [ ] RH1-G: public HTTPS MCP server, OAuth refresh/revoke and media bytes
-      under Bun.
+- [ ] **User:** RH1-G OAuth refresh/revoke live smoke, steps below. The public
+      HTTPS MCP part passed under Bun (`mcp.deepwiki.com`); refresh/revoke was
+      not run because it would rotate or destroy live account tokens.
 - [ ] PH4-G: `bun scripts/smoke-deepseek-reasoning.ts` with `DEEPSEEK_API_KEY`
-      (prints counts/status only). Native DeepSeek thinking+tools is not
-      claimed until this passes.
+      (prints counts/status only). Passed through a DeepSeek-compatible proxy
+      (`deepseek-v4.1-flash-free`); native first-party DeepSeek thinking+tools
+      is not claimed until it passes against the first-party endpoint.
 - [ ] Prompt behavior: `PROMPT_EVAL_API_KEY=… PROMPT_EVAL_BASE_URL=… bun
       scripts/prompt-eval/run.ts deepseek-v4.1-flash-free` (the measured
       model; always name it, because the defaults are the first-party URL and
       `deepseek-v4-pro`), plus each other model the release recommends.
       Prints counts/status only; record the per-case lines.
+
+### OAuth refresh/revoke smoke (user, disposable account)
+
+Use a throwaway account on an OAuth MCP server (Notion, Linear, Atlassian or
+Sentry in the catalog), never a real workspace: refresh rotates the stored
+tokens and revoke destroys the grant. Run the release build under Bun 1.4.3
+(`bun run web` from a checkout, or the installed `dnt-harness`) with a scratch
+`--data-dir`.
+
+1. Settings → MCP → **Browse catalog** → Install the OAuth entry (or add an HTTP
+   server with `auth.type: managed_oauth`), enable it.
+2. **Connect**; finish sign-in in the provider tab. Expected: the row shows
+   connected and lists tools. Note the provider's lifetime for access tokens.
+3. Call one tool from a chat (or the row's **Test**). Expected: success.
+4. Refresh: keep the app running until the access token has expired (provider
+   lifetime, commonly 1 h), then call a tool again. Expected: the call succeeds
+   without a new browser sign-in and the row never shows **Needs sign-in**.
+   Check the provider's "authorized apps" page shows one grant for this client.
+5. Revoke: row menu → **Disconnect OAuth**. Expected: notice "<server> is
+   disconnected." (a "provider did not confirm" notice means the provider
+   refused revocation: record which provider). The row shows **Connect** again
+   and tool calls fail with a sign-in-required result.
+6. In the provider's authorized-apps page confirm the grant is gone. Confirm no
+   plaintext token appears anywhere in the data dir (`grep -r` for the access
+   token you saw in the provider UI, if it exposes one; tokens live encrypted
+   under `oauth/`).
+7. Record: date, provider, pass/fail per step, and the notice text from step 5
+   (no tokens, no client secrets). Tick the RH1-G item above.
 
 ## Never
 

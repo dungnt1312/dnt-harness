@@ -3,6 +3,8 @@ name: Linux full suite
 # The whole Vitest suite on GitHub's Linux runner (Node 22.20, Bun 1.4.3).
 # Separate from runtime-probes.yml so the fast probe gate never waits on it.
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

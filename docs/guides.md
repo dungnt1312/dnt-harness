@@ -25,9 +25,8 @@ upgrades the package. `dnt-harness --version` prints the installed version.
 
 On Windows `pm2` is a `.cmd` shim, so the launcher runs it through
 a shell with quoted arguments. The same commands are meant to work on Linux and
-macOS, but the release evidence covers Windows and Linux only (see
-[release-checklist.md](release-checklist.md)); the Linux CI gate is pending its
-first green run.
+macOS. The release evidence covers Windows, Linux and macOS (see
+[release-checklist.md](release-checklist.md)).
 
 `dnt-harness start pm2 [--name N] [web flags]` requires `pm2` on PATH (it prints
 `bun add -g pm2` otherwise). It deletes any pm2 process with the same name, starts
@@ -49,7 +48,8 @@ Releasing: tag-triggered publish through `.github/workflows/release.yml`. The
 publish job needs every gate job (typecheck + `build:web`, deterministic
 suites, Linux and macOS runtime/PTY probes, the Windows launcher/PM2 smoke)
 and approval in the protected `release`
-environment. These gates are wired but pending their first green CI run.
+environment. Every gate is green on the release pull request; the first tag run
+is the final proof.
 A separate `pack` job (no OIDC token) builds the tarball; `publish` only
 uploads it with `npm publish --ignore-scripts`. Follow [release-checklist.md](release-checklist.md); what each
 gate covers and the remaining manual evidence are listed there. Check the

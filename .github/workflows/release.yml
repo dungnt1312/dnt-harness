@@ -19,6 +19,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Dry run: a pull request that touches this file runs every gate job and the
+  # pack job, but never `publish` (it only runs for a tag, and the `release`
+  # environment only admits `v*` tags). The tag-equals-version checks are
+  # skipped because there is no tag.
+  pull_request:
+    paths: ['.github/workflows/release.yml']
 
 # Least privilege by default; only the publish job gets the OIDC token.
 permissions:
@@ -43,6 +49,7 @@ jobs:
       - run: bun run typecheck
       - run: bun run build:web
       - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
 
   deterministic-suites:
@@ -96,7 +103,7 @@ jobs:
           tests/harness/mcp-client-fixes.spec.ts
         timeout-minutes: 15
 
-  linux-runtime-probes:
+  runtime-probes:
     name: Gate · Bun runtime + PTY probes (Linux, macOS)
     # Bun 1.4.3: real Undici dispatcher, DNS policy, and
     # `bun scripts/pty-probes.mjs --require` (real bash PTY teardown on Linux,
@@ -120,7 +127,7 @@ jobs:
   # None of that code ever sees `id-token: write`.
   pack:
     name: Pack tarball (no OIDC)
-    needs: [typecheck-build, deterministic-suites, linux-runtime-probes, windows-smoke]
+    needs: [typecheck-build, deterministic-suites, runtime-probes, windows-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -135,6 +142,7 @@ jobs:
         with:
           node-version: 22.20.0
       - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       - run: bun install --frozen-lockfile
       # prepack runs `vite build`, so web-dist/ is fresh in the tarball.
@@ -153,6 +161,7 @@ jobs:
   publish:
     name: Publish (npm, OIDC)
     needs: [pack]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     # Protected environment: required reviewers must approve before this job
     # starts (and before any OIDC token can be minted).

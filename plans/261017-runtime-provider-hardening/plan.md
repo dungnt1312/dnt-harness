@@ -33,6 +33,8 @@ Implementation plan for [`../261017-spec-runtime-provider-hardening.md`](../2610
 
 Final report: [reports/phase-06-final-report.md](./reports/phase-06-final-report.md)
 
+Release status (2026-10-19): status stays **in-review**. Met: Linux full suite and probes, macOS zsh+bash PTY probes, Windows smoke, environment `release` and tag ruleset, local before-tagging checks (see [release checklist](../../docs/release-checklist.md)). Open, user-owned: npm trusted publisher, OAuth refresh/revoke live smoke (RH1-G), first-party DeepSeek smoke (PH4-G), first tag run.
+
 ## Implementation log
 
 Baseline `337af2d`. Commits (oldest first), each after code review with findings fixed:
