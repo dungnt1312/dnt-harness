@@ -493,7 +493,8 @@ export async function readWorkspaceHooks(workspaceDir: string): Promise<{ hooks:
   if (read.error !== undefined) throw new HookSettingsError(read.error)
   const doc = read.doc ?? {}
   const hooks = doc['hooks']
-  if (hooks !== undefined && !isRecord(hooks)) throw new HookSettingsError(`${workspaceSettingsPath(workspaceDir)}: 'hooks' must be an object keyed by event name`)
+  // A non-object `hooks` still loads (as empty) so the panel stays usable; the
+  // problem is reported by the effective-hooks diagnostics and a save keeps the value.
   return { hooks: isRecord(hooks) ? hooks : {}, disableAllHooks: doc['disableAllHooks'] === true }
 }
 
@@ -507,8 +508,12 @@ export async function writeWorkspaceHooks(workspaceDir: string, hooks: unknown, 
   const read = await readSettings(file)
   if (read.error !== undefined) throw new HookSettingsError(read.error)
   const doc: Record<string, unknown> = { ...(read.doc ?? {}) }
-  if (Object.keys(parsed).length === 0) delete doc['hooks']
-  else doc['hooks'] = parsed
+  // An empty editor document next to a stored non-object `hooks` is what a read of
+  // that file shows, so it is "no change": keep the stored value (Claude Code may
+  // still use it) and only apply `disableAllHooks`. A non-empty document replaces it.
+  const storedIsInvalid = doc['hooks'] !== undefined && !isRecord(doc['hooks'])
+  if (Object.keys(parsed).length > 0) doc['hooks'] = parsed
+  else if (!storedIsInvalid) delete doc['hooks']
   if (disableAllHooks === true) doc['disableAllHooks'] = true
   else if (disableAllHooks === false) delete doc['disableAllHooks']
   await fs.mkdir(workspaceDir, { recursive: true })
