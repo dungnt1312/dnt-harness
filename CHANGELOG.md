@@ -53,6 +53,7 @@ upgrade notes for the runtime changes: [docs/migration-runtime-hardening.md](doc
   generation of the carrying client; deleting an MCP server reports local fence
   and remote revocation.
 - Boot recovery no longer loads every session; session replay is cached.
+- Faster startup: the web host now reaches listening in about half a second on a large history (about 19 s before) by indexing settled child agents and checking root-mode snapshots from session summaries. The first start after upgrading rebuilds session summaries once (about 10 s on a large history).
 - Settings lists have valid ARIA structure; dictation settings lookup settles on failure.
 
 ### CI and release
