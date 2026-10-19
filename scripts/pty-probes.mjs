@@ -291,23 +291,30 @@ await probe('UTF-8 split across PTY reads decodes intact', async () => {
   await terminals.disposeAll()
 })
 
-// ── the product's own default shell (no override): macOS opens the login shell as a login shell ──
+// ── the product's own macOS shells: each leg's shell opens as a login shell ──
+// The leg's shell is selected explicitly, so the zsh leg proves `zsh -l -i`
+// even where the account's login shell (the catalog's first entry) is bash.
 if (process.platform === 'darwin') {
-  await probe('the default macOS terminal is the catalog\'s first shell, started as a login shell', async () => {
+  const name = `the macOS ${shellName} terminal is started as a login shell, and the default is the catalog's first shell`
+  await probe(name, async () => {
     const terminals = createTerminalService()
-    const first = shellCatalog()[0]
-    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
-    const check = first.id === 'zsh'
+    const catalog = shellCatalog()
+    const option = catalog.find((entry) => entry.id === shellName)
+    if (option === undefined) throw new Error(`no ${shellName} entry in the macOS shell catalog`)
+    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: shellName })
+    const check = shellName === 'zsh'
       ? '[[ -o login ]] && echo "LOGIN-$((40 + 2))"\n'
       : 'shopt -q login_shell && echo "LOGIN-$((40 + 2))"\n'
     // Dotfiles may be slow; this only needs the shell to answer.
     await sleep(300)
     terminals.write(info.id, check)
     const login = await waitForOutput(terminals, info.id, 'LOGIN-42', 10_000)
-    record('the default macOS terminal is the catalog\'s first shell, started as a login shell',
-      info.shellId === first.id && login,
-      `shell=${first.id} ${first.executable} ${first.args.join(' ')} login=${login}`)
     await terminals.kill(info.id)
+    const fallback = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+    await terminals.kill(fallback.id)
+    record(name,
+      info.shellId === shellName && option.args.includes('-l') && login && fallback.shellId === catalog[0].id,
+      `shell=${option.id} ${option.executable} ${option.args.join(' ')} login=${login} default=${fallback.shellId} first=${catalog[0].id}`)
     await terminals.disposeAll()
   })
 }
