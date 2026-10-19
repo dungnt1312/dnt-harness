@@ -246,7 +246,8 @@ describe('MCP config reconciliation', () => {
       expect(row?.generation).toBe(saved?.generation)
       generation = row!.generation
       const live = await livePids(started)
-      expect(live.length).toBeLessThanOrEqual(1)
+      // Exactly one process while the transport is stdio; none once it is remote.
+      expect(live).toHaveLength((await ws.stored('fx')).transport === 'stdio' ? 1 : 0)
       runningPid = live[0] ?? 0
     }
 
