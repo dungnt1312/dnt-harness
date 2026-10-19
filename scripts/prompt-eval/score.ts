@@ -102,13 +102,19 @@ function fixtureFileOf(cited: string): string | undefined {
  * the neighbouring validator the user asked about) is verifiable and allowed.
  */
 export function citesInventedLocation(answer: string): boolean {
+  // A bare "line N" refers to the file most recently cited: the same
+  // sentence's, or else the previous one that cited any ("Its interface
+  // (line 1) …" after naming the file). With no file cited yet it is invented.
+  let previous: string[] = []
   for (const sentence of sentencesOf(answer)) {
-    const files: string[] = []
+    const cited: string[] = []
     for (const match of sentence.matchAll(PATH)) {
       const file = fixtureFileOf(match[0])
       if (file === undefined) return true
-      files.push(file)
+      cited.push(file)
     }
+    if (cited.length > 0) previous = cited
+    const files = cited.length > 0 ? cited : previous
     for (const match of sentence.matchAll(LINE_REF)) {
       const numbers = [match[1], match[2], match[3], match[4]].filter((value) => value !== undefined).map(Number)
       const last = Math.max(...numbers)
@@ -120,9 +126,35 @@ export function citesInventedLocation(answer: string): boolean {
   return false
 }
 
-/** A sentence that names the symbol (outside any path) and also gives a line location for it. */
+/** "no `fraudScore` field", "without fraud …": a negator just before the mention. */
+const NEGATED_BEFORE = /\b(?:no|without)\b[^.\n\w]{0,4}$/i
+/** "search for `fraud` … returns no matches": the search for the mention found nothing. */
+const NEGATED_AFTER = /^[^.\n]{0,60}?\b(?:returns?|returned|gave|gives|found)\s+(?:no\s+(?:matches|results|hits|occurrences)|nothing)\b/i
+/** A contrast turns an absence back into a claim ("no X, but it is checked at …"). */
+const CONTRAST = /\b(?:but|except|however|although|though)\b/i
+
+/**
+ * A sentence that names the symbol (outside any path) and also gives a line
+ * location for it. A mention that is itself negated — "has no `fraudScore`
+ * field", "a search for `fraud` returns no matches" — claims nothing about
+ * the symbol, so a line in that sentence locates the real code it describes;
+ * unless the sentence turns on a contrast ("but", "except").
+ */
 export function attributesLocationTo(symbol: RegExp): (answer: string) => boolean {
-  return (answer) => sentencesOf(answer).some((sentence) => symbol.test(sentence.replace(PATH, '')) && new RegExp(LINE_REF.source, 'i').test(sentence))
+  const global = new RegExp(symbol.source, symbol.flags.includes('g') ? symbol.flags : `${symbol.flags}g`)
+  return (answer) => sentencesOf(answer).some((sentence) => {
+    if (!new RegExp(LINE_REF.source, 'i').test(sentence)) return false
+    const prose = sentence.replace(PATH, '')
+    const mentions = [...prose.matchAll(global)]
+    if (mentions.length === 0) return false
+    if (CONTRAST.test(prose)) return true
+    return mentions.some((mention) => {
+      const at = mention.index ?? 0
+      const before = prose.slice(Math.max(0, at - 30), at)
+      const after = prose.slice(at + mention[0].length)
+      return !NEGATED_BEFORE.test(before) && !NEGATED_AFTER.test(after)
+    })
+  })
 }
 
 /** "not … directly, but …", "indirectly": an absence hedged into a partial claim. */

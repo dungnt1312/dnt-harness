@@ -75,7 +75,7 @@ Baseline `337af2d`. Commits (oldest first), each after code review with findings
 - RH-1 transport: real Undici must be loaded by resolved package entry under Bun; bare `undici` import is forbidden for this path.
 - Phase 5 replay window: default native DeepSeek window is the whole conversation (official docs: "all previous turns" when `tools` present); strict pre-network gate covers only the active tool loop. `tool-loop` stays an explicit profile value.
 - Phase 2 copies are HEAD-only (HEAD + index + worktree layers rebuilt; no history).
-- Phase 6 prompt eval: string-level tests plus an opt-in live behavioral eval (`scripts/prompt-eval/`); spec §11.3 eval implemented 2026-10-19. Gap: nonexistent-feature FAILS live under the hardened scorer. Evidence is one live sample per case, one model via the `ocproxy` proxy (`ocproxy-2`), and the rule was narrowed after run 1 (see final report).
+- Phase 6 prompt eval: string-level tests plus an opt-in live behavioral eval (`scripts/prompt-eval/`); spec §11.3 eval implemented 2026-10-19. nonexistent-feature passes 5/5 live after a scorer false-positive fix (run 5 failures were false positives; run 6 passed). Evidence is one model via the `ocproxy` proxy (`ocproxy-2`), one sample for each of the other cases, and the rule was adjusted after observing live answers (see final report).
 - Post-plan: Windows terminal backend replaced node-pty with bun-pty 0.5.1 (exact pin, user request); spec RH3-D "Windows node-pty smoke" is satisfied by equivalent bun-pty smoke.
 
 ## Release gates status
@@ -90,7 +90,7 @@ Baseline `337af2d`. Commits (oldest first), each after code review with findings
 - [ ] RH1-G live public HTTPS MCP/OAuth/media smoke under Bun.
 - [ ] PH4-G live DeepSeek smoke (needs `DEEPSEEK_API_KEY`).
 - [ ] Protected `release` environment + tag protection configured by repo admin.
-- [ ] Behavioral prompt eval (spec §11.3): implemented. Live run 3 passed 3/3 under the narrowed rule (narrowed after run 1). Run 4 under the hardened scorer FAILS nonexistent-feature. One live sample per case, one model (`deepseek-v4.1-flash-free`) via the `ocproxy-2` proxy (2026-10-19).
+- [x] Behavioral prompt eval (spec §11.3): implemented. Live run 3 passed 3/3 under the narrowed rule (narrowed after run 1). Run 4 under the hardened scorer failed nonexistent-feature; run 5 showed its failures to be scorer false positives (5/5); run 6 under the fixed scorer passed 5/5. One model (`deepseek-v4.1-flash-free`) via the `ocproxy-2` proxy (2026-10-19).
 
 ## Red Team Review
 

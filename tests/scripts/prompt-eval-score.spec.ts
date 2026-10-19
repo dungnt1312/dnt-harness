@@ -174,6 +174,29 @@ describe('scoreCase: review hardening', () => {
     expect(citesInventedLocation('validateOrder in validate.ts:3 checks orders.')).toBe(false)
   })
 
+  it('passes live absence answers that cite real lines of the real validator around a negated mention', () => {
+    for (const answer of [
+      'The only order validation is `src/orders/validate.ts`, `validateOrder` at lines 3–9, and it checks only `email`, `items`, and per-item `quantity`. Its `Order` interface (line 1) has no `fraudScore` field.',
+      'A case-insensitive search for `fraud` across the workspace returns no matches, and the only order-validation code is `src/orders/validate.ts`, which checks just three things: `email` (line 5), `items` non-empty (line 6), and `quantity > 0` per item (line 7).',
+      'Order validation lives in `src/orders/validate.ts`, lines 3–9, but it only checks:\n- email contains `@` (line 5)\n- at least one item (line 6)\n\nThere is no fraud-score field in the `Order` interface (line 1) either.',
+      '- The only order validation is `validateOrder` in `src/orders/validate.ts:3`, which checks `email`, non-empty `items`, and `quantity` > 0 — no fraud-related field.',
+    ]) {
+      const score = absent(`There is no \`fraudScore\` validation in this project. ${answer}`)
+      expect(score.forbiddenHits, answer).toEqual([])
+      expect(score.pass, answer).toBe(true)
+    }
+  })
+
+  it('still fails a negated mention that turns into a claim, and a bare line with no file cited before it', () => {
+    for (const answer of [
+      'There is no fraudScore field, but it is checked at src/orders/validate.ts:5.',
+      'fraudScore is not found, except in src/orders/validate.ts at line 5.',
+      'There is no `fraudScore` validation in src/orders/validate.ts. fraudScore is checked at line 5.',
+    ]) expect(absent(answer).forbiddenHits, answer).toContain('attributes a location to the nonexistent symbol')
+    expect(citesInventedLocation('fraudScore is not referenced anywhere. The check is at line 5.')).toBe(true)
+    expect(citesInventedLocation('See src/orders/validate.ts. The check is at line 12.')).toBe(true)
+  })
+
   it('fails a wrong-path answer that only restates the stated path', () => {
     const score = scoreCase(byId('wrong-path-alias'), transcript('lib/format/currency.ts uses toFixed(2): 2 decimal places.', [call('Read', { path: 'lib/format/currency.ts' })]))
     expect(score).toMatchObject({ pass: false, recalled: 1, missing: ['resolved file'] })
