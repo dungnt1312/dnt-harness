@@ -3,7 +3,11 @@
  * that needs a changed search, and a nonexistent feature that must be reported
  * absent. Scores recall together with tool use (see `score.ts`).
  *
- *   PROMPT_EVAL_API_KEY=… [PROMPT_EVAL_BASE_URL=…] bun scripts/prompt-eval/run.ts [model]
+ *   PROMPT_EVAL_API_KEY=… [PROMPT_EVAL_BASE_URL=…] bun scripts/prompt-eval/run.ts [model] [case-id…]
+ *
+ * Name the model explicitly: the defaults (first-party DeepSeek URL,
+ * `deepseek-v4-pro`) are not what any recorded run measured. Case ids limit
+ * the run to those cases; none runs all of them.
  *
  * Without PROMPT_EVAL_API_KEY it exits 0 and does nothing (never runs in CI by
  * accident). The base URL is used as-is; the provider appends
@@ -42,6 +46,10 @@ if (key === undefined || key.trim() === '') {
 }
 const baseUrl = process.env['PROMPT_EVAL_BASE_URL'] ?? 'https://api.deepseek.com'
 const model = process.argv[2] ?? 'deepseek-v4-pro'
+const caseIds = process.argv.slice(3)
+const unknown = caseIds.filter((id) => !PROMPT_EVAL_CASES.some((testCase) => testCase.id === id))
+if (unknown.length > 0) throw new Error(`unknown case id: ${unknown.join(', ')}`)
+const selected = caseIds.length === 0 ? PROMPT_EVAL_CASES : PROMPT_EVAL_CASES.filter((testCase) => caseIds.includes(testCase.id))
 const CASE_TIMEOUT_MS = 180_000
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep'])
 
@@ -102,7 +110,7 @@ async function runCase(testCase: PromptEvalCase, apiKey: string): Promise<{ scor
 }
 
 let failed = false
-for (const testCase of PROMPT_EVAL_CASES) {
+for (const testCase of selected) {
   let outcome: Awaited<ReturnType<typeof runCase>>
   try {
     outcome = await runCase(testCase, key)

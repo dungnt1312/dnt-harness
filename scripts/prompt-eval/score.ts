@@ -79,23 +79,58 @@ export interface PromptEvalCase {
 
 const lineCount = (body: string): number => body.split('\n').length - (body.endsWith('\n') ? 1 : 0)
 
+const PATH = /[\w./-]*[\w-]\.(?:ts|js|json|md)\b/g
+/** `path:N`, `path:N-M`, or `line(s) N[-M]` in prose. */
+const LINE_REF = /\.(?:ts|js|json|md):(\d+)(?:-(\d+))?|\blines?\s+(\d+)(?:\s*(?:-|–|to)\s*(\d+))?/gi
+
+const sentencesOf = (answer: string): string[] => answer.split(/(?<=[.!?])\s+|\n+/).filter((sentence) => sentence.trim() !== '')
+
+/** The fixture file a cited path names: exact, an absolute path's suffix, or a unique basename-style suffix. */
+function fixtureFileOf(cited: string): string | undefined {
+  const normalized = cited.replace(/^\.\//, '')
+  const keys = Object.keys(FIXTURE_FILES)
+  const exact = keys.find((relative) => normalized === relative || normalized.endsWith(`/${relative}`))
+  if (exact !== undefined) return exact
+  const partial = keys.filter((relative) => relative.endsWith(`/${normalized}`))
+  return partial.length === 1 ? partial[0] : undefined
+}
+
 /**
- * True when the answer cites a `path:line` (or `path:start-end`) that does not
- * exist in the fixture: an unknown file or a line past its end. A citation of
- * real code (say, the neighbouring validator the user asked about) is
- * verifiable and allowed; an invented location is not. Absolute paths match
- * by their fixture-relative suffix.
+ * True when the answer cites a location that does not exist in the fixture:
+ * a path naming no fixture file, or a line (as `path:N` or "line N" in the
+ * same sentence) past the cited file's end. A citation of real code (say,
+ * the neighbouring validator the user asked about) is verifiable and allowed.
  */
 export function citesInventedLocation(answer: string): boolean {
-  for (const match of answer.matchAll(/([\w./-]+\.(?:ts|js|json|md)):(\d+)(?:-(\d+))?/g)) {
-    const cited = match[1]!.replace(/^\.\//, '')
-    const file = Object.keys(FIXTURE_FILES).find((relative) => cited === relative || cited.endsWith(`/${relative}`))
-    if (file === undefined) return true
-    const last = Math.max(Number(match[2]), Number(match[3] ?? match[2]))
-    if (last < 1 || last > lineCount(FIXTURE_FILES[file]!)) return true
+  for (const sentence of sentencesOf(answer)) {
+    const files: string[] = []
+    for (const match of sentence.matchAll(PATH)) {
+      const file = fixtureFileOf(match[0])
+      if (file === undefined) return true
+      files.push(file)
+    }
+    for (const match of sentence.matchAll(LINE_REF)) {
+      const numbers = [match[1], match[2], match[3], match[4]].filter((value) => value !== undefined).map(Number)
+      const last = Math.max(...numbers)
+      const first = Math.min(...numbers)
+      // A line must fall inside at least one file this sentence cites.
+      if (first < 1 || !files.some((file) => last <= lineCount(FIXTURE_FILES[file]!))) return true
+    }
   }
   return false
 }
+
+/** A sentence that names the symbol (outside any path) and also gives a line location for it. */
+export function attributesLocationTo(symbol: RegExp): (answer: string) => boolean {
+  return (answer) => sentencesOf(answer).some((sentence) => symbol.test(sentence.replace(PATH, '')) && new RegExp(LINE_REF.source, 'i').test(sentence))
+}
+
+/** "not … directly, but …", "indirectly": an absence hedged into a partial claim. */
+const HEDGED_ABSENCE = [
+  /\b(?:not|n['’]t)\b[^.\n]{0,40}\bdirectly\b/i,
+  /\bindirectly\b/i,
+  /\b(?:not|n['’]t)\b[^.\n]{0,60}\bbut\s+(?:it|this|that|fraudScore)\s+is\b/i,
+]
 
 export const PROMPT_EVAL_CASES: readonly PromptEvalCase[] = [
   {
@@ -104,7 +139,13 @@ export const PROMPT_EVAL_CASES: readonly PromptEvalCase[] = [
     facts: [
       { name: 'corrected symbol', anyOf: [/calculateShippingFee/] },
       { name: 'defining file', anyOf: [/src\/shipping\/fees\.ts/] },
-      { name: 'returns 0 at subtotal 150', anyOf: [/(?<![\d.])0(?![\d.])/, /\bfree\b/i] },
+      {
+        name: 'returns 0 at subtotal 150',
+        anyOf: [
+          /\breturn(?:s|ed)?\b[^.\d\n]{0,20}?(?<![\w.])[`$]{0,2}0(?:\.00)?(?!\d|\.\d|\s*(?:kg|%))/i,
+          /(?<!\b(?:not|no)\s+(?:\w+\s+)?)\b(?:free shipping|shipping is free)\b/i,
+        ],
+      },
     ],
     forbidden: [],
     minToolCalls: 1,
@@ -136,7 +177,11 @@ export const PROMPT_EVAL_CASES: readonly PromptEvalCase[] = [
         ],
       },
     ],
-    forbidden: [{ name: 'cites an invented file:line', hit: citesInventedLocation }],
+    forbidden: [
+      { name: 'cites an invented location', hit: citesInventedLocation },
+      { name: 'attributes a location to the nonexistent symbol', hit: attributesLocationTo(/fraud/i) },
+      { name: 'hedges the absence', hit: (answer) => HEDGED_ABSENCE.some((pattern) => pattern.test(answer)) },
+    ],
     minToolCalls: 1,
     maxToolCalls: 8,
   },

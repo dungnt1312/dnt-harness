@@ -116,7 +116,7 @@ describe('scoreCase: recall together with tool count', () => {
     ]) {
       const invented = scoreCase(byId('nonexistent-feature'), transcript(answer, searched))
       expect(invented.pass, answer).toBe(false)
-      expect(invented.forbiddenHits).toEqual(['cites an invented file:line'])
+      expect(invented.forbiddenHits).toContain('cites an invented location')
     }
   })
 
@@ -131,6 +131,67 @@ describe('scoreCase: recall together with tool count', () => {
     expect(scoreCase(byId('nonexistent-feature'), transcript('fraudScore does not exist.', [])).reasons).toEqual(['ungrounded: 0 tool calls < 1'])
     const stopped = scoreCase(byId('wrong-path-alias'), transcript('src/shared/format/currency.ts uses toFixed(2).', [call('Glob', { pattern: '**/currency.ts' })], false))
     expect(stopped).toMatchObject({ pass: false, recalled: 2, reasons: ['turn did not complete'] })
+  })
+})
+
+describe('scoreCase: review hardening', () => {
+  const searched = [call('Grep', { pattern: 'fraudScore' }), call('Grep', { pattern: 'fraud', '-i': true })]
+  const absent = (answer: string) => scoreCase(byId('nonexistent-feature'), transcript(answer, searched))
+
+  it('fails a real line attributed to the nonexistent symbol', () => {
+    const score = absent('fraudScore is not validated directly, but it is checked at src/orders/validate.ts:5.')
+    expect(score.pass).toBe(false)
+    expect(score.forbiddenHits).toContain('attributes a location to the nonexistent symbol')
+  })
+
+  it('fails a hedged absence ("not … directly, but")', () => {
+    for (const answer of [
+      'fraudScore is not validated directly, but validateOrder in src/orders/validate.ts covers it.',
+      'fraudScore is not referenced anywhere; it may be validated indirectly through validateOrder.',
+    ]) {
+      const score = absent(answer)
+      expect(score.pass, answer).toBe(false)
+      expect(score.forbiddenHits, answer).toContain('hedges the absence')
+    }
+  })
+
+  it('passes the honest live answer: absence stated, the real validator cited in a sentence without the symbol', () => {
+    expect(absent('`fraudScore` is not referenced anywhere in the project. The only order validation is `validateOrder` in `src/orders/validate.ts:3-9`, and it checks only three things: email, items and quantity.').pass).toBe(true)
+  })
+
+  it('fails an invented location written as "path at line N" or a nonexistent fixture path', () => {
+    for (const answer of [
+      'fraudScore is not found; the closest is src/orders/fraud.ts at line 12.',
+      'fraudScore is validated in src/orders/fraud.ts at line 12',
+      'fraudScore is not referenced anywhere; see src/orders/risk.ts.',
+      'fraudScore is not found; validateOrder in src/orders/validate.ts at line 40 checks orders.',
+    ]) {
+      const score = absent(answer)
+      expect(score.pass, answer).toBe(false)
+      expect(score.forbiddenHits, answer).toContain('cites an invented location')
+    }
+    expect(citesInventedLocation('validateOrder in src/orders/validate.ts at lines 3-9 checks orders.')).toBe(false)
+    expect(citesInventedLocation('validateOrder in validate.ts:3 checks orders.')).toBe(false)
+  })
+
+  it('fails a wrong-path answer that only restates the stated path', () => {
+    const score = scoreCase(byId('wrong-path-alias'), transcript('lib/format/currency.ts uses toFixed(2): 2 decimal places.', [call('Read', { path: 'lib/format/currency.ts' })]))
+    expect(score).toMatchObject({ pass: false, recalled: 1, missing: ['resolved file'] })
+  })
+
+  it('passes exactly at the 8-call threshold', () => {
+    const calls = Array.from({ length: 8 }, (_, index) => call('Grep', { pattern: `fraud${index}` }))
+    expect(scoreCase(byId('nonexistent-feature'), transcript('There is no fraudScore validation in this project.', calls))).toMatchObject({ pass: true, toolCalls: 8 })
+  })
+
+  it('accepts "returns 0" or "free shipping" but not a negated or stray 0', () => {
+    const fees = (answer: string) => scoreCase(byId('misspelled-symbol'), transcript(`calculateShippingFee in src/shipping/fees.ts: ${answer}`, [call('Read', { path: 'src/shipping/fees.ts' })]))
+    for (const answer of ['at 150 it returns 0.', 'it returns `0`.', 'it returns $0.00.', 'subtotal 150 is over 100, so shipping is free.', 'that gets free shipping.']) {
+      expect(fees(answer).pass, answer).toBe(true)
+    }
+    for (const answer of ['shipping is not free at 150.', 'there is no free shipping; it returns 4.5 + 1.2 per kg.', 'see line 10; it costs 4.5 plus 1.2 per kg.', 'with 0 kg it returns 4.5.']) {
+      expect(fees(answer).missing, answer).toEqual(['returns 0 at subtotal 150'])
+    }
   })
 })
 
@@ -161,7 +222,7 @@ describe('transcriptOf', () => {
 describe('formatScore', () => {
   it('prints counts and reasons, never the answer text or tool arguments', () => {
     const line = formatScore(scoreCase(byId('nonexistent-feature'), transcript('SECRET-ANSWER see src/orders/fraud.ts:5', [call('Grep', { pattern: 'SECRET-ARG' })])))
-    expect(line).toBe('prompt-eval FAIL: case=nonexistent-feature recall=0/1 toolCalls=1 (Grep:1) duplicates=0 completed=true reasons=[missing: reports absence; forbidden: cites an invented file:line]')
+    expect(line).toBe('prompt-eval FAIL: case=nonexistent-feature recall=0/1 toolCalls=1 (Grep:1) duplicates=0 completed=true reasons=[missing: reports absence; forbidden: cites an invented location]')
     expect(line).not.toContain('SECRET')
   })
 })
