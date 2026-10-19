@@ -192,6 +192,7 @@ describe('scoreCase: review hardening', () => {
       'There is no fraudScore field, but it is checked at src/orders/validate.ts:5.',
       'fraudScore is not found, except in src/orders/validate.ts at line 5.',
       'There is no `fraudScore` validation in src/orders/validate.ts. fraudScore is checked at line 5.',
+      'There is no fraudScore check in src/orders/validate.ts. Actually fraudScore is computed at line 5 and returns nothing for valid orders.',
     ]) expect(absent(answer).forbiddenHits, answer).toContain('attributes a location to the nonexistent symbol')
     expect(citesInventedLocation('fraudScore is not referenced anywhere. The check is at line 5.')).toBe(true)
     expect(citesInventedLocation('See src/orders/validate.ts. The check is at line 12.')).toBe(true)

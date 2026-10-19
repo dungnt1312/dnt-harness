@@ -128,7 +128,9 @@ export function citesInventedLocation(answer: string): boolean {
 
 /** "no `fraudScore` field", "without fraud …": a negator just before the mention. */
 const NEGATED_BEFORE = /\b(?:no|without)\b[^.\n\w]{0,4}$/i
-/** "search for `fraud` … returns no matches": the search for the mention found nothing. */
+/** "search for `fraud` …": the mention is what a search looked for. */
+const SEARCHED_FOR = /\b(?:search(?:ed|ing|es)?|grep(?:ped|ping)?|look(?:ed|ing)?|query|queried)\b(?:\s+for)?[^.\n\w]{0,4}$/i
+/** "… returns no matches": that search found nothing (only counts after {@link SEARCHED_FOR}). */
 const NEGATED_AFTER = /^[^.\n]{0,60}?\b(?:returns?|returned|gave|gives|found)\s+(?:no\s+(?:matches|results|hits|occurrences)|nothing)\b/i
 /** A contrast turns an absence back into a claim ("no X, but it is checked at …"). */
 const CONTRAST = /\b(?:but|except|however|although|though)\b/i
@@ -136,7 +138,7 @@ const CONTRAST = /\b(?:but|except|however|although|though)\b/i
 /**
  * A sentence that names the symbol (outside any path) and also gives a line
  * location for it. A mention that is itself negated — "has no `fraudScore`
- * field", "a search for `fraud` returns no matches" — claims nothing about
+ * field", or the object of a search that "returns no matches" — claims nothing about
  * the symbol, so a line in that sentence locates the real code it describes;
  * unless the sentence turns on a contrast ("but", "except").
  */
@@ -152,7 +154,7 @@ export function attributesLocationTo(symbol: RegExp): (answer: string) => boolea
       const at = mention.index ?? 0
       const before = prose.slice(Math.max(0, at - 30), at)
       const after = prose.slice(at + mention[0].length)
-      return !NEGATED_BEFORE.test(before) && !NEGATED_AFTER.test(after)
+      return !NEGATED_BEFORE.test(before) && !(SEARCHED_FOR.test(before) && NEGATED_AFTER.test(after))
     })
   })
 }
