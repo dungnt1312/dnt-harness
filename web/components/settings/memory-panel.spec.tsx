@@ -99,6 +99,14 @@ describe('MemoryPanel', () => {
     expect(mocked.searchMemory).toHaveBeenCalledWith('ws-1', '', 'p1')
   })
 
+  it('exposes each group header as a tree item so the tree owns only tree items and groups', async () => {
+    await renderPanel()
+    const tree = document.body.querySelector('[role="tree"]')!
+    const headers = [...tree.querySelectorAll('[role="group"] > button[aria-expanded]')]
+    expect(headers.length).toBeGreaterThan(0)
+    expect(headers.every((header) => header.getAttribute('role') === 'treeitem')).toBe(true)
+  })
+
   it('marks each entry with its metadata.type icon, falling back to a plain document icon', async () => {
     mocked.searchMemory.mockImplementation(async (_ws: string, _q: string, projectId?: string | null) => projectId === null
       ? [

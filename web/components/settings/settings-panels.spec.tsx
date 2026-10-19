@@ -267,7 +267,7 @@ describe('agents panel', () => {
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([explorerRow, userRow, workspaceRow] as never)
     await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
     await settle()
-    const groups = [...document.body.querySelectorAll('[role="listbox"] [role="group"]')].map((group) => group.getAttribute('aria-label'))
+    const groups = [...document.body.querySelectorAll('[role="group"][aria-label="Agent roles"] > [role="group"]')].map((group) => group.getAttribute('aria-label'))
     expect(groups).toEqual(['Workspace', '~/.claude', 'Bundled'])
     // The most specific layer is first, and opened by default.
     expect(document.body.querySelector('h3')?.textContent).toBe('auditor')

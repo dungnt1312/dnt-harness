@@ -412,6 +412,7 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
                 <div key={group.key} role="group">
                   <button
                     type="button"
+                    role="treeitem"
                     className={`${TREE_ROW} gap-1.5 pl-2 font-medium text-fg`}
                     aria-expanded={groupOpen}
                     title={group.label}

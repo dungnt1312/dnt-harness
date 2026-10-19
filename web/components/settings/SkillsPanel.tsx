@@ -486,6 +486,7 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {}, onOpenSources }
                   <div key={group.key} role="group">
                     <button
                       type="button"
+                      role="treeitem"
                       className={`${TREE_ROW} gap-1.5 pl-2 font-medium text-fg`}
                       aria-expanded={groupOpen}
                       title={group.label}
@@ -518,7 +519,7 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {}, onOpenSources }
                             <button
                               type="button"
                               title={description !== '' ? `${row.name} — ${description}` : row.name}
-                              aria-selected={rowActive}
+                              aria-current={rowActive ? 'true' : undefined}
                               className={`flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-link ${(row.hidden ?? false) ? 'text-fg-faint' : 'text-fg'}`}
                               onClick={() => guardDiscard(() => { if (!isOpen) toggleSkill(row, key); void openDetail(row) })}
                             >
@@ -546,22 +547,26 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {}, onOpenSources }
                           {isOpen ? (
                             files === undefined ? (
                               <p className="m-0 flex h-7 items-center pl-[68px] text-xs text-fg-faint">Loading…</p>
-                            ) : files.map((file) => {
-                              const fileActive = rowActive && selected?.file === file.path
-                              return (
-                                <button
-                                  key={file.path}
-                                  type="button"
-                                  role="treeitem"
-                                  aria-label={file.path}
-                                  className={`${TREE_ROW} gap-1.5 pl-[52px] ${fileActive ? 'bg-hover text-fg' : 'text-fg-muted'}`}
-                                  onClick={() => guardDiscard(() => void openFile(row, file.path))}
-                                >
-                                  <Icon name={fileIconName(file.path)} size={13} className="shrink-0 text-fg-faint" />
-                                  <span className="min-w-0 truncate">{file.path}</span>
-                                </button>
-                              )
-                            })
+                            ) : (
+                              <div role="group">
+                                {files.map((file) => {
+                                  const fileActive = rowActive && selected?.file === file.path
+                                  return (
+                                    <button
+                                      key={file.path}
+                                      type="button"
+                                      role="treeitem"
+                                      aria-label={file.path}
+                                      className={`${TREE_ROW} gap-1.5 pl-[52px] ${fileActive ? 'bg-hover text-fg' : 'text-fg-muted'}`}
+                                      onClick={() => guardDiscard(() => void openFile(row, file.path))}
+                                    >
+                                      <Icon name={fileIconName(file.path)} size={13} className="shrink-0 text-fg-faint" />
+                                      <span className="min-w-0 truncate">{file.path}</span>
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            )
                           ) : null}
                         </div>
                       )

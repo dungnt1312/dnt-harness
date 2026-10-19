@@ -640,7 +640,7 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
               />
             </div>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto py-1" role="listbox" aria-label="Agent roles">
+          <div className="min-h-0 flex-1 overflow-y-auto py-1" role="group" aria-label="Agent roles">
             {definitions === null ? (
               <p className="m-0 px-4 py-6 text-center text-[13px] text-fg-muted">Loading…</p>
             ) : groups.length === 0 ? (
@@ -662,7 +662,7 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
                   <span>{SOURCE_LABEL[group.source]}</span>
                   <span className="font-normal">{group.rows.length}</span>
                 </button>
-                {!groupOpen(group.source) ? null : group.rows.map((row) => {
+                {!groupOpen(group.source) ? null : <div role="listbox" aria-label={`${SOURCE_LABEL[group.source]} roles`}>{group.rows.map((row) => {
                   const key = rowKey(row)
                   const active = (activeView?.kind === 'role' || activeView?.kind === 'edit') && activeView.key === key
                   const model = modelText(row)
@@ -693,7 +693,7 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
                       <span className={cn('shrink-0 font-mono text-[10px]', model.warn ? 'text-warn' : 'text-fg-faint')} title={model.long}>{model.short}</span>
                     </button>
                   )
-                })}
+                })}</div>}
               </div>
             ))}
           </div>
