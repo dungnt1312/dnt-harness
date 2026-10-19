@@ -875,9 +875,12 @@ On Windows it is `bun-pty` (a prebuilt Rust library loaded through `bun:ffi`,
 no install script), imported lazily. If it cannot load, the routes answer
 `501` with the reason and the rest of the product is untouched.
 
-**Platform support (this release).** Windows (bun-pty/ConPTY) has local
-smoke evidence (`bun scripts/pty-smoke-windows.mjs`: bash, PowerShell, cmd
-I/O, resize, natural exit, kill with background-job cleanup, 16 terminals).
+**Platform support (this release).** Windows (bun-pty/ConPTY) is gated by
+the `windows-smoke` CI job on windows-2025: `bun scripts/pty-smoke-windows.mjs
+--require` (bash, PowerShell, cmd I/O, resize, natural exit, kill with
+background-job cleanup, 16 terminals) and the same terminal routes on a
+PM2-launched server (`scripts/pm2-smoke-windows.mjs`), green in
+[run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
 Linux and macOS (Bun 1.4.3 built-in PTY) are gated by
 `bun scripts/pty-probes.mjs --require [--shell zsh|bash]` in the
 `runtime-probes` CI job: bash on ubuntu-24.04 and zsh 5.9 plus bash 3.2.57 on

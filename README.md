@@ -49,8 +49,9 @@ DNS policy). See [docs/migration-runtime-hardening.md](docs/migration-runtime-ha
 for behaviour changes in this release.
 
 **Platform support.** Terminal (PTY) support is claimed only where it has
-been verified. Windows (bun-pty/ConPTY) has local smoke evidence
-(`bun scripts/pty-smoke-windows.mjs`). Linux and macOS (Bun built-in PTY)
+been verified. Windows (bun-pty/ConPTY) is gated by the
+`windows-smoke` CI job (`bun scripts/pty-smoke-windows.mjs --require` plus a
+PM2-launched server, on windows-2025). Linux and macOS (Bun built-in PTY)
 are gated by the `runtime-probes` CI job (`bun scripts/pty-probes.mjs
 --require`): bash on Linux (ubuntu-24.04), and zsh plus the system bash 3.2
 on macOS (macos-15, arm64), both green in

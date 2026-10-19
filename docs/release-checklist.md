@@ -105,6 +105,11 @@ gate of `release.yml`. It packs the repo and checks:
   OpenAI-compatible gateway (`scripts/e2e/fake-gateway.mjs`) through a
   temporary `--config`; no provider secret.
 
+Green on `dev` (windows-2025, Windows Server 2025 10.0.26100): ConPTY smoke
+14/14, PM2 smoke 27/27, both DLL hashes OK, headless chat OK, in
+[run 39178325530](https://github.com/dungnt1312/dnt-harness/actions/runs/39178325530)
+and [run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
+
 - [ ] `windows-smoke` green on the release tag (link the run).
 
 Still manual (not covered by the job):
