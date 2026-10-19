@@ -1,7 +1,7 @@
 name: Runtime probes
 
 # Linux and macOS gate for Bun runtime / DNS / PTY behaviour. Kept separate from
-# the full suite, which has known host-environment failures on GitHub's Linux runners.
+# the full suite (linux-suite.yml) so this fast gate never waits on it.
 on:
   push:
     branches: [main]

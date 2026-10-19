@@ -60,9 +60,9 @@ jobs:
           node-version: 22.20.0
       - run: bun install --frozen-lockfile
       - run: node scripts/node-preflight.mjs
-      # A stable subset of the runtime/provider hardening specs. The full suite
-      # still has host-environment failures on GitHub's Linux runners, so it is
-      # run locally before tagging (see docs/release-checklist.md).
+      # The runtime/provider hardening specs plus the PTY, headless, media and
+      # MCP OAuth suites proven stable on this runner by linux-suite.yml. The
+      # full suite runs on every pull request there (see docs/release-checklist.md).
       - name: Vitest (Node 22.20)
         run: >-
           node node_modules/vitest/vitest.mjs run
@@ -76,6 +76,24 @@ jobs:
           tests/harness/llm-openai.spec.ts
           tests/scripts/bench-metrics.spec.ts
           tests/harness/base-prompt-guidance.spec.ts
+          tests/web/terminals-posix.spec.ts
+          tests/web/terminals.spec.ts
+          tests/web/server-terminals.spec.ts
+          tests/web/server-models.spec.ts
+          tests/bins/headless.spec.ts
+          tests/harness/image-tools.spec.ts
+          tests/harness/image-tools-mode-exposure.spec.ts
+          tests/harness/video-tools.spec.ts
+          tests/harness/mcp-oauth.spec.ts
+          tests/harness/mcp-oauth-config.spec.ts
+          tests/harness/mcp-oauth-discovery.spec.ts
+          tests/harness/mcp-oauth-registration.spec.ts
+          tests/web/mcp-oauth-connect.spec.ts
+          tests/web/mcp-oauth-paste.spec.ts
+          tests/web/mcp-oauth-races.spec.ts
+          tests/web/mcp-oauth-redirect.spec.ts
+          tests/web/mcp-shutdown-oauth.spec.ts
+          tests/harness/mcp-client-fixes.spec.ts
         timeout-minutes: 15
 
   linux-runtime-probes:

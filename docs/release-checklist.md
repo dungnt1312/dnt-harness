@@ -9,7 +9,8 @@ only when all of these hold:
    - `deterministic-suites`: a stable Vitest subset under Node 22.20
      (outbound-http, mcp-outbound-policy, repo-freeze, terminals-lifecycle,
      effective-model, provider-error-classification, reasoning-round-trip,
-     llm-openai, bench-metrics, base-prompt-guidance).
+     llm-openai, bench-metrics, base-prompt-guidance, plus the suites promoted
+     below).
    - `linux-runtime-probes` (`runtime-probes.yml` via `workflow_call`): Bun
      1.4.3 runtime/Undici/DNS probes and `bun scripts/pty-probes.mjs --require`
      (real bash PTY teardown) on Linux, plus the `macos-pty-probes` job:
@@ -28,11 +29,15 @@ only when all of these hold:
 All gates are wired but **pending their first green CI run**; until a real
 tag run passes, treat them as unproven.
 
-### Suites left out of the deterministic gate
+### Linux full suite and promoted suites
 
-These affected suites are **not** in `deterministic-suites` because they are
-not yet proven stable on GitHub's Linux runners (PTY/host processes, timing,
-native media tooling, loopback OAuth fixtures). Run them locally before tagging:
+`.github/workflows/linux-suite.yml` (ubuntu-24.04, Node 22.20, Bun 1.4.3) runs
+the whole `bun run test` suite on every pull request and on `workflow_dispatch`.
+While promoting, it also had a `candidate-suites` job that ran each suite below
+in its own Vitest process, three times in parallel. Three consecutive green runs on
+`a625583` ([run 39181016471](https://github.com/dungnt1312/dnt-harness/actions/runs/39181016471),
+attempts 1–3: full suite 5123 passed, 3 skipped; every candidate file green in
+all nine legs) promoted all of these into `deterministic-suites`:
 
 - `tests/web/terminals-posix.spec.ts`, `tests/web/terminals.spec.ts`,
   `tests/web/server-terminals.spec.ts`
@@ -40,13 +45,18 @@ native media tooling, loopback OAuth fixtures). Run them locally before tagging:
 - `tests/bins/headless.spec.ts`
 - `tests/harness/image-tools.spec.ts`, `tests/harness/image-tools-mode-exposure.spec.ts`,
   `tests/harness/video-tools.spec.ts`
-- `tests/harness/mcp-oauth*.spec.ts`, `tests/web/mcp-oauth*.spec.ts`
-  (and the new `tests/web/mcp-shutdown-oauth.spec.ts`)
+- `tests/harness/mcp-oauth*.spec.ts`, `tests/web/mcp-oauth*.spec.ts`,
+  `tests/web/mcp-shutdown-oauth.spec.ts`
 - `tests/harness/mcp-client-fixes.spec.ts`
 
-- [ ] To do: after the first real release run, run these on the Linux runner
-      (e.g. a `workflow_dispatch` job) and add each one that passes reliably
-      to the `deterministic-suites` list in `release.yml`.
+No suite is left out. The three Linux skips are explicit host conditions:
+two Windows-only cases (`tests/capabilities/bash.spec.ts`,
+`tests/web/git-askpass.spec.ts`) and the zsh PTY probe in
+`terminals-posix.spec.ts`, which runs only where zsh is installed (the runner
+has none; `macos-pty-probes` covers zsh).
+
+- [x] Run these on the Linux runner and add each one that passes reliably
+      (3 consecutive green runs) to the `deterministic-suites` list in `release.yml`.
 
 ## One-time repository setup (admin)
 
@@ -66,7 +76,8 @@ on tag-triggered publish:
 
 - [ ] `bun run preflight:node` (Node >= 22.19) and `bun run probe:runtime`
       (Bun 1.4.3) pass.
-- [ ] Full suite run on a supported host. Any failure is either on the pinned
+- [ ] Full suite run on a supported host (a green `linux-suite.yml` run on the
+      tagged commit counts). Any failure is either on the pinned
       baseline inventory (`plans/261017-runtime-provider-hardening/reports/phase-00-baseline.md`)
       or classified (isolated rerun: flake vs regression). Never "all green"
       by footnote.
