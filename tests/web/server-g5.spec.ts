@@ -608,6 +608,13 @@ describe('G5 web MCP + hooks', () => {
       name: 'scripted', models: ['scripted'],
       async *stream(request) {
         seen.push(request.messages.map((message) => messageText(message.content)))
+        // One tool step, then a final answer: a repeating step would fire
+        // PostToolUse again before the test stops the turn.
+        if (seen.length > 1) {
+          yield { type: 'delta', delta: 'done' }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
         yield { type: 'toolCalls', calls: [
           { id: 'b1', name: 'Bash', args: { command: 'echo should-not-run' } },
           { id: 'g1', name: 'Glob', args: { pattern: '*' } },
