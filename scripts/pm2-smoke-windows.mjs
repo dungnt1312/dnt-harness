@@ -180,9 +180,11 @@ async function timed(command, check) {
   const ms = Date.now() - started
   record(`pm2 ${command} completes within ${PM2_BUDGET_MS / 1000} s`, result.status === 0 && ms <= PM2_BUDGET_MS, `${ms} ms, exit ${result.status}`)
   if (result.status !== 0) console.log(result.stdout, result.stderr)
-  await until(() => tree.every((p) => !alive(p.pid)), 5_000)
+  // The shells must be gone within the same budget pm2 had, counted from
+  // the command's start: a shell that outlives start + budget is a leftover.
+  await until(() => tree.every((p) => !alive(p.pid)), Math.max(0, started + PM2_BUDGET_MS - Date.now()))
   const survivors = tree.filter((p) => alive(p.pid))
-  record(`pm2 ${command}: no leftover shell processes`, shellsBefore.length >= 2 && survivors.length === 0,
+  record(`pm2 ${command}: no leftover shell processes within ${PM2_BUDGET_MS / 1000} s`, shellsBefore.length >= 2 && survivors.length === 0,
     `shells before: ${shellsBefore.map((p) => p.name).join(' ')}; survivors: ${survivors.map((p) => `${p.pid}=${p.name}`).join(' ') || 'none'}`)
   for (const p of survivors) { try { process.kill(p.pid, 'SIGKILL') } catch { /* already gone */ } }
   await check()
