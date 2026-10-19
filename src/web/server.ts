@@ -7000,12 +7000,21 @@ async function handleApi(
         send(400, { error: resolved.reason })
         return
       }
+      const maxBytes = deps.limitsReader.read().values.maxAttachmentBytes
+      // A declared oversize body is refused before reading it, so the client
+      // gets the 413; a chunked body that overflows is cut off mid-read.
+      const declared = Number(req.headers['content-length'])
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        send(413, { error: `audio exceeds the ${maxBytes} byte limit` })
+        return
+      }
       try {
-        const bytes = await readBytes(req, deps.limitsReader.read().values.maxAttachmentBytes)
+        const bytes = await readBytes(req, maxBytes)
         const text = await transcribe(resolved.config, bytes, { language: languageOf(req.url) })
         send(200, { text })
       } catch (error) {
-        send(502, { error: `transcription failed: ${String(error instanceof Error ? error.message : error)}` })
+        if (error instanceof AttachmentError) send(413, { error: `audio exceeds the ${maxBytes} byte limit` })
+        else send(502, { error: `transcription failed: ${String(error instanceof Error ? error.message : error)}` })
       }
       return
     }

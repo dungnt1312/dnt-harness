@@ -81,6 +81,24 @@ describe('POST /api/speech-to-text/transcribe', () => {
     expect(seen?.raw.includes('whisper-large-v3')).toBe(true)
   })
 
+  it('answers 413 for audio over the attachment limit, before any provider request', async () => {
+    const setCap = async (value: number): Promise<void> => {
+      const view = await server.appConfig.describe()
+      await server.appConfig.edit([{ op: 'set', key: 'maxAttachmentBytes', value }], view.hash!)
+    }
+    const before = sttRequests.length
+    const original = server.appConfig.read().values.maxAttachmentBytes
+    await setCap(AUDIO.length - 1)
+    try {
+      const response = await fetch(`${server.url}/api/speech-to-text/transcribe`, { method: 'POST', headers: { 'content-type': 'audio/webm' }, body: AUDIO })
+      expect(response.status).toBe(413)
+      expect(((await response.json()) as { error: string }).error).toContain(`${AUDIO.length - 1} byte limit`)
+      expect(sttRequests.length).toBe(before)
+    } finally {
+      await setCap(original)
+    }
+  })
+
   it('refuses audio before any provider request when not configured (blank pair)', async () => {
     const saved = await json('/api/speech-to-text', 'PUT', { provider: null, model: null })
     expect(saved.status).toBe(200)
