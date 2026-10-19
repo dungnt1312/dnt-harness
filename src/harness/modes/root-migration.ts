@@ -72,7 +72,7 @@ const lastSeqOf = (events: readonly { readonly seq: number }[]): number => event
  * the HTTP listener begins accepting requests. The host already holds the
  * data-home ownership lock; no second process may append concurrently.
  * A stopped migration resumes by checking the canonical session/mode record,
- * never by trusting a derived checkpoint alone.
+ * never by trusting the marker alone.
  *
  * The one derived record it does trust is an unloaded session's summary, and
  * only in the direction logs cannot undo: boot reconciled that summary with

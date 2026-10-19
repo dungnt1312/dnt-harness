@@ -285,7 +285,14 @@ describe('legacy root mode migration', () => {
           logs[id] = (await fs.readFile(path.join(dataHome, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'utf8'))
             .trim().split('\n').map((line) => (JSON.parse(line) as { type: string }).type)
         }
-        return { result, verified: verified.sort((a, b) => a.id.localeCompare(b.id)), logs, reads: [...new Set(reads)].sort() }
+        const backups: Record<string, string> = {}
+        const backupRoot = path.join(dataHome, 'root-mode-backups')
+        for (const entry of await fs.readdir(backupRoot, { recursive: true, withFileTypes: true })) {
+          if (!entry.isFile()) continue
+          const file = path.join(entry.parentPath, entry.name)
+          backups[path.relative(backupRoot, file)] = await fs.readFile(file, 'utf8')
+        }
+        return { result, verified: verified.sort((a, b) => a.id.localeCompare(b.id)), logs, backups, reads: [...new Set(reads)].sort() }
       } finally {
         await kernel.stop()
         vi.restoreAllMocks()
@@ -298,6 +305,12 @@ describe('legacy root mode migration', () => {
       expect(fromSummaries.result).toEqual({ migrated: 1, skippedChildren: 2, defaultedWorkspaces: [] })
       expect(fromSummaries.verified).toEqual(fromLogs.verified)
       expect(fromSummaries.logs).toEqual(fromLogs.logs)
+      // Backups and their manifests match byte for byte: only the legacy root was backed up.
+      expect(fromSummaries.backups).toEqual(fromLogs.backups)
+      expect(Object.keys(fromSummaries.backups).sort()).toEqual([
+        path.join(wsId, roots[0]!, 'events.jsonl'),
+        path.join(wsId, roots[0]!, 'manifest.json'),
+      ])
       expect(fromLogs.reads).toEqual([...roots, CHILD, modedChild].sort())
       expect(fromSummaries.reads).toEqual([roots[0]])
     } finally {
@@ -329,6 +342,48 @@ describe('legacy root mode migration', () => {
       expect(summary?.modeFacts).toEqual({ child: false, hasMode: true })
     }
     expect((await readMarker()).verified.map((entry) => entry.id).sort()).toEqual([...roots].sort())
+  })
+
+  it('reads each log once when only the mode facts are missing, children included', async () => {
+    const { wsId, roots } = await seed(2)
+    // The parent commits a finished child, so child recovery settles it from summaries.
+    const parentLog = log(wsId, roots[0]!)
+    const lastSeq = (await fs.readFile(parentLog, 'utf8')).trim().split('\n').length
+    await fs.appendFile(parentLog, [
+      { v: 1, seq: lastSeq + 1, timestamp: Date.now(), type: 'agent/child-spawn', childSessionId: CHILD, parentTurnId: 'turn-old', definition: 'explorer' },
+      { v: 1, seq: lastSeq + 2, timestamp: Date.now(), type: 'agent/child-result', childSessionId: CHILD, parentTurnId: 'turn-old', status: 'completed' },
+    ].map((record) => JSON.stringify(record) + '\n').join(''))
+    await writeChild(wsId, roots[0]!)
+    await (await boot()).close()
+    // An upgrade from a host that projected child recovery facts but not mode facts.
+    const ids = [...roots, CHILD]
+    const store = new FileSessionStore({ dir: home, workspaceId: wsId as WorkspaceId })
+    const recovery: Record<string, unknown> = {}
+    await fs.rm(marker())
+    for (const id of ids) {
+      const file = path.join(path.dirname(log(wsId, id)), 'summary.json')
+      const { modeFacts: _facts, ...older } = JSON.parse(await fs.readFile(file, 'utf8')) as Record<string, unknown>
+      expect(older['childRecovery']).toBeDefined()
+      recovery[id] = older['childRecovery']
+      await fs.writeFile(file, JSON.stringify(older))
+    }
+    const original = FileSessionStore.prototype.read
+    const parses: string[] = []
+    vi.spyOn(FileSessionStore.prototype, 'read').mockImplementation(function (this: FileSessionStore, id) {
+      parses.push(id)
+      return original.call(this, id)
+    })
+    await (await boot()).close()
+    expect(parses.sort()).toEqual([...ids].sort())
+    for (const id of ids) {
+      const summary = await store.readSummary(id as SessionId)
+      expect(summary?.childRecovery).toEqual(recovery[id])
+      expect(summary?.modeFacts).toEqual(id === CHILD ? { child: true, hasMode: false } : { child: false, hasMode: true })
+    }
+    expect((recovery[roots[0]!] as { children: Record<string, string> }).children).toEqual({ [CHILD]: 'settled' })
+    const verified = (await readMarker()).verified
+    expect(verified.map((entry) => entry.id).sort()).toEqual([...ids].sort())
+    expect(verified.find((entry) => entry.id === CHILD)).toEqual({ id: CHILD, lastSeq: 1, child: true })
   })
 
   it('stamps the mode at creation for a root made through the legacy sessions route', async () => {
