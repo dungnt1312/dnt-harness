@@ -52,8 +52,8 @@ test('a paired browser works across a reload and returns to the gate when its se
   page.on('response', (response) => { if (response.status() === 401 || response.status() === 403) refusals.push(`${response.status()} ${response.url()}`) })
   await page.getByRole('button', { name: 'Open settings', exact: true }).click()
   const settings = page.getByRole('dialog', { name: 'Settings' })
-  for (const section of ['Providers', 'Hooks', 'Agents', 'MCP', 'Secrets']) {
-    await settings.getByRole('tab', { name: new RegExp(section) }).click()
+  for (const section of ['Providers & Models', 'Hooks', 'Agents', 'MCP', 'Secrets']) {
+    await settings.getByRole('tab', { name: section, exact: true }).click()
     await expect(settings.getByRole('heading', { name: section, exact: true }).first()).toBeVisible()
   }
   await settings.getByRole('button', { name: 'Close settings' }).click()

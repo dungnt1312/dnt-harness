@@ -67,6 +67,10 @@ async function serve(page: Page, events: readonly unknown[], children: readonly 
     ])
     if (path === '/api/workspaces/w/meta') return json(route, { workspace: { id: 'w', name: 'Fixture workspace', archived: false }, provider: 'fixture-provider', model: 'fixture-model', providers: [], models: ['fixture-model'], projects: [{ id: 'p', name: 'Fixture project', path: 'C:/fixture/project' }], permissionDefaults: {}, thinkingLevel: null })
     if (path === '/api/workspaces/w/mode') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }], selected: 'chat', revision: 1 })
+    if (path === '/api/model-aliases') return json(route, [])
+    // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
+    if (path === '/api/speech-to-text') return json(route, { provider: null, model: null })
+    if (path === '/api/workspaces/w/commands') return json(route, { commands: [], errors: [] })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/workspaces/w/agents/children') return json(route, children)
     // Any conversation id: a Subagents row navigates to the child's own session.
@@ -79,7 +83,7 @@ async function serve(page: Page, events: readonly unknown[], children: readonly 
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path)) return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path)) return json(route, [])
     if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], available: false })
-    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, changes: [], truncated: false })
+    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, branchInfo: null, head: null, changes: [], truncated: false })
     throw new Error(`Unexpected fixture API request: ${route.request().method()} ${url.href}`)
   })
 
@@ -152,18 +156,20 @@ test('clicking a step shows what the log recorded for it', async ({ page }) => {
   await timeline.getByRole('button', { name: 'Turn 1, 2 tool calls' }).click()
   const calls = workbench.getByRole('list', { name: 'Turn 1, 2 tool calls' })
   await expect(calls.getByText('pnpm test')).toBeVisible()
-  await expect(calls.getByText('createProject in src')).toBeVisible()
+  await expect(calls.getByRole('button', { name: /Find createProject in src/ })).toBeVisible()
 
   // Each call opens to what the log recorded: exact arguments and output.
-  const grep = calls.getByRole('button', { name: /Grep/ })
+  const grep = calls.getByRole('button', { name: /Find createProject in src/ })
   await expect(grep).toHaveAttribute('aria-expanded', 'false')
   await grep.click()
   await expect(grep).toHaveAttribute('aria-expanded', 'true')
-  const body = calls.getByRole('group').filter({ has: page.locator('pre') })
-  await expect(body).toContainText('"pattern": "createProject"')
+  const body = calls.getByRole('group').filter({ has: page.getByRole('button', { name: 'View call details' }) })
   await expect(body).toContainText('no such dir')
+  await body.getByRole('button', { name: 'View call details' }).click()
+  await expect(body.locator('pre[aria-label="Arguments"]')).toContainText('"pattern": "createProject"')
   await grep.click()
-  await expect(calls.getByRole('group').filter({ has: page.locator('pre') })).toHaveCount(0)
+  await expect(grep).toHaveAttribute('aria-expanded', 'false')
+  await expect(body).toHaveCount(0)
 
   await timeline.getByRole('button', { name: 'Turn 1, request 2' }).click()
   await expect(steps.locator('[aria-current="step"]')).toContainText('All done.')
@@ -188,8 +194,8 @@ test('the Subagents view lists running and ended children and opens one', async 
   await serve(page, spawns, children)
   const workbench = await selectWorkbenchView(page, 'Subagents')
 
-  const running = workbench.getByRole('region', { name: 'Running subagents' })
-  await expect(running).toContainText('Running · 1')
+  const running = workbench.getByRole('region', { name: 'Active subagents' })
+  await expect(running).toContainText('Active · 1')
   await expect(running).toContainText('Explore delegation terminal')
   await expect(running).toContainText('Waiting for your approval')
 

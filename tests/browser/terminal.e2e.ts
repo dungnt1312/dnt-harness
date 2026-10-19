@@ -92,11 +92,15 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
     if (path === '/api/workspaces/w/skills') return json(route, [])
     // Control-plane auth off: the shell loads without a pairing step.
     if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
+    if (path === '/api/model-aliases') return json(route, [])
+    // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
+    if (path === '/api/speech-to-text') return json(route, { provider: null, model: null })
+    if (path === '/api/workspaces/w/commands') return json(route, { commands: [], errors: [] })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/workspaces/w/sessions/s/model') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
     if (path === '/api/workspaces/w/sessions/s/mode') return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (path === '/api/workspaces/w/sessions/s/processes') return json(route, [])
-    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, changes: [], truncated: false })
+    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, branchInfo: null, head: null, changes: [], truncated: false })
     // No extra folder grants: file tools stay within the bound project.
     if (path === '/api/workspaces/w/sessions/s/grants' && method === 'GET') return json(route, { revision: 0, roots: [], effective: [] })
     if (path === '/api/workspaces/w/projects/p/files') return json(route, { path: '', entries: [] })
@@ -207,8 +211,9 @@ test('keeps offering new terminals however many already exist', async ({ page })
   await page.setViewportSize({ width: 1440, height: 900 })
   const terminal = await fixture(page, { shells: [{ id: 'bash', label: 'Git Bash' }] })
 
-  // The panel must have subscribed before a frame is pushed, or it is lost.
-  await expect(page.getByText('No terminal open')).toBeVisible()
+  // The panel opens its first terminal itself; it must have subscribed before a
+  // frame is pushed, or the frame is lost.
+  await expect.poll(() => terminal.posts().some((entry) => entry.method === 'POST' && entry.path.endsWith('/terminals'))).toBe(true)
   await terminal.push({ kind: 'created', terminal: TERMINAL })
   const plus = page.getByRole('button', { name: 'New terminal' })
   await expect(plus).toBeEnabled()
