@@ -1,13 +1,17 @@
 name: Release
 
-# Push a version tag (npm version patch && git push --follow-tags) to publish.
+# Publish by tagging the merge commit on main by hand, after the push-to-main
+# `linux-suite` run for that commit is green (package.json already holds the
+# release version, so do not run `npm version`):
+#   git tag -a v0.3.0 <main sha> -m v0.3.0 && git push origin v0.3.0
 #
 # Publish runs only after EVERY gate job passes AND a required reviewer approves
 # the protected `release` environment. Repository admin setup (not expressible
 # in this file, must exist before relying on tag-triggered publish):
-#   1. Settings → Environments → `release`: required reviewers (≥1, not the
-#      tag author), "Prevent self-review", deployment branches/tags limited to
-#      `v*` tags.
+#   1. Settings → Environments → `release`: required reviewers (≥1),
+#      deployment branches/tags limited to `v*` tags. "Prevent self-review" is
+#      off because the repository has a single maintainer, who is both tag
+#      author and reviewer; with a second maintainer, turn it on.
 #   2. Settings → Rules → tag ruleset for `v*`: restrict creation/update/
 #      deletion to maintainers (tag protection).
 #   3. npm trusted publisher bound to this repo + `release.yml` + environment
