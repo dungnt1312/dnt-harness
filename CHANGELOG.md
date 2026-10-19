@@ -12,19 +12,23 @@ upgrade notes for the runtime changes: [docs/migration-runtime-hardening.md](doc
   rejecting or dropping them. An invalid command hook blocks saving until it is fixed.
 - **Speech-to-text:** `transcribe` answers `413` for a request body over the
   attachment limit.
-- **macOS terminals are supported** (zsh and bash). The login shell is tried
-  first, and `LC_CTYPE=UTF-8` is set when the environment has no locale.
+- **macOS terminals are supported** (zsh and bash), on CI evidence (macos-15,
+  arm64) and a local macOS run; the claim is re-checked on the release tag run.
+  The login shell is tried first, and `LC_CTYPE=UTF-8` is set when the
+  environment has no locale.
 - **Bun is the runtime.** The toolchain, PM2 launcher and docs moved from
   pnpm/tsx to Bun 1.4.3 (`engines.bun >=1.4.3`); Vitest/Vite need Node >= 22.19.
   The Windows terminal backend is bun-pty 0.5.1 (was node-pty); the web terminal
-  uses Bun's built-in PTY on POSIX.
+  uses Bun's built-in PTY on POSIX. Windows is gated on x64; the ARM64 DLL is
+  hash-checked but not loaded in CI, and the browser terminal UI is checked by hand.
 - **DeepSeek defaults** to `deepseek-flash`, and retired models are no longer offered.
 
 ### Added
 
 - Speech-to-text dictation over OpenAI-compatible transcription APIs.
 - Provider-agnostic reasoning round-trip; DeepSeek reasoning is replayed across
-  tool loops and never fabricated.
+  tool loops and never fabricated. This was proven through an OpenAI-compatible
+  DeepSeek proxy; the first-party DeepSeek endpoint has not been live-smoked yet.
 - Background child agents that outlive the turn and wake the root; resume and
   message children from a pinned spawn snapshot; undelivered background reports
   survive a restart.
@@ -57,7 +61,8 @@ upgrade notes for the runtime changes: [docs/migration-runtime-hardening.md](doc
   (`linux-suite.yml`, on pull requests and pushes to `main`), and Linux plus macOS
   (zsh, bash) runtime/PTY probes (`runtime-probes.yml`).
 - Tag-triggered publish needs every gate and approval of the protected `release`
-  environment, and publishes a prebuilt tarball with npm trusted publishing.
+  environment, and publishes a prebuilt tarball with npm trusted publishing
+  (the trusted publisher setup and the first tag run are still to be confirmed).
   A pull request touching `release.yml` runs the gates and the pack job as a
   dry run without `publish`.
 - Actions are pinned to full commit SHAs on `ubuntu-24.04`.
