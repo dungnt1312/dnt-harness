@@ -66,6 +66,29 @@ has none; `macos-pty-probes` covers zsh).
 - [x] Run these on the Linux runner and add each one that passes reliably
       (3 consecutive green runs) to the `deterministic-suites` list in `release.yml`.
 
+## Cut the release (maintainer)
+
+Ordered, user-owned steps. Do not skip ahead: each one is the precondition of
+the next. `package.json` already holds `0.3.0`, so never run `npm version`.
+
+1. [ ] Configure the npm trusted publisher (repository, workflow `release.yml`,
+       environment `release`). See "One-time repository setup".
+2. [ ] Merge pull request #1 (`dev` into `main`).
+3. [ ] Wait for the `linux-suite` run triggered by the push to `main` to finish
+       green. Note the merge commit sha.
+4. [ ] Tag that merge commit by hand and push the tag:
+       `git tag -a v0.3.0 <main sha> -m v0.3.0 && git push origin v0.3.0`
+5. [ ] Watch the tag run of `release.yml`. The Windows (`windows-smoke`) and
+       macOS (`macos-pty-probes`, inside `runtime-probes`) gates must be green.
+       If `macos-pty-probes` fails, drop the macOS claim from README.md,
+       docs/web.md, docs/guides.md and CHANGELOG.md before approving.
+6. [ ] Do the manual checks below: the browser terminal and Windows on ARM64
+       (under "Still manual"), and the OAuth refresh/revoke smoke if you want
+       that claim. Link the tag-run gate runs under "Manual evidence".
+7. [ ] Approve the `release` environment deployment. Only then does `publish` run.
+8. [ ] If the OIDC publish fails, re-run only the `publish` job from the same
+       run (the tarball artifact is kept for 7 days). Do not re-tag.
+
 ## One-time repository setup (admin)
 
 The workflow cannot enforce these itself. They must exist before anyone relies
