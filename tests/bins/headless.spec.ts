@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, rm, readFile, readdir, mkdir, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { WorkspaceService } from '../../src/harness/workspace/service.ts'
+import { DEFAULT_MODE_ID } from '../../src/harness/modes/service.ts'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -170,6 +171,19 @@ describe('headless CLI', () => {
     expect(stderr).not.toContain('mock provider')
     expect(stdout).toContain('no provider registered')
     expect(stdout).not.toContain('mock')
+  }, 30_000)
+
+  it('stamps the new root with the selected mode at creation, as the web host does', async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-mode-'))
+    const { code } = await runCli(['--data-dir', dataDir, '--config', path.join(dataDir, 'providers.json'), '--message', 'hello'])
+    expect(code).toBe(0)
+    const logs = (await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl') && file.includes(`${path.sep}sessions${path.sep}`))
+    expect(logs).toHaveLength(1)
+    const events = (await readFile(path.join(dataDir, logs[0]!), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>)
+    const modes = events.filter((event) => event.type === 'session/mode')
+    expect(modes).toHaveLength(1)
+    expect(modes[0]).toMatchObject({ modeId: DEFAULT_MODE_ID, revision: 1, source: 'bundled' })
+    expect(modes[0]?.hash).toMatch(/^[a-f0-9]{64}$/)
   }, 30_000)
 
   describe('model selection', () => {

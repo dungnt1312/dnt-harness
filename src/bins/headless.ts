@@ -64,6 +64,7 @@ import { existsSync, promises as fs, readFileSync, statSync } from 'node:fs'
 import { MemoryService } from '../harness/memory/service.ts'
 import { memoryRoots, memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { ModesService, DEFAULT_MODE_ID } from '../harness/modes/service.ts'
+import { rootModeRecord } from '../harness/modes/root-mode-record.ts'
 import { buildContext } from '../harness/context/builder.ts'
 import { latestCalibration } from '../harness/context/calibration.ts'
 import { agentScope } from '../harness/agent/scope.ts'
@@ -409,6 +410,9 @@ async function main(): Promise<void> {
     }
 
     const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
+    // A new root owns a snapshot of the mode it runs under, as in the web host.
+    const modeRecord = rootModeRecord(mode, 1)
+    session.append(modeRecord)
     session.append({ type: 'session/project', projectId: project.id })
     await session.durable()
     kernel.ctx.on('session/event', (emitter, event) => {
@@ -434,7 +438,7 @@ async function main(): Promise<void> {
       // The provider's last report calibrates the budget, as in the web host.
       const calibration = latestCalibration(session.events, { model: selectedModel, provider: selectedProvider })
       const assembled = buildContext({
-        events: session.events, mode, modeRevision: 0,
+        events: session.events, mode, modeRevision: modeRecord.revision,
         model: selectedModel, providerName: selectedProvider,
         schemas, activeSkills: [], pinnedMemory, budget,
         ...(environment !== undefined ? { environment } : {}),

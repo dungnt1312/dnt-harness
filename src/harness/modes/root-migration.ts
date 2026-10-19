@@ -5,6 +5,7 @@ import type { SessionId, WorkspaceId } from '../../util/brand.ts'
 import type { SessionsService } from '../session/service.ts'
 import { sessionModeOf } from '../session/events.ts'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
+import { rootModeRecord } from './root-mode-record.ts'
 import { DEFAULT_MODE_ID, type ModesService } from './service.ts'
 import type { ResolvedMode } from './types.ts'
 
@@ -18,34 +19,53 @@ const digest = (bytes: Buffer | string): string => createHash('sha256').update(b
 
 /**
  * Completion marker version. Bump it whenever the migration's decision logic
- * changes: an older (or newer, or unreadable) marker is ignored and the next
- * boot rescans every canonical log.
+ * or the marker's shape changes: an older (or newer, or unreadable) marker is
+ * ignored and the next boot rescans every canonical log.
+ * 2: each verified entry carries the canonical length it was verified at.
  */
-export const ROOT_MODE_MIGRATION_VERSION = 1
+export const ROOT_MODE_MIGRATION_VERSION = 2
+
+/**
+ * One session a completed pass resolved: a root holding a mode snapshot, or a
+ * child (`child`). Logs are append-only, so the fact stays true for as long as
+ * the log is at least `lastSeq` long. A shorter log (restored from a backup,
+ * truncated, deleted) is read again.
+ */
+interface VerifiedSession {
+  readonly id: string
+  readonly lastSeq: number
+  readonly child?: true
+}
 
 interface MigrationMarker {
   readonly version: number
   readonly completedAt: number
   /**
-   * Sessions a completed pass resolved: roots that hold a mode snapshot and
-   * children (child identity is permanent in an append-only log). A session
-   * absent from this set (created later by a path that stamps no snapshot,
-   * forked from a legacy root, or written by an older host) is still read.
+   * A session absent from this list (created later by a path that stamps no
+   * snapshot, forked from a legacy root, or written by an older host) is read.
    */
-  readonly verified: readonly string[]
+  readonly verified: readonly VerifiedSession[]
 }
 
-/** The verified set of a current marker; undefined means "scan everything". */
-async function readMarker(file: string): Promise<ReadonlySet<string> | undefined> {
+const isVerifiedSession = (entry: unknown): entry is VerifiedSession => {
+  if (entry === null || typeof entry !== 'object') return false
+  const { id, lastSeq, child } = entry as Record<string, unknown>
+  return typeof id === 'string' && typeof lastSeq === 'number' && Number.isInteger(lastSeq) && lastSeq >= 1 && (child === undefined || child === true)
+}
+
+/** A current marker's entries by id; undefined means "scan everything". */
+async function readMarker(file: string): Promise<ReadonlyMap<string, VerifiedSession> | undefined> {
   try {
     const record = JSON.parse(await fs.readFile(file, 'utf8')) as Partial<MigrationMarker>
     if (record.version !== ROOT_MODE_MIGRATION_VERSION || !Array.isArray(record.verified)) return undefined
-    return new Set(record.verified.filter((id): id is string => typeof id === 'string'))
+    return new Map(record.verified.filter(isVerifiedSession).map((entry) => [entry.id, entry]))
   } catch {
     // Missing or unreadable: derived state only, so fall back to a full scan.
     return undefined
   }
 }
+
+const lastSeqOf = (events: readonly { readonly seq: number }[]): number => events.at(-1)?.seq ?? 0
 
 /**
  * A data-home startup migration. Call after SessionsService.boot() but before
@@ -67,7 +87,7 @@ export async function migrateRootModes(
   const backupDir = path.join(home, 'root-mode-backups')
   const markerFile = path.join(home, 'root-mode-migration.json')
   const previouslyVerified = await readMarker(markerFile)
-  const verified: string[] = []
+  const verified: VerifiedSession[] = []
   let examined = 0
   const snapshots = new Map<WorkspaceId, ResolvedMode>()
   const defaultedWorkspaces = new Set<string>()
@@ -78,8 +98,12 @@ export async function migrateRootModes(
     const id = summary.id as SessionId
     const workspaceId = sessions.workspaceOf(id)
     if (workspaceId === undefined) continue
-    if (previouslyVerified?.has(id) === true) {
-      verified.push(id)
+    const known = previouslyVerified?.get(id)
+    // The summary's lastSeq was reconciled with the canonical tail in
+    // SessionsService.boot(), so a log shorter than verified shows up here.
+    if (known !== undefined && summary.lastSeq >= known.lastSeq) {
+      if (known.child === true) skippedChildren += 1
+      verified.push(known)
       continue
     }
     examined += 1
@@ -89,11 +113,11 @@ export async function migrateRootModes(
     if (events === undefined) throw new Error(`root-mode migration: no canonical log for '${id}'`)
     if (events.some((event) => event.type === 'session/child-meta')) {
       skippedChildren += 1
-      verified.push(id)
+      verified.push({ id, lastSeq: lastSeqOf(events), child: true })
       continue
     }
     if (sessionModeOf(events) !== undefined) {
-      verified.push(id)
+      verified.push({ id, lastSeq: lastSeqOf(events) })
       continue
     }
     let selected = snapshots.get(workspaceId)
@@ -132,16 +156,12 @@ export async function migrateRootModes(
     // Recovery itself may have appended interrupted-turn records. Only the
     // missing mode fact matters: retries never duplicate it.
     if (sessionModeOf(session.events) === undefined) {
-      const snapshot = selected.definition
-      session.append({
-        type: 'session/mode', modeId: snapshot.id, revision: 1,
-        snapshot, source: selected.source, hash: digest(JSON.stringify(snapshot)),
-      })
+      session.append(rootModeRecord(selected, 1))
       await session.durable()
       migrated += 1
     }
     await replaceFileAtomic(manifestFile, JSON.stringify({ v: 1, sessionId: id, workspaceId, originalSha256: digest(await fs.readFile(backupFile)), completed: true }))
-    verified.push(id)
+    verified.push({ id, lastSeq: lastSeqOf(session.events) })
   }
   // Rewrite only when the set changed: no current marker, a new session was
   // resolved, or a verified one no longer exists.

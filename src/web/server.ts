@@ -122,6 +122,7 @@ import {
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { migrateRootModes } from '../harness/modes/root-migration.ts'
+import { rootModeRecord } from '../harness/modes/root-mode-record.ts'
 import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition, type AgentSource } from '../harness/agents/definition-service.ts'
 import { narrowCeiling, roleCandidates } from '../harness/agents/mcp-candidates.ts'
 import {
@@ -3542,15 +3543,7 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   function stampRootMode(session: Session, resolved: ResolvedMode): Extract<SessionEvent, { type: 'session/mode' }> {
     const previous = sessionModeOf(session.events)
-    const snapshot = resolved.definition
-    session.append({
-      type: 'session/mode',
-      modeId: snapshot.id,
-      revision: (previous?.revision ?? 0) + 1,
-      snapshot,
-      source: resolved.source,
-      hash: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
-    })
+    session.append(rootModeRecord(resolved, (previous?.revision ?? 0) + 1))
     return sessionModeOf(session.events) as Extract<SessionEvent, { type: 'session/mode' }>
   }
 
@@ -6773,6 +6766,15 @@ async function handleApi(
         }
         const wsId = implicitWorkspace(deps)
         const session = deps.kernel.ctx.sessions.create(wsId)
+        // Like any new root, it owns a snapshot of the workspace default mode.
+        deps.stampRootMode(session, deps.controlsFor(wsId).modeDefinition)
+        try {
+          await session.durable()
+        } catch (error) {
+          await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
+          send(500, { error: `session mode snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
+          return
+        }
         deps.sessions.set(session.id, {
           session,
           agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId }),

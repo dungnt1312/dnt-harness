@@ -3,7 +3,10 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createWebServer, SessionsService, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, Kernel, SessionsService, type LlmProvider, type WebServer } from 'dnt-harness'
+import { migrateRootModes } from '../../src/harness/modes/root-migration.ts'
+import { DEFAULT_MODE_ID, ModesService } from '../../src/harness/modes/service.ts'
+import type { SessionId, WorkspaceId } from '../../src/util/brand.ts'
 
 const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' } } }
 let home = ''
@@ -51,7 +54,32 @@ async function modeCount(wsId: string, sid: string): Promise<number> {
     .filter((event) => event.type === 'session/mode').length
 }
 
-async function seed(count: number): Promise<{ wsId: string; roots: string[] }> {
+interface MarkerRecord { version: number; completedAt: number; verified: { id: string; lastSeq: number; child?: boolean }[] }
+
+async function readMarker(): Promise<MarkerRecord> {
+  return JSON.parse(await fs.readFile(marker(), 'utf8')) as MarkerRecord
+}
+
+const CHILD = 'session-legacy-child'
+
+/** A child log the parent never recorded: still a child by its own log. */
+async function writeChild(wsId: string, parent: string): Promise<void> {
+  await fs.mkdir(path.dirname(log(wsId, CHILD)), { recursive: true })
+  await fs.writeFile(log(wsId, CHILD), `${JSON.stringify({ v: 1, seq: 1, timestamp: Date.now(), type: 'session/child-meta', parentSessionId: parent, parentTurnId: 'turn-old', definition: 'explorer', brief: 'legacy' })}\n`)
+}
+
+/** Ids of canonical reads issued by the root-mode migration itself (not child recovery). */
+function spyMigrationReads(): string[] {
+  const original = SessionsService.prototype.readCanonicalEvents
+  const ids: string[] = []
+  vi.spyOn(SessionsService.prototype, 'readCanonicalEvents').mockImplementation(function (this: SessionsService, id) {
+    if (new Error().stack?.includes('root-migration') === true) ids.push(id)
+    return original.call(this, id)
+  })
+  return ids
+}
+
+async function seed(count: number, options: { child?: boolean } = {}): Promise<{ wsId: string; roots: string[] }> {
   const server = await boot()
   const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as { id: string }[])[0]!.id
   const roots: string[] = []
@@ -59,6 +87,7 @@ async function seed(count: number): Promise<{ wsId: string; roots: string[] }> {
     roots.push(((await (await post(server.url, `/api/workspaces/${wsId}/sessions`, {})).json()) as { id: string }).id)
   }
   await server.close()
+  if (options.child === true) await writeChild(wsId, roots[0]!)
   // The next boot's pass resolves the new roots and records them.
   await (await boot()).close()
   return { wsId, roots }
@@ -95,20 +124,42 @@ describe('legacy root mode migration', () => {
     expect(after.filter((event) => event.type === 'session/mode')).toHaveLength(1)
   })
 
-  it('records a versioned completion marker after a successful pass', async () => {
-    const { roots } = await seed(2)
-    const record = JSON.parse(await fs.readFile(marker(), 'utf8')) as { version: number; completedAt: number; verified: string[] }
-    expect(record.version).toBe(1)
+  it('records a versioned completion marker with each verified session and its canonical length', async () => {
+    const { wsId, roots } = await seed(2, { child: true })
+    const record = await readMarker()
+    expect(record.version).toBe(2)
     expect(typeof record.completedAt).toBe('number')
-    expect([...record.verified].sort()).toEqual([...roots].sort())
+    const byId = new Map(record.verified.map((entry) => [entry.id, entry]))
+    expect([...byId.keys()].sort()).toEqual([...roots, CHILD].sort())
+    for (const root of roots) {
+      const lines = (await fs.readFile(log(wsId, root), 'utf8')).trim().split('\n')
+      expect(byId.get(root)).toEqual({ id: root, lastSeq: lines.length })
+    }
+    expect(byId.get(CHILD)).toEqual({ id: CHILD, lastSeq: 1, child: true })
   })
 
-  it('reads no canonical log on a later boot once the marker covers every session', async () => {
-    await seed(3)
-    const reads = vi.spyOn(SessionsService.prototype, 'readCanonicalEvents')
-    const server = await boot()
-    expect(reads).not.toHaveBeenCalled()
-    await server.close()
+  it('a later boot issues no migration read for verified roots and children', async () => {
+    await seed(3, { child: true })
+    const reads = spyMigrationReads()
+    await (await boot()).close()
+    expect(reads).toEqual([])
+  })
+
+  it('reports verified children in skippedChildren without reading them', async () => {
+    const { wsId } = await seed(1, { child: true })
+    const reads = spyMigrationReads()
+    const kernel = new Kernel()
+    kernel.ctx.plugin((ctx) => { new SessionsService(ctx, 'sessions', { home }) })
+    try {
+      await kernel.ctx.sessions.boot()
+      const modes = new ModesService(home)
+      const fallback = await modes.resolve(wsId as WorkspaceId, DEFAULT_MODE_ID)
+      const result = await migrateRootModes(home, kernel.ctx.sessions, modes, () => fallback)
+      expect(result).toEqual({ migrated: 0, skippedChildren: 1, defaultedWorkspaces: [] })
+      expect(reads).toEqual([])
+    } finally {
+      await kernel.stop()
+    }
   })
 
   it('still stamps a root the marker has not verified, reading only that root', async () => {
@@ -119,12 +170,35 @@ describe('legacy root mode migration', () => {
     const extra = ((await (await post(server.url, `/api/workspaces/${wsId}/sessions`, {})).json()) as { id: string }).id
     await server.close()
     await stripMode(wsId, extra)
-    const reads = vi.spyOn(SessionsService.prototype, 'readCanonicalEvents')
+    const reads = spyMigrationReads()
     await (await boot()).close()
-    expect(reads.mock.calls.map(([id]) => id)).toEqual([extra])
+    expect(reads).toEqual([extra])
     expect(await modeCount(wsId, extra)).toBe(1)
-    const record = JSON.parse(await fs.readFile(marker(), 'utf8')) as { verified: string[] }
-    expect([...record.verified].sort()).toEqual([...roots, extra].sort())
+    expect((await readMarker()).verified.map((entry) => entry.id).sort()).toEqual([...roots, extra].sort())
+  })
+
+  it('re-stamps a verified root whose log was restored to its pre-migration backup', async () => {
+    const { wsId, roots } = await seed(1)
+    const root = roots[0]!
+    await fs.rm(marker())
+    await stripMode(wsId, root)
+    await (await boot()).close()
+    expect(await modeCount(wsId, root)).toBe(1)
+    expect((await readMarker()).verified.map((entry) => entry.id)).toContain(root)
+    // The user copies the backup back over the live log: shorter than verified.
+    await fs.copyFile(path.join(home, 'root-mode-backups', wsId, root, 'events.jsonl'), log(wsId, root))
+    expect(await modeCount(wsId, root)).toBe(0)
+    const reads = spyMigrationReads()
+    await (await boot()).close()
+    expect(reads).toEqual([root])
+    expect(await modeCount(wsId, root)).toBe(1)
+  })
+
+  it('a verified root whose log disappeared is re-read and fails the boot, as without a marker', async () => {
+    const { wsId, roots } = await seed(1)
+    await fs.rm(log(wsId, roots[0]!))
+    await expect(boot()).rejects.toThrow()
+    await expect(fs.stat(log(wsId, roots[0]!))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('writes no marker when a pass fails part-way, and a later boot completes it', async () => {
@@ -144,23 +218,37 @@ describe('legacy root mode migration', () => {
 
     await (await boot()).close()
     for (const root of roots) expect(await modeCount(wsId, root)).toBe(1)
-    const record = JSON.parse(await fs.readFile(marker(), 'utf8')) as { verified: string[] }
-    expect([...record.verified].sort()).toEqual([...roots].sort())
+    expect((await readMarker()).verified.map((entry) => entry.id).sort()).toEqual([...roots].sort())
   })
 
   it('rescans every session when the marker is missing, older or unreadable', async () => {
     const { wsId, roots } = await seed(2)
-    for (const content of [undefined, JSON.stringify({ version: 0, completedAt: 1, verified: roots }), '{not json']) {
+    const ids = roots.map((id) => ({ id, lastSeq: 1 }))
+    const stale = [
+      undefined,
+      JSON.stringify({ version: 1, completedAt: 1, verified: roots }),
+      JSON.stringify({ version: 2, completedAt: 1, verified: roots }),
+      JSON.stringify({ version: 0, completedAt: 1, verified: ids }),
+      '{not json',
+    ]
+    for (const content of stale) {
       if (content === undefined) await fs.rm(marker(), { force: true })
       else await fs.writeFile(marker(), content)
       await stripMode(wsId, roots[0]!)
-      const reads = vi.spyOn(SessionsService.prototype, 'readCanonicalEvents')
+      const reads = spyMigrationReads()
       await (await boot()).close()
-      expect([...new Set(reads.mock.calls.map(([id]) => id))].sort()).toEqual([...roots].sort())
+      expect([...new Set(reads)].sort()).toEqual([...roots].sort())
       expect(await modeCount(wsId, roots[0]!)).toBe(1)
-      reads.mockRestore()
-      const record = JSON.parse(await fs.readFile(marker(), 'utf8')) as { version: number }
-      expect(record.version).toBe(1)
+      vi.restoreAllMocks()
+      expect((await readMarker()).version).toBe(2)
     }
+  })
+
+  it('stamps the mode at creation for a root made through the legacy sessions route', async () => {
+    const server = await boot()
+    const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as { id: string }[])[0]!.id
+    const created = (await (await post(server.url, '/api/sessions', {})).json()) as { id: string }
+    expect(await modeCount(wsId, created.id)).toBe(1)
+    await server.close()
   })
 })
