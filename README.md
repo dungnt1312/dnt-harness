@@ -55,7 +55,7 @@ PM2-launched server, on windows-2025). Linux and macOS (Bun built-in PTY)
 are gated by the `runtime-probes` CI job (`bun scripts/pty-probes.mjs
 --require`): bash on Linux (ubuntu-24.04), and zsh plus the system bash 3.2
 on macOS (macos-15, arm64), both green in
-[run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003). **macOS terminal support
+[run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207884). **macOS terminal support
 (zsh and Bash) is claimed** on that CI evidence and on a local run on real
 macOS 26 (arm64). See [docs/release-checklist.md](docs/release-checklist.md).
 
