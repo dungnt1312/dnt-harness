@@ -3408,6 +3408,8 @@ ${entry.description}`.toLowerCase().includes(query))
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
+              // Hashes the model-visible text: the truncated output plus any
+              // in-flight configuration-change note, not the raw server reply.
               resultHash: auditHash(text),
               durationMs: Date.now() - started,
               isError: dispatched.outcome !== 'success',
