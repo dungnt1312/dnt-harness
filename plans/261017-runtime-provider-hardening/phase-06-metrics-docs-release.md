@@ -8,7 +8,7 @@
 ## Overview
 
 - Priority: P2, release-blocking for runtime gates.
-- Status: Implemented, committed `16eb829` (metrics + prompt) and `58153cc` (release gates/docs). Pending gates: protected `release` environment + tag protection (repo admin), first green Linux CI run. Behavioral prompt eval (spec §11.3) met 2026-10-19 via `scripts/prompt-eval/`. Report: [reports/phase-06-final-report.md](./reports/phase-06-final-report.md).
+- Status: Implemented, committed `16eb829` (metrics + prompt) and `58153cc` (release gates/docs). Pending gates: protected `release` environment + tag protection (repo admin), first green Linux CI run. Behavioral prompt eval (spec §11.3) implemented 2026-10-19 via `scripts/prompt-eval/`. Gap: nonexistent-feature FAILS live under the hardened scorer (one sample per case, one model via the `ocproxy-2` proxy, rule narrowed after run 1). Report: [reports/phase-06-final-report.md](./reports/phase-06-final-report.md).
 - Finish measurement, prompt calibration, documentation, and enforceable release gates.
 
 ## Key Insights
@@ -57,7 +57,7 @@
 
 - [x] Metrics fixed (`scripts/bench/metrics.mjs`, `tests/scripts/bench-metrics.spec.ts`).
 - [x] Prompt softened (string-level tests in `base-prompt-guidance.spec.ts`).
-- [x] Behavioral prompt eval (recall with tool count): `scripts/prompt-eval/`, `tests/scripts/prompt-eval-score.spec.ts`; 3/3 live (2026-10-19).
+- [ ] Behavioral prompt eval (recall with tool count): `scripts/prompt-eval/`, `tests/scripts/prompt-eval-score.spec.ts`. Run 3 passed 3/3 under the rule narrowed after run 1; run 4 (hardened scorer) FAILS nonexistent-feature. One live sample per case, one model via the `ocproxy-2` proxy (2026-10-19).
 - [x] Runtime pins/docs (Bun 1.4.3, Node >=22.19; README/guides/web/migration/release-checklist).
 - [x] Release jobs: publish `needs:` all gates, SHA-pinned actions, tarball built without OIDC token.
 - [ ] Protected `release` environment + tag protection — must be configured by repo admin.

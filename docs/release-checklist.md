@@ -161,8 +161,10 @@ macOS terminal support **is claimed** for this release. Evidence:
       (prints counts/status only). Native DeepSeek thinking+tools is not
       claimed until this passes.
 - [ ] Prompt behavior: `PROMPT_EVAL_API_KEY=… PROMPT_EVAL_BASE_URL=… bun
-      scripts/prompt-eval/run.ts <model>` for each model the release
-      recommends (prints counts/status only; record the per-case lines).
+      scripts/prompt-eval/run.ts deepseek-v4.1-flash-free` (the measured
+      model; always name it, because the defaults are the first-party URL and
+      `deepseek-v4-pro`), plus each other model the release recommends.
+      Prints counts/status only; record the per-case lines.
 
 ## Never
 
