@@ -50,22 +50,15 @@ terminals.subscribe(WS, (event) => {
   if (event.kind === 'exit') exits.set(event.terminalId, [...(exits.get(event.terminalId) ?? []), event])
 })
 
+/** Terminal output without escape sequences (CSI, OSC) and control characters. */
+const plain = (text) => text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[@-_]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 /**
- * Wait until the shell has drawn its prompt: some output, then 300 ms of
- * quiet (bounded). A cold PowerShell can take seconds to start; typing
- * before it reads input loses the keystrokes.
+ * Wait until the shell has drawn its prompt (output ending in `>`, `$` or
+ * `#`), bounded. A cold PowerShell can take seconds to start; typing before
+ * it reads input loses the keystrokes.
  */
 async function shellReady(id, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs
-  let seen = ''
-  let quietSince = Date.now()
-  while (Date.now() < deadline) {
-    const now = output.get(id) ?? ''
-    if (now !== seen) { seen = now; quietSince = Date.now() }
-    else if (seen !== '' && Date.now() - quietSince >= 300) return true
-    await sleep(50)
-  }
-  return false
+  return until(() => /[>$#]\s*$/.test(plain(output.get(id) ?? '')), timeoutMs)
 }
 
 const pidOf = new Map()
