@@ -1,6 +1,6 @@
 ---
 title: "Release readiness for v0.3.0"
-status: in-progress
+status: completed
 branch: dev
 created: 2026-10-19
 ---
