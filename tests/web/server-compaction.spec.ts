@@ -884,8 +884,8 @@ describe('web compaction', () => {
       await until(async () => {
         const log = await fs.readFile(logPath, 'utf8').catch(() => '')
         // The log is read while the host appends to it; a last line without its newline is still being written.
-    const complete = log.slice(0, log.lastIndexOf('\n') + 1)
-    const ended = complete.split('\n').filter((line) => line !== '' && JSON.parse(line).type === 'turn/end').length
+        const complete = log.slice(0, log.lastIndexOf('\n') + 1)
+        const ended = complete.split('\n').filter((line) => line !== '' && JSON.parse(line).type === 'turn/end').length
         const sessions = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
         return ended === turns && sessions.find((session) => session.id === id)?.status === 'idle' ? true : undefined
       })
