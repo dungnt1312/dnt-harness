@@ -55,7 +55,32 @@ export interface SessionSummary {
    * Absent in summaries written before it was projected; those rebuild.
    */
   readonly lastUserActivityAt?: number
+  /**
+   * Facts boot-time child recovery needs, so a settled child is indexed
+   * without reading its log or its parent's. Absent in summaries written
+   * before it was projected; those rebuild.
+   */
+  readonly childRecovery?: ChildRecoveryFacts
 }
+
+/**
+ * Child-relationship facts derived from one session's log. A key left out
+ * means "not well-formed in the log": recovery then reads the canonical log.
+ */
+export interface ChildRecoveryFacts {
+  /** From the newest `session/child-meta`; null when the log has none. */
+  readonly meta?: { readonly background: boolean; readonly projectId: string | null } | null
+  /** The newest `session/project` binding; null when unbound or never bound. */
+  readonly boundProjectId?: string | null
+  /**
+   * Every child whose spawn this log committed, by the state of its current
+   * run (after its newest spawn/resume): `open` has no terminal result,
+   * `settled` has one, `reported` also queued the child's report after it.
+   */
+  readonly children: Readonly<Record<string, ChildRunState>>
+}
+
+export type ChildRunState = 'open' | 'settled' | 'reported'
 
 /** Storage seam behind `SessionsService`; file-backed in production. */
 export interface SessionStore {
@@ -252,7 +277,8 @@ export class FileSessionStore implements SessionStore {
         (parsed['projectId'] !== undefined && parsed['projectId'] !== null && typeof parsed['projectId'] !== 'string') ||
         (parsed['pinned'] !== undefined && typeof parsed['pinned'] !== 'boolean') ||
         (parsed['parentSessionId'] !== undefined && parsed['parentSessionId'] !== null && typeof parsed['parentSessionId'] !== 'string') ||
-        (parsed['lastUserActivityAt'] !== undefined && !Number.isFinite(parsed['lastUserActivityAt']))
+        (parsed['lastUserActivityAt'] !== undefined && !Number.isFinite(parsed['lastUserActivityAt'])) ||
+        (parsed['childRecovery'] !== undefined && !isChildRecoveryFacts(parsed['childRecovery']))
       ) return undefined
       return {
         id,
@@ -279,6 +305,10 @@ export class FileSessionStore implements SessionStore {
         // Absent means the summary predates the activity mark; boot rebuilds it.
         ...(parsed['lastUserActivityAt'] !== undefined
           ? { lastUserActivityAt: parsed['lastUserActivityAt'] as number }
+          : {}),
+        // Absent means the summary predates recovery facts; boot rebuilds it.
+        ...(parsed['childRecovery'] !== undefined
+          ? { childRecovery: parsed['childRecovery'] as ChildRecoveryFacts }
           : {}),
       }
     } catch {
@@ -390,4 +420,23 @@ export class FileSessionStore implements SessionStore {
       throw new SessionLogError('schema', `refusing unsafe session id '${id}'`)
     }
   }
+}
+
+function isChildRecoveryFacts(value: unknown): value is ChildRecoveryFacts {
+  if (!isRecord(value)) return false
+  const meta = value['meta']
+  if (meta !== undefined && meta !== null && !(
+    isRecord(meta) &&
+    typeof meta['background'] === 'boolean' &&
+    (meta['projectId'] === null || typeof meta['projectId'] === 'string')
+  )) return false
+  const bound = value['boundProjectId']
+  if (bound !== undefined && bound !== null && typeof bound !== 'string') return false
+  const children = value['children']
+  return isRecord(children) &&
+    Object.values(children).every((state) => state === 'open' || state === 'settled' || state === 'reported')
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }

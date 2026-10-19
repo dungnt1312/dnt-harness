@@ -11,6 +11,7 @@ import {
 import type { AttachmentRef } from '../attachments/store.ts'
 import type { SessionEvent } from './events.ts'
 import { Session } from './session.ts'
+import { childRecoveryFacts } from './child-recovery-facts.ts'
 import { deriveTitle } from './title.ts'
 import {
   FileSessionStore,
@@ -214,6 +215,7 @@ export class SessionsService extends Service {
           summary.derivedTitle === undefined ||
           summary.parentSessionId === undefined ||
           summary.lastUserActivityAt === undefined ||
+          summary.childRecovery === undefined ||
           (tail !== undefined && summary.lastSeq !== tail)
         ) {
           // Deleting derived state must never hide a canonical session:
@@ -329,6 +331,18 @@ export class SessionsService extends Service {
   summary(id: SessionId): SessionSummary | undefined {
     const session = this.loaded.get(id)
     if (session !== undefined) return this.summarize(session)
+    return this.known.get(id)
+  }
+
+  /**
+   * The persisted summary of a stored session that is not loaded: boot
+   * verified (or rebuilt) it against the canonical tail, and nothing appends
+   * to an unloaded session, so it describes the whole canonical log. A loaded
+   * session's live summary may include appends not yet durable, so it is
+   * undefined here and callers needing canonical facts read the log.
+   */
+  durableSummary(id: SessionId): SessionSummary | undefined {
+    if (this.loaded.has(id) || this.loading.has(id)) return undefined
     return this.known.get(id)
   }
 
@@ -578,6 +592,7 @@ export class SessionsService extends Service {
         pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
         parentSessionId: lastRecorded(events, parentOf, null),
         lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? 0),
+        childRecovery: childRecoveryFacts(events),
       }
       await store.writeSummary(id, summary)
       return summary
@@ -688,6 +703,7 @@ export class SessionsService extends Service {
       pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
       parentSessionId: lastRecorded(events, parentOf, null),
       lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? this.now()),
+      childRecovery: childRecoveryFacts(events),
     }
   }
 }

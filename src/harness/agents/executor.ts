@@ -22,6 +22,7 @@ import { agentScope, type AgentScope } from '../agent/scope.ts'
 import type { AgentDefinition, AgentSource } from './definition-service.ts'
 import { matchesMcpEntry, missingGrantedMcp, narrowCeiling, roleCandidates } from './mcp-candidates.ts'
 import type { SessionEvent, TurnEndReason } from '../session/events.ts'
+import type { ChildRecoveryFacts } from '../storage/file-session-store.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 import { describeProgress, type ChildProgress } from './child-progress.ts'
 import { resolveLimits, type HarnessLimits } from '../limits.ts'
@@ -220,6 +221,8 @@ interface SessionsLike {
   has(id: SessionId): boolean
   workspaceOf(id: SessionId): WorkspaceId | undefined
   summaries(): readonly { readonly id: SessionId; readonly parentSessionId?: string | null }[]
+  /** A stored, unloaded session's summary, which describes its whole canonical log. */
+  durableSummary?(id: SessionId): { readonly childRecovery?: ChildRecoveryFacts } | undefined
   delete(id: SessionId): Promise<void>
 }
 
@@ -467,10 +470,25 @@ export class ChildExecutor {
     }
     let recovered = 0
     for (const [parentId, childIds] of childIdsByParent) {
-      const parentEvents = sessions.has(parentId)
+      // A child is settled when its summaries prove what reading both logs
+      // would conclude: indexed, no report owed, nothing to reconcile. Only
+      // the rest — and their parent, once — are read from canonical logs.
+      const parentFacts = sessions.durableSummary?.(parentId)?.childRecovery
+      const unsettled = new Set(childIds.filter((childId) => !settledFromSummaries(
+        parentFacts,
+        sessions.durableSummary?.(childId)?.childRecovery,
+        childId,
+        sessions.workspaceOf(parentId) === sessions.workspaceOf(childId),
+      )))
+      const parentEvents = unsettled.size > 0 && sessions.has(parentId)
         ? await sessions.readCanonicalEvents(parentId).catch(() => undefined)
         : undefined
       for (const childId of childIds) {
+        if (!unsettled.has(childId)) {
+          this.indexChild(parentId, childId)
+          recovered += 1
+          continue
+        }
         const childEvents = await sessions.readCanonicalEvents(childId).catch(() => undefined)
         if (childEvents === undefined) continue
         const meta = childMetaOf(childEvents)
@@ -1840,6 +1858,27 @@ function digestMessage(events: readonly SessionEvent[], includeToolTurns: boolea
     filesTouched: files,
     ...(truncated ? { truncated: true } : {}),
   }
+}
+
+/**
+ * Whether summary facts alone show a child that recovery indexes and then
+ * leaves alone: a well-formed child-meta, a same-workspace parent that
+ * committed the spawn on a matching project, and a current run whose
+ * terminal result is recorded with no background report still owed. Any
+ * missing fact means "unknown" and sends the child to the canonical read.
+ */
+function settledFromSummaries(
+  parent: ChildRecoveryFacts | undefined,
+  child: ChildRecoveryFacts | undefined,
+  childSessionId: SessionId,
+  sameWorkspace: boolean,
+): boolean {
+  const meta = child?.meta
+  if (parent === undefined || meta === undefined || meta === null || !sameWorkspace) return false
+  if (parent.boundProjectId === undefined) return false
+  if (meta.projectId !== null && parent.boundProjectId !== meta.projectId) return false
+  const run = Object.hasOwn(parent.children, childSessionId) ? parent.children[childSessionId] : undefined
+  return run === 'reported' || (run === 'settled' && !meta.background)
 }
 
 function childMetaOf(events: readonly SessionEvent[]): Extract<SessionEvent, { type: 'session/child-meta' }> | undefined {
