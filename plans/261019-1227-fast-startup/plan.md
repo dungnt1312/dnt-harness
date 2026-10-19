@@ -1,6 +1,6 @@
 ---
 title: "Fast web startup"
-status: in-progress
+status: completed
 branch: dev
 created: 2026-10-19
 ---
