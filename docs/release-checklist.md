@@ -32,6 +32,10 @@ runs the gate jobs and `pack` as a dry run without `publish`. The first real
 tag run is still the final proof; link its gate runs under "Manual evidence".
 Release notes: [CHANGELOG.md](../CHANGELOG.md).
 
+Evidence head: all links below point to `b966de3`, the last code and workflow
+commit on `dev`; later commits change docs only. The dry run of this workflow
+(every gate job and `pack`, `publish` skipped) is [run 39193207914](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207914).
+
 ### Linux full suite and promoted suites
 
 `.github/workflows/linux-suite.yml` (ubuntu-24.04, Node 22.20, Bun 1.4.3) runs
@@ -82,7 +86,7 @@ on tag-triggered publish:
 - [x] `bun run preflight:node` (Node >= 22.19) and `bun run probe:runtime`
       (Bun 1.4.3) pass. Local, macOS arm64: Node 24.15.0, probes 8/8.
 - [x] Full suite run on a supported host (a green `linux-suite.yml` run on the
-      tagged commit counts). Linux run: LINUX_RUN; local macOS (Node 24.15.0, `--maxWorkers=3`): 374 files, 5160 passed, 2 skipped. Any failure is either on the pinned
+      tagged commit counts). Linux run: [run 39193207887](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207887) (full suite green); local macOS (Node 24.15.0, `--maxWorkers=3`): 374 files, 5160 passed, 2 skipped. Any failure is either on the pinned
       baseline inventory (`plans/261017-runtime-provider-hardening/reports/phase-00-baseline.md`)
       or classified (isolated rerun: flake vs regression). Never "all green"
       by footnote.
@@ -130,7 +134,7 @@ Green on `dev` (windows-2025, Windows Server 2025 10.0.26100): ConPTY smoke
 [run 39178325530](https://github.com/dungnt1312/dnt-harness/actions/runs/39178325530)
 and [run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
 
-- [x] `windows-smoke` green on the release pull request head (WIN_RUN).
+- [x] `windows-smoke` green on the release pull request head ([run 39193207918](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207918)).
 - [ ] `windows-smoke` green on the release tag (link the run).
 
 Still manual (not covered by the job):
@@ -145,7 +149,7 @@ Still manual (not covered by the job):
 ### Linux (required, automated)
 
 - [x] `linux-probes` (probes 8/8, PTY probes) green on the release pull request
-      head (PROBE_RUN).
+      head ([run 39193207884](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207884)).
 - [ ] `runtime-probes` gate green on the release tag (link the run). Linux
       terminal support is not claimed without this.
 
@@ -161,7 +165,7 @@ macOS terminal support **is claimed** for this release. Evidence:
       `macos-pty-probes` job (macos-15 arm64, macOS 15.7), 11/11 for both
       shells, green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
 - [x] README.md, docs/web.md and docs/guides.md say macOS is supported.
-- [x] `macos-pty-probes` green on the release pull request head (PROBE_RUN).
+- [x] `macos-pty-probes` green on the release pull request head ([run 39193207884](https://github.com/dungnt1312/dnt-harness/actions/runs/39193207884)).
 - [ ] `macos-pty-probes` green on the release tag (link the run). If it is not,
       drop the macOS claim from those docs before publishing.
 
