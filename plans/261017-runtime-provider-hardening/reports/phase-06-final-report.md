@@ -68,7 +68,7 @@ Legend: **Pass (Windows/Node)** = Vitest on Windows, Node 22.20. **Pass (Bun pro
 | PH4-A..F | Pass (Windows/Node) | Fake strict DeepSeek gateway: real HTTP/SSE plus a real CLI process. |
 | PH4-G | Pass (2026-10-18, Bun 1.4.3) | `scripts/smoke-deepseek-reasoning.ts` against the `ocproxy-2` OpenAI-compatible proxy, model `deepseek-v4.1-flash-free`, thinking `high`: turn 1 completed (3 assistant messages, 1 with complete reasoning, 2 tool results); turn 2 on the same session completed (5 assistants, 2 with reasoning, 3 tool results). Proves reasoning replay through that proxy; not the first-party DeepSeek endpoint or `deepseek-v4-pro`. |
 | QH-1 | Partial: Linux CI Pass; admin config pending | Runtime pins and gated release workflow are done. Linux `runtime-probes` is green ([run](https://github.com/dungnt1312/dnt-harness/actions/runs/39144804342), 2026-10-18). Protected release env and tag protection are outstanding. |
-| QH-2 | Partial: metrics/docs Pass; prompt eval Not met | §11.3 behavioral recall/tool-count eval was not done. Prompt checks are string-level only. |
+| QH-2 | Pass (metrics/docs Windows/Node; prompt eval live 2026-10-19, macOS, Bun 1.4.3) | §11.3 behavioral eval: `scripts/prompt-eval/run.ts` (opt-in, exits 0 without `PROMPT_EVAL_API_KEY`) drives the real agent loop, default base prompt and default mode with Read/Glob/Grep over a disposable temp fixture repo; scoring in `scripts/prompt-eval/score.ts`, deterministic spec `tests/scripts/prompt-eval-score.spec.ts` (14 tests, no model). A case passes only with full recall AND no invented file:line, no identical repeated call, ≥1 and ≤8 tool calls (a scoring threshold, not a runtime cap). Live through `ocproxy-2`, `deepseek-v4.1-flash-free`, one sample per case: misspelled-symbol pass (recall 3/3, 3 calls: Grep 1, Glob 1, Read 1, 0 duplicates); wrong-path-alias pass (recall 2/2, 4 calls: Glob 2, Read 1, Grep 1, 0 duplicates); nonexistent-feature pass (recall 1/1, 5 calls: Grep 3, Glob 1, Read 1, 0 duplicates, no invented location). See *Prompt eval runs* below for the earlier run under a stricter location rule. |
 
 ## Final verification (Windows)
 
@@ -96,7 +96,19 @@ Verdict: no regression attributable to this plan was found. Linux probe baseline
 4. PH4-G: passed via the `ocproxy-2` proxy with `deepseek-v4.1-flash-free`. A run against the first-party DeepSeek endpoint is still unrecorded; claim native thinking+tools support only as proven through that proxy.
 5. A repo admin must configure the protected `release` environment (required reviewers) and tag protection.
 
-Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
+Spec §11.3 behavioral prompt eval: met (2026-10-19). One live sample per case through the `ocproxy-2` proxy with `deepseek-v4.1-flash-free`; other models and the first-party DeepSeek endpoint are unmeasured.
+
+## Prompt eval runs (spec §11.3)
+
+All runs 2026-10-19, macOS, Bun 1.4.3, `ocproxy-2` (base URL as-is), model `deepseek-v4.1-flash-free`, key loaded at runtime from `~/.dnt-harness/providers.json` and passed only via the child environment. Counts only; the one quoted citation in run 2 is fixture code, not model prose.
+
+| Run | Scorer | misspelled-symbol | wrong-path-alias | nonexistent-feature |
+|---|---|---|---|---|
+| 1 | location rule: any `file:line` fails | pass, recall 3/3, 2 calls (Grep 2), 0 dup | pass, recall 2/2, 4 calls (Glob 1, Read 2, Grep 1), 0 dup | **FAIL**: recall 1/1, 4 calls (Grep 2, Glob 1, Read 1), 0 dup, reason "claims a file:line location" |
+| 2 | same, absent case only, diagnostic | — | — | FAIL, same reason, 5 calls (Grep 3, Glob 1, Read 1). The only citation was the real neighbouring validator, `validateOrder` at `src/orders/validate.ts:3-9` (correct lines). |
+| 3 | location rule: an *invented* `file:line` fails (unknown file or line past end) | pass (see QH-2) | pass | pass |
+
+The run 1 failure was a scorer miscalibration, not a model failure: the prompt asks for "the file and line", the model reported the absence and stopped after 4 to 5 calls, and it cited only real code with correct lines. The rule now fails a citation of a nonexistent file or line, so a fabricated location still fails. Fixture tests cover both sides (real `validate.ts:3-9` passes; `fraud.ts:12`, `validate.ts:40` and `validate.ts:8-30` fail). The rule cannot catch a real line wrongly attributed to `fraudScore` alongside an absence statement; recall still requires the absence statement.
 
 ## Spec deviations
 
@@ -104,7 +116,7 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 - RH-1: real Undici is loaded by resolved package entry; bare `undici` is forbidden.
 - Phase 5: default DeepSeek replay window is the whole conversation (per official docs). The strict gate covers only the active tool loop.
 - Phase 2: disposable copies are HEAD-only (no history).
-- Phase 6: prompt eval is string-level only (§11.3 unmet).
+- Phase 6: the §11.3 behavioral eval is an opt-in live script plus deterministic scorer tests. It does not run in CI because CI has no provider keys.
 - Windows terminal backend is bun-pty 0.5.1, not node-pty (post-plan, user request).
 
 ## Residual risks
@@ -134,10 +146,9 @@ Not met (scope gap, not a gate run): spec §11.3 behavioral prompt eval.
 2. macOS zsh/Bash terminal evidence, or an explicit Windows/Linux-only release scope in the support docs.
 3. Remaining live smokes: RH1-G OAuth refresh/revoke and media under Bun (needs a disposable account), and PH4-G against the first-party DeepSeek endpoint with `DEEPSEEK_API_KEY`.
 4. Repo admin: configure the protected `release` environment and tag protection.
-5. Implement the behavioral prompt eval (recall / tool-count fixtures, spec §11.3).
+5. Done 2026-10-19: behavioral prompt eval (`scripts/prompt-eval/`), all 3 cases pass live on `deepseek-v4.1-flash-free` via `ocproxy-2`. Remaining: one sample per case only; re-run per release candidate and on other target models.
 6. Leftover `bash.exe` PID 39640 (~2GB, a `/proc` kill loop from a 10/17 test run) was left alone. Kill it if the user agrees.
 
 ## Unresolved questions
 
 - Release scope if macOS evidence cannot be obtained: Windows/Linux only?
-- Should the behavioral prompt eval block this release, or move to the next one?

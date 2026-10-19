@@ -8,7 +8,7 @@
 ## Overview
 
 - Priority: P2, release-blocking for runtime gates.
-- Status: Implemented, committed `16eb829` (metrics + prompt) and `58153cc` (release gates/docs). Pending gates: protected `release` environment + tag protection (repo admin), first green Linux CI run. Not met: behavioral prompt eval (spec §11.3); prompt checks are string-level only. Report: [reports/phase-06-final-report.md](./reports/phase-06-final-report.md).
+- Status: Implemented, committed `16eb829` (metrics + prompt) and `58153cc` (release gates/docs). Pending gates: protected `release` environment + tag protection (repo admin), first green Linux CI run. Behavioral prompt eval (spec §11.3) met 2026-10-19 via `scripts/prompt-eval/`. Report: [reports/phase-06-final-report.md](./reports/phase-06-final-report.md).
 - Finish measurement, prompt calibration, documentation, and enforceable release gates.
 
 ## Key Insights
@@ -57,7 +57,7 @@
 
 - [x] Metrics fixed (`scripts/bench/metrics.mjs`, `tests/scripts/bench-metrics.spec.ts`).
 - [x] Prompt softened (string-level tests in `base-prompt-guidance.spec.ts`).
-- [ ] Behavioral prompt fixtures (recall / tool-count) — not done; spec §11.3 unmet.
+- [x] Behavioral prompt eval (recall with tool count): `scripts/prompt-eval/`, `tests/scripts/prompt-eval-score.spec.ts`; 3/3 live (2026-10-19).
 - [x] Runtime pins/docs (Bun 1.4.3, Node >=22.19; README/guides/web/migration/release-checklist).
 - [x] Release jobs: publish `needs:` all gates, SHA-pinned actions, tarball built without OIDC token.
 - [ ] Protected `release` environment + tag protection — must be configured by repo admin.

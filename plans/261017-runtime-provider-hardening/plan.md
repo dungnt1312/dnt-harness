@@ -75,7 +75,7 @@ Baseline `337af2d`. Commits (oldest first), each after code review with findings
 - RH-1 transport: real Undici must be loaded by resolved package entry under Bun; bare `undici` import is forbidden for this path.
 - Phase 5 replay window: default native DeepSeek window is the whole conversation (official docs: "all previous turns" when `tools` present); strict pre-network gate covers only the active tool loop. `tool-loop` stays an explicit profile value.
 - Phase 2 copies are HEAD-only (HEAD + index + worktree layers rebuilt; no history).
-- Phase 6 prompt eval is string-level only. Spec §11.3 behavioral recall/tool-count eval is **not met**.
+- Phase 6 prompt eval: string-level tests plus an opt-in live behavioral eval (`scripts/prompt-eval/`); spec §11.3 met 2026-10-19 (see final report).
 - Post-plan: Windows terminal backend replaced node-pty with bun-pty 0.5.1 (exact pin, user request); spec RH3-D "Windows node-pty smoke" is satisfied by equivalent bun-pty smoke.
 
 ## Release gates status
@@ -90,7 +90,7 @@ Baseline `337af2d`. Commits (oldest first), each after code review with findings
 - [ ] RH1-G live public HTTPS MCP/OAuth/media smoke under Bun.
 - [ ] PH4-G live DeepSeek smoke (needs `DEEPSEEK_API_KEY`).
 - [ ] Protected `release` environment + tag protection configured by repo admin.
-- [ ] Behavioral prompt eval (spec §11.3) — not met.
+- [x] Behavioral prompt eval (spec §11.3): 3/3 cases pass live, `deepseek-v4.1-flash-free` via `ocproxy-2` (2026-10-19).
 
 ## Red Team Review
 

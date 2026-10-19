@@ -160,6 +160,9 @@ macOS terminal support **is claimed** for this release. Evidence:
 - [ ] PH4-G: `bun scripts/smoke-deepseek-reasoning.ts` with `DEEPSEEK_API_KEY`
       (prints counts/status only). Native DeepSeek thinking+tools is not
       claimed until this passes.
+- [ ] Prompt behavior: `PROMPT_EVAL_API_KEY=… PROMPT_EVAL_BASE_URL=… bun
+      scripts/prompt-eval/run.ts <model>` for each model the release
+      recommends (prints counts/status only; record the per-case lines).
 
 ## Never
 
