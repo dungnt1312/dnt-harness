@@ -631,6 +631,8 @@ export interface HookCommandRow {
   readonly command: string
   /** Seconds (Claude); omitted = 60. */
   readonly timeout?: number
+  /** Claude fields the editor does not model (`if`, `async`, …), saved back untouched. */
+  readonly [field: string]: unknown
 }
 
 /** One Claude Code matcher group. */
@@ -638,6 +640,8 @@ export interface HookMatcherGroupRow {
   /** Regex over the tool name / source / trigger; omitted or `*` matches all. */
   readonly matcher?: string
   readonly hooks: readonly HookCommandRow[]
+  /** Claude fields the editor does not model, saved back untouched. */
+  readonly [field: string]: unknown
 }
 
 export type HookEvent =

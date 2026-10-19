@@ -150,6 +150,26 @@ describe('settings.json hooks section', () => {
   })
 })
 
+describe('workspace hooks round trip', () => {
+  it('a read-then-write keeps fields it does not understand and the Claude modifiers', async () => {
+    const hooks = {
+      PreToolUse: [{ matcher: 'Bash', note: 'group-level extra', hooks: [
+        { type: 'command', command: 'guard', if: 'Bash(git push:*)', async: true, statusMessage: 'Checking', once: true },
+        { type: 'command', command: 'wake', asyncRewake: true, rewakeMessage: 'Woke', rewakeSummary: 'guard woke', future: { nested: [1, 2] } },
+      ] }],
+    }
+    await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify({ hooks }))
+    const read = await readWorkspaceHooks(dir)
+    expect(read.hooks).toEqual(hooks)
+    await writeWorkspaceHooks(dir, read.hooks)
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'settings.json'), 'utf8')).hooks).toEqual(hooks)
+  })
+
+  it('still rejects a malformed known field on save', async () => {
+    await expect(writeWorkspaceHooks(dir, { PreToolUse: [{ hooks: [{ type: 'command', command: 'x', async: 'yes', extra: 1 }] }] })).rejects.toThrow(/async must be a boolean/)
+  })
+})
+
 describe('command hooks (runner)', () => {
   it('runs through the shell with stdin JSON, cwd and CLAUDE_PROJECT_DIR', async () => {
     const outcome = await runHook({ command: cmd('echo') }, { hook_event_name: 'SessionStart', session_id: 's1' }, { cwd: dir })

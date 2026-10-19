@@ -1433,6 +1433,26 @@ describe('context compaction + budget bar', () => {
     expect(saveHooks).toHaveBeenCalledWith('ws-1', { PreToolUse: [{ matcher: 'Write|Edit', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] }, false)
   })
 
+  it('hooks editor saves fields it does not understand untouched', async () => {
+    const hook = { type: 'command', command: 'node guard.mjs', if: 'Bash(git push:*)', async: true, asyncRewake: true, rewakeMessage: 'Woke', statusMessage: 'Checking' }
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ PreToolUse: [{ matcher: 'Bash', note: 'kept', hooks: [hook] }] }))
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    await act(async () => setInput(host.querySelector<HTMLInputElement>('.hooks-binding input')!, 'Write|Edit'))
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', { PreToolUse: [{ matcher: 'Write|Edit', note: 'kept', hooks: [hook] }] }, false)
+  })
+
+  it('hooks raw editor applies and saves fields it does not understand untouched', async () => {
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow())
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    await act(async () => button('Edit raw JSON').click())
+    const hooks = { Stop: [{ hooks: [{ type: 'command', command: 'x', async: true, asyncRewake: true, if: 'Bash', future: { a: 1 } }] }] }
+    await act(async () => setInput(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')!, JSON.stringify(hooks)))
+    await act(async () => button('Apply JSON').click())
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', hooks, false)
+  })
+
   it('hooks editor asks before removing a hook', async () => {
     ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] }))
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)

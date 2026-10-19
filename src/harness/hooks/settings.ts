@@ -139,12 +139,22 @@ function parseModifiers(raw: Record<string, unknown>, event: ClaudeHookEvent): H
   return out
 }
 
+const KNOWN_GROUP_KEYS: ReadonlySet<string> = new Set(['matcher', 'hooks'])
+const KNOWN_COMMAND_KEYS: ReadonlySet<string> = new Set(['type', 'command', 'timeout', 'if', 'async', 'asyncRewake', 'rewakeMessage', 'rewakeSummary'])
+
+/** The fields of `raw` this parser does not understand, copied as they are. */
+function unknownFields(raw: Record<string, unknown>, known: ReadonlySet<string>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(raw).filter(([key]) => !known.has(key)))
+}
+
 /**
  * Parse the `hooks` section of one settings document. `strict` throws on the
  * first problem (app saves); otherwise problems become diagnostics and the
- * entry is skipped (loading files written for Claude Code).
+ * entry is skipped (loading files written for Claude Code). `preserveUnknown`
+ * keeps fields this parser does not understand (newer Claude Code keys) on
+ * their group or command untouched, so the editor's read-then-save loses none.
  */
-export function parseHooksSection(value: unknown, options: { strict?: boolean; label?: string } = {}): { hooks: HooksSection; diagnostics: string[] } {
+export function parseHooksSection(value: unknown, options: { strict?: boolean; label?: string; preserveUnknown?: boolean } = {}): { hooks: HooksSection; diagnostics: string[] } {
   const label = options.label ?? 'hooks'
   const diagnostics: string[] = []
   const problem = (message: string): void => {
@@ -190,9 +200,11 @@ export function parseHooksSection(value: unknown, options: { strict?: boolean; l
         if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0)) { problem(`${where}.timeout must be a positive number of seconds`); continue }
         const modifiers = parseModifiers(hookRaw, event as ClaudeHookEvent)
         if (typeof modifiers === 'string') { problem(`${where}${modifiers}`); continue }
-        commands.push({ type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}), ...modifiers })
+        const extra = options.preserveUnknown === true ? unknownFields(hookRaw, KNOWN_COMMAND_KEYS) : {}
+        commands.push({ ...extra, type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}), ...modifiers })
       }
-      groups.push({ ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks: commands })
+      const extra = options.preserveUnknown === true ? unknownFields(groupRaw, KNOWN_GROUP_KEYS) : {}
+      groups.push({ ...extra, ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks: commands })
     }
     out[event] = groups
   }
@@ -433,12 +445,15 @@ export async function readWorkspaceHooks(workspaceDir: string): Promise<{ hooks:
   const read = await readSettings(workspaceSettingsPath(workspaceDir))
   if (read.error !== undefined) throw new HookSettingsError(read.error)
   const doc = read.doc ?? {}
-  return { hooks: parseHooksSection(doc['hooks']).hooks, disableAllHooks: doc['disableAllHooks'] === true }
+  return { hooks: parseHooksSection(doc['hooks'], { preserveUnknown: true }).hooks, disableAllHooks: doc['disableAllHooks'] === true }
 }
 
-/** Replace the workspace `hooks` section (strictly validated), preserving every other key. */
+/**
+ * Replace the workspace `hooks` section (known fields strictly validated,
+ * unknown ones kept as written), preserving every other key.
+ */
 export async function writeWorkspaceHooks(workspaceDir: string, hooks: unknown, disableAllHooks?: boolean): Promise<void> {
-  const parsed = parseHooksSection(hooks, { strict: true }).hooks
+  const parsed = parseHooksSection(hooks, { strict: true, preserveUnknown: true }).hooks
   const file = workspaceSettingsPath(workspaceDir)
   const read = await readSettings(file)
   if (read.error !== undefined) throw new HookSettingsError(read.error)

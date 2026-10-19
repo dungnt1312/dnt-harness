@@ -36,8 +36,16 @@ const HOOK_EVENTS: readonly { readonly key: HookEvent; readonly hint: string; re
 const CLAUDE_ONLY_EVENTS = new Set<string>(['PermissionRequest'])
 const HOOK_EVENT_KEYS = new Set<string>([...HOOK_EVENTS.map((event) => event.key), ...CLAUDE_ONLY_EVENTS])
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+const KNOWN_GROUP_KEYS = new Set<string>(['matcher', 'hooks'])
+const KNOWN_COMMAND_KEYS = new Set<string>(['type', 'command', 'timeout'])
+/** Fields this editor does not understand (`if`, `async`, newer Claude keys), carried through untouched; the server validates the ones it knows. */
+const unknownFields = (raw: Record<string, unknown>, known: ReadonlySet<string>): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(raw).filter(([key]) => !known.has(key)))
 
-/** Validate an untrusted Claude Code `hooks` section before it enters typed editor state or is saved. */
+/**
+ * Validate an untrusted Claude Code `hooks` section before it enters typed
+ * editor state or is saved. Fields it does not understand are kept as they are.
+ */
 export function validateHooksSection(value: unknown): HooksSectionRow {
   if (!isRecord(value)) throw new Error('Hooks validation error: "hooks" must be an object keyed by event.')
   const out: Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>> = {}
@@ -55,9 +63,9 @@ export function validateHooksSection(value: unknown): HooksSectionRow {
         if (rawHook.type !== 'command') throw new Error(`Hooks validation error: ${where}.type must be "command".`)
         if (typeof rawHook.command !== 'string') throw new Error(`Hooks validation error: ${where}.command must be a string.`)
         if (rawHook.timeout !== undefined && (typeof rawHook.timeout !== 'number' || !Number.isFinite(rawHook.timeout) || rawHook.timeout <= 0)) throw new Error(`Hooks validation error: ${where}.timeout must be a positive number of seconds.`)
-        return { type: 'command', command: rawHook.command, ...(typeof rawHook.timeout === 'number' ? { timeout: rawHook.timeout } : {}) }
+        return { ...unknownFields(rawHook, KNOWN_COMMAND_KEYS), type: 'command', command: rawHook.command, ...(typeof rawHook.timeout === 'number' ? { timeout: rawHook.timeout } : {}) }
       })
-      return { ...(typeof rawGroup.matcher === 'string' ? { matcher: rawGroup.matcher } : {}), hooks }
+      return { ...unknownFields(rawGroup, KNOWN_GROUP_KEYS), ...(typeof rawGroup.matcher === 'string' ? { matcher: rawGroup.matcher } : {}), hooks }
     })
   }
   return out
