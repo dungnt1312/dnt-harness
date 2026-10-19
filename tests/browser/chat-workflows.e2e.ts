@@ -188,11 +188,18 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       if (path === '/api/workspaces/w/memory/fixture-memory' && method === 'GET') return json(route, { id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'server body', hash: memoryPatchCount === 0 ? 'memory-old' : 'memory-fresh' })
       if (path === '/api/workspaces/w/memory/fixture-memory' && method === 'PATCH') { memoryPatchCount += 1; return memoryPatchCount === 1 ? json(route, { error: 'memory conflict' }, 409) : json(route, { id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'local body', hash: 'memory-saved' }) }
       if (path === '/api/workspaces/w/agents' && method === 'GET') return json(route, agentDeleteCount === 0 ? [{ source: 'workspace', definition: { name: 'fixture-agent', description: 'Fixture agent', tools: [], disallowedTools: [] } }] : [])
-      if (path === '/api/workspaces/w/agents/children' && method === 'GET') return json(route, [])
       if (path === '/api/workspaces/w/agents/fixture-agent' && method === 'DELETE') { agentDeleteCount += 1; return agentDeleteCount === 1 ? json(route, { error: 'agent delete refused' }, 503) : json(route, { deleted: true }) }
       if (path === '/api/workspaces/w/mcp' && method === 'GET') return json(route, [{ name: 'fixture-mcp', transport: 'stdio', enabled: false, status: 'disabled', breakerOpenUntil: null }])
       if (path === '/api/workspaces/w/mcp/fixture-mcp/enable' && method === 'POST') { mcpActionCount += 1; return mcpActionCount === 1 ? json(route, { error: 'MCP enable refused' }, 503) : json(route, { status: 'ready' }) }
-      if (path === '/api/workspaces/w/hooks' && method === 'GET') return json(route, { version: 1, hooks: { PreToolUse: [{ matcher: 'Bash*', type: 'command', command: 'node guard.mjs', onFailure: 'deny' }] } })
+      if (path === '/api/workspaces/w/hooks' && method === 'GET') return json(route, {
+        file: 'C:/fixture/workspace/settings.json',
+        hooks: { PreToolUse: [{ matcher: 'Bash*', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] },
+        disableAllHooks: false,
+        sources: [{ layer: 'workspace', path: 'C:/fixture/workspace/settings.json', exists: true }],
+        effective: [{ id: 'hook-1', event: 'PreToolUse', matcher: 'Bash*', command: 'node guard.mjs', layer: 'workspace', source: 'C:/fixture/workspace/settings.json', active: true, supported: true }],
+        disabled: false,
+        diagnostics: [],
+      })
       if (path === '/api/workspaces/w/hooks' && method === 'PUT') return json(route, { saved: true })
       if (path === '/api/workspaces/w/secrets' && method === 'GET') return json(route, secretDeleteCount < 2 ? [{ name: 'FIXTURE_SECRET' }] : [])
       if (path === '/api/workspaces/w/secrets/FIXTURE_SECRET' && method === 'DELETE') { secretDeleteCount += 1; return secretDeleteCount === 1 ? json(route, { error: 'secret delete refused' }, 503) : json(route, { deleted: 'FIXTURE_SECRET' }) }
@@ -206,6 +213,8 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/children\/[^/]+$/.test(path) && method === 'GET') {
       return json(route, { childSessionId: 'child', status: 'completed', definitionName: 'explorer', startedAt: 0, endedAt: 1, result: { report: 'Mapped the app.', filesTouched: [] } })
     }
+    if (path === '/api/workspaces/w/agents/children' && method === 'GET') return json(route, [])
+    if (path === '/api/usage' && method === 'GET') return json(route, { days: [], longestSessionMs: 0, today: '2026-10-19' })
     if (path === '/api/workspaces/w/commands' && method === 'GET') return json(route, { commands: [], errors: [] })
     // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
     if (path === '/api/speech-to-text' && method === 'GET') return json(route, { provider: null, model: null })
@@ -261,8 +270,11 @@ function expectNoMutationRequests(state: Fixture, before: number): void {
   expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(before)
 }
 
+/** Settings sections whose endpoints the fixture mocks, in rail order. */
+const SETTINGS_SECTIONS = ['Providers & Models', 'Usage', 'Advanced', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']
+
 for (const width of [320, 375, 768, 1024, 1440]) {
-  test(`settings keeps all nine sections reachable with keyboard navigation at ${width}px`, async ({ page }) => {
+  test(`settings keeps the mocked sections reachable with keyboard navigation at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 })
     const state = await fixture(page, 'settings')
     const trigger = await settingsTrigger(page)
@@ -270,7 +282,7 @@ for (const width of [320, 375, 768, 1024, 1440]) {
     await trigger.click()
     const dialog = page.getByRole('dialog', { name: 'Settings' })
     await expect(dialog).toBeVisible()
-    const labels = ['Providers', 'Advanced', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']
+    const labels = SETTINGS_SECTIONS
     if (width <= 600) {
       const section = page.getByRole('combobox', { name: 'Settings section' })
       await expect(section).toBeVisible()
@@ -280,13 +292,12 @@ for (const width of [320, 375, 768, 1024, 1440]) {
         await expect(dialog.getByRole('heading', { name: label, exact: true }).first()).toBeVisible()
       }
     } else {
-      // Providers & Models also has its own Providers sub-tab; the rail entry comes first.
-      const providers = dialog.getByRole('tab', { name: /Providers/ }).first()
+      const providers = dialog.getByRole('tab', { name: 'Providers & Models', exact: true })
       await providers.focus()
       await page.keyboard.press('ArrowDown')
-      await expect(dialog.getByRole('tab', { name: /Advanced/ })).toBeFocused()
+      await expect(dialog.getByRole('tab', { name: 'Usage', exact: true })).toBeFocused()
       for (const label of labels) {
-        const tab = dialog.getByRole('tab', { name: new RegExp(`^${label}`) }).first()
+        const tab = dialog.getByRole('tab', { name: label, exact: true })
         await tab.click()
         await expect(tab).toHaveAttribute('aria-selected', 'true')
         await expect(dialog.getByRole('heading', { name: label, exact: true }).first()).toBeVisible()
@@ -295,8 +306,8 @@ for (const width of [320, 375, 768, 1024, 1440]) {
     if (width <= 600) {
       const section = page.getByRole('combobox', { name: 'Settings section' })
       await section.click()
-      await page.getByRole('option', { name: 'Hooks', exact: true }).click()
-    } else await dialog.getByRole('tab', { name: /Hooks/ }).click()
+      await page.getByRole('option', { name: 'Advanced', exact: true }).click()
+    } else await dialog.getByRole('tab', { name: 'Advanced', exact: true }).click()
     const panel = dialog.getByRole('tabpanel')
     await expect(panel).toHaveCSS('overflow-y', 'auto')
     await expect.poll(() => panel.evaluate(element => element.scrollHeight - element.clientHeight)).toBeGreaterThan(0)
@@ -404,10 +415,10 @@ test('discarding a provider draft actually clears it — later tab switches and 
 
   // A resolved discard must not leave the draft comparison permanently dirty:
   // every further navigation should move directly, with no repeat prompt.
-  for (const tabName of [/Memory/, /Agents/, /MCP/, /Providers/]) {
-    await dialog.getByRole('tab', { name: tabName }).click()
+  for (const tabName of ['Memory', 'Agents', 'MCP', 'Providers & Models']) {
+    await dialog.getByRole('tab', { name: tabName, exact: true }).click()
     await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeHidden()
-    await expect(dialog.getByRole('tab', { name: tabName })).toHaveAttribute('aria-selected', 'true')
+    await expect(dialog.getByRole('tab', { name: tabName, exact: true })).toHaveAttribute('aria-selected', 'true')
   }
   await dialog.getByRole('button', { name: 'Close settings' }).click()
   await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeHidden()
@@ -475,7 +486,8 @@ test('project bound and running 409 remains visible after confirmed removal', as
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   await dialog.getByRole('tab', { name: /Projects/ }).click()
-  await dialog.getByRole('button', { name: 'Remove project' }).click()
+  await dialog.getByRole('button', { name: 'Actions for Fixture project' }).click()
+  await page.getByRole('menuitem', { name: 'Remove project' }).click()
   await dialog.getByRole('button', { name: 'Remove registration' }).click()
   await expect(dialog).toContainText('project is bound to 1 conversation and has a running session')
   expect(state.count('DELETE', '/api/workspaces/w/projects/p')).toBe(1)
@@ -486,37 +498,37 @@ test('Hooks raw invalid stays intact and valid raw saves the exact whole documen
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   await dialog.getByRole('tab', { name: /Hooks/ }).click()
-  await dialog.getByRole('button', { name: 'Advanced · edit raw JSON' }).click()
-  const raw = dialog.getByLabel('hooks.json')
-  await raw.fill('{}')
-  await dialog.getByRole('button', { name: 'Apply raw' }).click()
-  await expect(dialog).toContainText('Hooks validation error: version must be 1')
-  await expect(raw).toHaveValue('{}')
+  await dialog.getByRole('button', { name: 'Edit raw JSON' }).click()
+  const raw = dialog.getByLabel('"hooks"', { exact: true })
+  await raw.fill('[]')
+  await dialog.getByRole('button', { name: 'Apply JSON' }).click()
+  await expect(dialog).toContainText('Hooks validation error: "hooks" must be an object keyed by event.')
+  await expect(raw).toHaveValue('[]')
   expect(state.count('PUT', '/api/workspaces/w/hooks')).toBe(0)
-  const document = { version: 1, hooks: { PreToolUse: [{ matcher: 'Bash*', type: 'command', command: 'node exact.mjs', args: ['--safe'], timeoutMs: 800, onFailure: 'deny' }] } }
+  const document = { PreToolUse: [{ matcher: 'Bash*', hooks: [{ type: 'command', command: 'node exact.mjs', timeout: 5 }] }] }
   await raw.fill(JSON.stringify(document))
-  await dialog.getByRole('button', { name: 'Apply raw' }).click()
-  await dialog.getByRole('button', { name: 'Save hooks' }).click()
+  await dialog.getByRole('button', { name: 'Apply JSON' }).click()
+  await dialog.getByRole('button', { name: 'Save changes' }).click()
   await expect.poll(() => state.count('PUT', '/api/workspaces/w/hooks')).toBe(1)
-  expect(state.requests().find(request => request.method === 'PUT' && request.path === '/api/workspaces/w/hooks')?.body).toEqual(document)
+  expect(state.requests().find(request => request.method === 'PUT' && request.path === '/api/workspaces/w/hooks')?.body).toEqual({ hooks: document, disableAllHooks: false })
 })
 
 for (const invalid of [
-  { label: 'unknown top-level key', draft: '{\n  "version": 1,\n  "hooks": {},\n  "extra": true\n}', error: 'unknown top-level key "extra"' },
-  { label: 'unknown binding key', draft: '{"version":1,"hooks":{"PreToolUse":[{"matcher":"*","type":"command","command":"node guard.mjs","onFailure":"deny","extra":true}]}}', error: 'PreToolUse[0] has unknown key "extra"' },
+  { label: 'unknown event', draft: '{\n  "Bogus": []\n}', error: 'unknown hook event "Bogus"' },
+  { label: 'non-command hook type', draft: '{"PreToolUse":[{"matcher":"*","hooks":[{"type":"shell","command":"node guard.mjs"}]}]}', error: 'PreToolUse[0].hooks[0].type must be "command"' },
 ]) {
   test(`Hooks raw ${invalid.label} remains verbatim/open with zero PUT`, async ({ page }) => {
     const state = await fixture(page, 'settings')
     await (await settingsTrigger(page)).click()
     const dialog = page.getByRole('dialog', { name: 'Settings' })
     await dialog.getByRole('tab', { name: /Hooks/ }).click()
-    await dialog.getByRole('button', { name: 'Advanced · edit raw JSON' }).click()
-    const raw = dialog.getByLabel('hooks.json')
+    await dialog.getByRole('button', { name: 'Edit raw JSON' }).click()
+    const raw = dialog.getByLabel('"hooks"', { exact: true })
     await raw.fill(invalid.draft)
-    await dialog.getByRole('button', { name: 'Apply raw' }).click()
+    await dialog.getByRole('button', { name: 'Apply JSON' }).click()
     await expect(dialog).toContainText(invalid.error)
     await expect(raw).toHaveValue(invalid.draft)
-    await expect(dialog.getByRole('button', { name: 'Apply raw' })).toBeVisible()
+    await expect(dialog.getByRole('button', { name: 'Apply JSON' })).toBeVisible()
     expect(state.count('PUT', '/api/workspaces/w/hooks')).toBe(0)
   })
 }
@@ -526,13 +538,12 @@ test('Agents, MCP, and Secrets expose destructive failures and explicit recovery
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   await dialog.getByRole('tab', { name: /Agents/ }).click()
-  await dialog.getByRole('button', { name: /fixture-agent/ }).click()
-  // The control names its target, matching the Secrets panel's `Delete FIXTURE_SECRET`.
-  await dialog.getByRole('button', { name: 'Delete fixture-agent' }).click()
-  await dialog.getByRole('button', { name: 'Delete definition' }).click()
+  await dialog.getByRole('option', { name: /fixture-agent/ }).click()
+  await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
+  await dialog.getByRole('button', { name: 'Delete role' }).click()
   await expect(dialog).toContainText('agent delete refused')
   expect(state.count('DELETE', '/api/workspaces/w/agents/fixture-agent')).toBe(1)
-  await dialog.getByRole('button', { name: 'Delete definition' }).click()
+  await dialog.getByRole('button', { name: 'Delete role' }).click()
   await expect.poll(() => state.count('DELETE', '/api/workspaces/w/agents/fixture-agent')).toBe(2)
 
   await dialog.getByRole('tab', { name: /MCP/ }).click()
@@ -576,7 +587,7 @@ test('Skills and Memory 409 conflicts require explicit reload or overwrite', asy
   await dialog.getByRole('button', { name: /Fixture memory/ }).click()
   await dialog.getByRole('button', { name: 'Edit', exact: true }).click()
   await dialog.getByLabel('Body').fill('local body')
-  await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+  await dialog.getByRole('button', { name: 'Save entry', exact: true }).click()
   await expect(dialog.getByRole('button', { name: 'Reload server version' })).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible()
   expect(state.count('PATCH', '/api/workspaces/w/memory/fixture-memory')).toBe(1)
@@ -625,7 +636,8 @@ test('a recovered tool outcome is unknown and never successful without requests'
 test('a delegation row opens its existing child conversation route', async ({ page }) => {
   await fixture(page, 'delegation')
   await transcriptOf(page).getByRole('button', { name: /Delegated explorer/ }).click()
-  await transcriptOf(page).getByRole('button', { name: /Open conversation/ }).click()
+  // The run opens in the workbench, whose detail pane links to the child conversation.
+  await page.getByRole('region', { name: 'Workbench' }).getByRole('button', { name: /Open conversation/ }).click()
   await expect(page).toHaveURL('/workspaces/w/sessions/child')
 })
 
@@ -671,12 +683,16 @@ test('a tool row states its window and opens the workbench at the lines it read'
   const state = await fixture(page, 'artifacts')
   // The window is on the row: nothing about it needs a click to be read. A
   // landed Read is a link row, not an expandable one.
-  const row = transcriptOf(page).getByRole('button', { name: /README\.md:30-35/ })
+  const row = transcriptOf(page).getByRole('button', { name: 'Open C:/fixture/project/README.md in workbench' })
+  await expect(row).toContainText('README.md:30-35')
   await row.click()
-  const contents = page.getByRole('region', { name: 'Contents of README.md' })
-  await expect(contents).toContainText('export const answer = 42')
+  // A markdown file opens rendered; the recorded window applies to the code view.
+  await page.getByRole('region', { name: 'Workbench' }).getByRole('button', { name: 'Code', exact: true }).click()
+  const contents = page.getByRole('textbox', { name: 'Contents of README.md' })
+  await expect(contents).toBeVisible()
   // The viewer lands on the recorded window rather than the top of the file.
-  await expect.poll(async () => contents.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+  const scroller = page.getByRole('region', { name: 'Workbench' }).locator('.cm-scroller')
+  await expect.poll(async () => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
   expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(0)
 })
 
@@ -709,12 +725,13 @@ test('manifest stays fail-closed beyond the delay when the current conversation 
   expect(state.requests().filter(request => request.path.endsWith('/manifest'))).toHaveLength(0)
 })
 
-test('manifest stays fail-closed beyond the delay while the session is running', async ({ page }) => {
+test('manifest is read once while the session is running, not once per workbench view', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'running-tool')
+  await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
   await selectWorkbenchView(page, 'Context')
   await page.waitForTimeout(750)
-  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
+  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
 })
 
 for (const width of [320, 375, 768, 1024, 1440]) {
@@ -865,9 +882,9 @@ test('nested Escape closes a menu inside the navigation drawer before the drawer
 test('Escape closes the composer mode menu and returns focus to its trigger', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 800 })
   await fixture(page, 'no-work')
-  const trigger = page.getByRole('button', { name: 'Workspace mode (next tool gate and request)' })
+  const trigger = page.getByRole('button', { name: 'Conversation mode (follows the workspace default)' })
   await trigger.click()
-  const menu = page.getByRole('menu', { name: 'Workspace mode (next tool gate and request)' })
+  const menu = page.getByRole('menu', { name: 'Conversation mode (follows the workspace default)' })
   await expect(menu).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(menu).toHaveCount(0)
@@ -908,8 +925,8 @@ test('axe gates shell, drawers, Context, Trajectory, approval, and every setting
   await fixture(settingsPage, 'settings')
   await (await settingsTrigger(settingsPage)).click()
   const dialog = settingsPage.getByRole('dialog', { name: 'Settings' })
-  for (const label of ['Providers', 'Advanced', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']) {
-    await dialog.getByRole('tab', { name: new RegExp(label) }).click()
+  for (const label of SETTINGS_SECTIONS) {
+    await dialog.getByRole('tab', { name: label, exact: true }).click()
     await expectAxeClean(settingsPage, '[role="dialog"][aria-label="Settings"]')
   }
   await settingsContext.close()
@@ -937,11 +954,13 @@ test('coarse pointer targets meet the minimum on header, composer, approval, con
   const context = await browser.newContext({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: true })
   const page = await context.newPage()
   await fixture(page, 'approval')
-  for (const selector of ['header button', 'form:has([data-composer-input]) button', '[aria-label="Pending approvals"] button']) {
+  // The composer's control row opts out of the 44px floor (data-compact-control,
+  // app.css) so its icon-only controls share one phone row; it keeps 36px.
+  for (const [selector, minimum] of [['header button', 44], ['form:has([data-composer-input]) button', 36], ['[aria-label="Pending approvals"] button', 44]] as const) {
     for (const control of await page.locator(selector).filter({ visible: true }).all()) {
       const box = await control.boundingBox()
-      expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
-      expect(box?.width ?? 0).toBeGreaterThanOrEqual(44)
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(minimum)
+      expect(box?.width ?? 0).toBeGreaterThanOrEqual(minimum)
     }
   }
   await openWorkbench(page)
@@ -969,7 +988,7 @@ test('captures the deterministic screenshot matrix', async ({ browser }) => {
     { name: 'trajectory-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
     { name: 'trajectory-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
     { name: 'settings-dirty', fixture: 'settings', prepare: async page => { await (await settingsTrigger(page)).click(); await (await providerName(page.getByRole('dialog', { name: 'Settings' }))).fill('Dirty provider draft') } },
-    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: /^Skills/ }).first().click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
+    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: 'Skills', exact: true }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills', exact: true }).click() } await dialog.getByRole('button', { name: 'fixture-skill', exact: true }).click(); await dialog.getByRole('button', { name: 'Edit raw' }).click(); await dialog.getByRole('textbox', { name: 'SKILL.md' }).fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
   ]
   for (const width of REQUIRED_WIDTHS) {
     for (const state of states) {
