@@ -32,9 +32,12 @@ runs the gate jobs and `pack` as a dry run without `publish`. The first real
 tag run is still the final proof; link its gate runs under "Manual evidence".
 Release notes: [CHANGELOG.md](../CHANGELOG.md).
 
-Evidence head: all links below point to `efbc3c6`, the last code, test and
-workflow commit on `dev`; later commits change docs only. The dry run of this workflow
-(every gate job and `pack`, `publish` skipped) is [run 39198490636](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490636).
+Release `v0.3.0` was cut from merge commit `ef5c4b5` ([PR #1](https://github.com/dungnt1312/dnt-harness/pull/1));
+its tag run [39359460311](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311)
+passed every gate and published. Older links below still point to `efbc3c6`, the
+last code, test and workflow commit on `dev` before the release. The dry run of
+this workflow (every gate job and `pack`, `publish` skipped) is
+[run 39198490636](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490636).
 
 ### Linux full suite and promoted suites
 
@@ -71,23 +74,30 @@ has none; `macos-pty-probes` covers zsh).
 Ordered, user-owned steps. Do not skip ahead: each one is the precondition of
 the next. `package.json` already holds `0.3.0`, so never run `npm version`.
 
-1. [ ] Configure the npm trusted publisher (repository, workflow `release.yml`,
+1. [x] Configure the npm trusted publisher (repository, workflow `release.yml`,
        environment `release`). See "One-time repository setup".
-2. [ ] Merge pull request #1 (`dev` into `main`).
-3. [ ] Wait for the `linux-suite` run triggered by the push to `main` to finish
-       green. Note the merge commit sha.
-4. [ ] Tag that merge commit by hand and push the tag:
+2. [x] Merge pull request #1 (`dev` into `main`): merge commit `ef5c4b5`.
+3. [x] Wait for the `linux-suite` run triggered by the push to `main` to finish
+       green. Note the merge commit sha. [Run 39358562923](https://github.com/dungnt1312/dnt-harness/actions/runs/39358562923)
+       failed its first attempt on the known full-suite flake
+       `tests/web/server-g5.spec.ts` (“disable and host close cancel delayed
+       in-flight MCP initialization”, `expected 'ready' to be 'disabled'`); the
+       failed-job rerun passed, and the same suite was green on the pull request.
+4. [x] Tag that merge commit by hand and push the tag:
        `git tag -a v0.3.0 <main sha> -m v0.3.0 && git push origin v0.3.0`
-5. [ ] Watch the tag run of `release.yml`. The Windows (`windows-smoke`) and
-       macOS (`macos-pty-probes`, inside `runtime-probes`) gates must be green.
+5. [x] Watch the tag run of `release.yml`. The Windows (`windows-smoke`) and
+       macOS (`macos-pty-probes`, inside `runtime-probes`) gates were green in
+       [run 39359460311](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311).
        If `macos-pty-probes` fails, drop the macOS claim from README.md,
        docs/web.md, docs/guides.md and CHANGELOG.md before approving.
 6. [ ] Do the manual checks below: the browser terminal and Windows on ARM64
        (under "Still manual"), and the OAuth refresh/revoke smoke if you want
        that claim. Link the tag-run gate runs under "Manual evidence".
-7. [ ] Approve the `release` environment deployment. Only then does `publish` run.
-8. [ ] If the OIDC publish fails, re-run only the `publish` job from the same
-       run (the tarball artifact is kept for 7 days). Do not re-tag.
+7. [x] Approve the `release` environment deployment. Only then does `publish` run.
+8. [x] If the OIDC publish fails, re-run only the `publish` job from the same
+       run (the tarball artifact is kept for 7 days). Do not re-tag. The first
+       attempt succeeded: [publish job 118422871501](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311/job/118422871501)
+       published `dnt-harness@0.3.0` with provenance, now the `latest` dist-tag.
 
 ## One-time repository setup (admin)
 
@@ -99,8 +109,8 @@ on tag-triggered publish:
       (sole maintainer, who is also the tag author and reviewer).
 - [x] Tag ruleset `release-tags` (id 25362958) for `v*`: only maintainers may
       create, update or delete release tags.
-- [ ] **User:** npm trusted publisher configured for this repository, workflow
-      `release.yml`, environment `release`.
+- [x] **User:** npm trusted publisher configured for this repository, workflow
+      `release.yml`, environment `release`. Proven by the `v0.3.0` publish.
 - [x] Workflow actions stay pinned to full commit SHAs (version comment beside
       each). Update them deliberately, never to a moving tag. (Done.)
 
@@ -158,7 +168,7 @@ Green on `dev` (windows-2025, Windows Server 2025 10.0.26100): ConPTY smoke
 and [run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
 
 - [x] `windows-smoke` green on the release pull request head ([run 39198490618](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490618)).
-- [ ] `windows-smoke` green on the release tag (link the run).
+- [x] `windows-smoke` green on the release tag ([job 118421933289](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311/job/118421933289)).
 
 Still manual (not covered by the job):
 
@@ -173,7 +183,7 @@ Still manual (not covered by the job):
 
 - [x] `linux-probes` (probes 8/8, PTY probes) green on the release pull request
       head ([run 39198490537](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490537)).
-- [ ] `runtime-probes` gate green on the release tag (link the run). Linux
+- [x] `runtime-probes` gate green on the release tag ([job 118421933277](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311/job/118421933277)). Linux
       terminal support is not claimed without this.
 
 ### macOS (claimed: zsh and Bash terminals)
@@ -189,7 +199,7 @@ macOS terminal support **is claimed** for this release. Evidence:
       shells, green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
 - [x] README.md, docs/web.md and docs/guides.md say macOS is supported.
 - [x] `macos-pty-probes` green on the release pull request head ([run 39198490537](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490537)).
-- [ ] `macos-pty-probes` green on the release tag (link the run). If it is not,
+- [x] `macos-pty-probes` green on the release tag ([job 118421933165](https://github.com/dungnt1312/dnt-harness/actions/runs/39359460311/job/118421933165)). If it is not,
       drop the macOS claim from those docs before publishing.
 
 ### Optional live smokes (needed before the matching support claim)
