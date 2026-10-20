@@ -95,11 +95,15 @@ describe('hooks + secrets panels', () => {
     [{ hooks: { PreToolUse: [null] } }, 'PreToolUse[0] must be an object'],
     [{ hooks: { PreToolUse: [{ matcher: 1, hooks: [] }] } }, 'matcher must be a string'],
     [{ hooks: { PreToolUse: [{ matcher: 'Bash' }] } }, 'PreToolUse[0].hooks must be an array'],
-    [{ hooks: { PreToolUse: [{ hooks: [{ type: 'prompt', prompt: 'x' }] }] } }, 'type must be "command"'],
+    [{ hooks: { PreToolUse: [{ hooks: [{ command: 'x' }] }] } }, 'PreToolUse[0].hooks[0].type must be a string'],
     [{ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'x', timeout: 0 }] }] } }, 'timeout must be a positive number of seconds'],
-    [{ hooks: { Nope: [] } }, 'unknown hook event "Nope"'],
   ] as const)('rejects malformed Claude hooks sections without casting them: %#', (input, message) => {
     expect(() => validateHooksConfig(input)).toThrow(message)
+  })
+
+  it('keeps unknown events and hooks of other types exactly as written', () => {
+    const hooks = { Nope: { anything: [1] }, PreToolUse: [{ hooks: [{ type: 'prompt', prompt: 'x', model: 'm' }, { type: 'command', command: 'y' }] }] }
+    expect(validateHooksConfig({ hooks }).hooks).toEqual(hooks)
   })
 
   it('keeps Claude events dnt-harness does not fire instead of rejecting the file', () => {

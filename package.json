@@ -1,6 +1,6 @@
 {
   "name": "dnt-harness",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,22 +20,25 @@
   "type": "module",
   "description": "A TypeScript agent harness with a Cordis-inspired plugin kernel: agent loop, tool pipeline, capability seams.",
   "engines": {
-    "node": ">=22.19.0"
+    "bun": ">=1.4.3"
   },
+  "packageManager": "bun@1.4.3",
   "scripts": {
-    "test": "vitest run",
+    "test": "node scripts/node-preflight.mjs && vitest run",
+    "preflight:node": "node scripts/node-preflight.mjs",
+    "probe:runtime": "bun scripts/runtime-probes.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
-    "chat": "tsx src/bins/headless.ts",
-    "web": "tsx src/bins/web.ts",
-    "pair": "tsx src/bins/pair.ts",
-    "migrate:mcp": "tsx src/bins/migrate-mcp.ts",
+    "chat": "bun src/bins/headless.ts",
+    "web": "bun src/bins/web.ts",
+    "pair": "bun src/bins/pair.ts",
+    "migrate:mcp": "bun src/bins/migrate-mcp.ts",
     "build:web": "vite build",
     "restart": "pm2 restart dnt-harness --update-env && sleep 2 && curl -fsS http://127.0.0.1:3082/api/health",
-    "deploy": "npm run build:web && npm run restart",
+    "deploy": "bun run build:web && bun run restart",
     "test:browser": "playwright test",
     "test:browser:mcp": "vitest run tests/web/mcp-production-stack.spec.ts",
-    "test:live-ui": "node scripts/live-ui-smoke.mjs",
+    "test:live-ui": "bun scripts/live-ui-smoke.mjs",
     "prepack": "vite build"
   },
   "dependencies": {
@@ -76,6 +79,7 @@
     "@radix-ui/react-tooltip": "^1.2.16",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "bun-pty": "0.5.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "croner": "^10.0.1",
@@ -85,12 +89,8 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "^3.7.0",
-    "tsx": "^4.20.3",
     "undici": "^7.29.1",
     "web-push": "^3.6.7"
-  },
-  "optionalDependencies": {
-    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",

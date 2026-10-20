@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { assessProjection, type CompactionProjection } from '../harness/context/compaction-projection.ts'
+import { canonicalJson } from '../harness/context/compaction-digest.ts'
 import {
-  SNAPSHOT_SCHEMA_VERSION,
+  snapshotSchemaFor,
   snapshotRequestOf,
   sourceDigest,
   type EffectiveCompactionSnapshot,
@@ -141,6 +142,9 @@ function buildSnapshot(input: BuildInput): EffectiveCompactionSnapshot | undefin
   if (cutoff === undefined) return undefined
   const answer = loggedFinalAnswer(input.events, input.turnId, cutoff)
   if (answer === undefined || input.finalAnswer.role !== 'assistant' || input.finalAnswer.content !== answer.content) return undefined
+  // Phase 05: reasoning is compared only when the snapshot carries it (v2); a
+  // v1 snapshot compares content exactly as before.
+  if (input.finalAnswer.reasoning !== undefined && (answer.reasoning === undefined || canonicalJson(input.finalAnswer.reasoning) !== canonicalJson(answer.reasoning))) return undefined
   // The final answer is a source of its own: the request that preceded it never contained it.
   const projection: CompactionProjection = {
     ...input.projection,
@@ -152,7 +156,7 @@ function buildSnapshot(input: BuildInput): EffectiveCompactionSnapshot | undefin
   if (!verdict.ok) return undefined
   return {
     id: input.id,
-    v: SNAPSHOT_SCHEMA_VERSION,
+    v: snapshotSchemaFor(input.request.messages, input.finalAnswer),
     policyVersion: 1,
     sessionId: input.sessionId,
     cutoff,

@@ -143,10 +143,75 @@ describe('settings.json hooks section', () => {
       PostToolUse: [{ matcher: 'mcp__*', type: 'command', command: 'scan', onFailure: 'allow' }],
     } }))
     expect(await migrateLegacyHooksJson(legacy)).toBe(true)
-    const migrated = await readWorkspaceHooks(legacy)
+    const migrated = (await readWorkspaceHooks(legacy)) as { hooks: Record<string, { matcher?: string }[] | undefined> }
     expect(migrated.hooks.PreToolUse?.[0]).toEqual({ matcher: 'Bash', hooks: [{ type: 'command', command: "/usr/bin/node 'a b.js' x", timeout: 3 }] })
     expect(migrated.hooks.PostToolUse?.[0]?.matcher).toBe('mcp__.*')
     await expect(fs.stat(path.join(legacy, 'hooks.json.migrated'))).resolves.toBeTruthy()
+  })
+})
+
+describe('workspace hooks round trip', () => {
+  it('a read-then-write keeps fields it does not understand and the Claude modifiers', async () => {
+    const hooks = {
+      PreToolUse: [{ matcher: 'Bash', note: 'group-level extra', hooks: [
+        { type: 'command', command: 'guard', if: 'Bash(git push:*)', async: true, statusMessage: 'Checking', once: true },
+        { type: 'command', command: 'wake', asyncRewake: true, rewakeMessage: 'Woke', rewakeSummary: 'guard woke', future: { nested: [1, 2] } },
+      ] }],
+    }
+    await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify({ hooks }))
+    const read = await readWorkspaceHooks(dir)
+    expect(read.hooks).toEqual(hooks)
+    await writeWorkspaceHooks(dir, read.hooks)
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'settings.json'), 'utf8')).hooks).toEqual(hooks)
+  })
+
+  it('keeps a hook dnt-harness cannot run in its place when a command beside it is edited', async () => {
+    const prompt = { type: 'prompt', prompt: 'Review the command', timeout: 30 }
+    await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [prompt, { type: 'command', command: 'guard' }] }] } }))
+    const read = await readWorkspaceHooks(dir)
+    const group = (read.hooks['PreToolUse'] as { matcher: string; hooks: Record<string, unknown>[] }[])[0]!
+    expect(group.hooks[0]).toEqual(prompt)
+    await writeWorkspaceHooks(dir, { PreToolUse: [{ ...group, hooks: [group.hooks[0], { ...group.hooks[1], command: 'guard --strict' }] }] })
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'settings.json'), 'utf8')).hooks).toEqual({
+      PreToolUse: [{ matcher: 'Bash', hooks: [prompt, { type: 'command', command: 'guard --strict' }] }],
+    })
+  })
+
+  it('a group of only non-command hooks and an unknown event survive a read-then-write unchanged', async () => {
+    const hooks = {
+      Stop: [{ hooks: [{ type: 'agent', prompt: 'Verify the tests pass' }] }],
+      FutureEvent: [{ matcher: 'x', hooks: [{ type: 'command', command: 'later' }] }],
+      SessionStart: [{ hooks: [{ type: 'command', command: 'hello' }] }],
+    }
+    await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify({ hooks }))
+    const read = await readWorkspaceHooks(dir)
+    expect(read.hooks).toEqual(hooks)
+    await writeWorkspaceHooks(dir, read.hooks)
+    const written = JSON.parse(await fs.readFile(path.join(dir, 'settings.json'), 'utf8')).hooks
+    expect(written).toEqual(hooks)
+    expect(Object.keys(written)).toEqual(Object.keys(hooks))
+  })
+
+  it('loads a non-object hooks value as empty and keeps it through a save that changes nothing else', async () => {
+    const file = path.join(dir, 'settings.json')
+    await fs.writeFile(file, JSON.stringify({ hooks: 'oops', theme: 'dark' }))
+    const read = await readWorkspaceHooks(dir)
+    expect(read.hooks).toEqual({})
+    await writeWorkspaceHooks(dir, read.hooks, true)
+    expect(JSON.parse(await fs.readFile(file, 'utf8'))).toEqual({ hooks: 'oops', theme: 'dark', disableAllHooks: true })
+    const diagnostics = (await loadHooks({ workspaceDir: dir })).diagnostics
+    expect(diagnostics.join('\n')).toMatch(/'hooks' must be an object/)
+  })
+
+  it('replaces a non-object hooks value only when the editor saves a non-empty document', async () => {
+    const file = path.join(dir, 'settings.json')
+    await fs.writeFile(file, JSON.stringify({ hooks: [1] }))
+    await writeWorkspaceHooks(dir, { SessionStart: [{ hooks: [{ type: 'command', command: 'hello' }] }] })
+    expect(JSON.parse(await fs.readFile(file, 'utf8')).hooks).toEqual({ SessionStart: [{ hooks: [{ type: 'command', command: 'hello' }] }] })
+  })
+
+  it('still rejects a malformed known field on save', async () => {
+    await expect(writeWorkspaceHooks(dir, { PreToolUse: [{ hooks: [{ type: 'command', command: 'x', async: 'yes', extra: 1 }] }] })).rejects.toThrow(/async must be a boolean/)
   })
 })
 

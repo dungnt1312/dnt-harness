@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
+import { keepReplayableReasoning, withoutReasoning } from '../llm/reasoning.ts'
 import { textOnlyVisionFallback, withoutDescribeImage } from '../llm/adaptive-vision.ts'
 import { DESCRIBE_IMAGE_TOOL } from '../tools/describe-image.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
@@ -283,7 +284,10 @@ export interface ContextBreakdown {
 
 export interface AssembledContext {
   readonly messages: readonly ModelMessage[]
-  /** Remaining window after calibrated input and safety margin; adapters may lower it. */
+  /**
+   * Remaining window after calibrated input and safety margin: an upper bound
+   * for an existing output cap, never a cap of its own. May be below 1 (no room).
+   */
   readonly maxOutputTokens: number
   readonly tools?: readonly ToolSchema[]
   readonly manifest: ContextManifest
@@ -372,7 +376,9 @@ ${safe}
 export const DEFAULT_BASE_SYSTEM = [
   'You are dnt-harness, a local coding assistant. Answer helpfully and precisely.',
   'An <environment_context> block in this message states the current date, platform, and workspace: treat it as ground truth for date and platform questions instead of guessing. Each message the user typed starts with a [sent YYYY-MM-DD HH:MM zone] line: the time it was sent, added by the host, not text the user wrote. For the exact current time later in a long task, check the clock with a tool.',
-  'Ground every claim in what you actually observed: files you read, commands you ran, or results a tool returned. When you are unsure or lack a fact, say so plainly rather than inventing it; verify with a tool when verification is cheap.',
+  'Ground every claim in what you observed: files read, commands run, or tool results. If unsure or missing a fact, say so plainly instead of inventing it. Do not re-read or re-run what you already have just to be sure; verify again after code or data changed, after an error, or while a concern is unresolved.',
+  'Answer the question that was asked and stop there: keep the reply as short as the question allows, do not widen the scope, and do not pad it with a summary of your own steps.',
+  'Stop researching once you can answer. Do not repeat a hypothesis or search parameters without new information; refine only when evidence points somewhere new (a corrected spelling, alias or path). If evidence-based searches find nothing, report it as absent and stop.',
   TOOL_SELECTION,
   'Restate exact paths, identifiers, and errors in your answers so they stay actionable.',
   'Reply in the user\'s language; keep code, identifiers, and file paths verbatim.',
@@ -650,9 +656,12 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
   const window = historyWindow(input.events, mode.definition.sources.history, compaction)
   const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
   const describeAvailable = schemas.some((schema) => schema.name === DESCRIBE_IMAGE_TOOL)
+  // Complete reasoning rides on its message (the adapter picks the field) and
+  // is counted below; a cut-off record is dropped so it is neither sent nor counted.
+  const projectedHistory = keepReplayableReasoning(history.dated)
   let dated = input.nativeVision === false
-    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message], describeAvailable)[0]! }))
-    : history.dated
+    ? projectedHistory.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message], describeAvailable)[0]! }))
+    : projectedHistory
   const totalTurns = countTurns(input.events)
 
   // ── optional sources (droppable) ───────────────────────────
@@ -995,7 +1004,13 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
 
   return {
     messages,
-    maxOutputTokens: Math.max(1, Math.floor(input.budget.contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens)),
+    // Measured against the squeezed window: after the provider refused a
+    // request for size, a smaller prompt must not be paired with a larger
+    // output cap, or input plus cap still overflows the real window. It only
+    // BOUNDS a cap the adapter already has (never invents one) and is never
+    // floored: a value below 1 means no room, which the adapter refuses
+    // before the network so the bounded squeeze can recover.
+    maxOutputTokens: Math.floor(squeezeBudget(input.budget, input.squeeze).contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens),
     ...(schemas.length > 0 ? { tools: schemas } : {}),
     manifest: {
       ...manifest,
@@ -1158,7 +1173,12 @@ function historyMessages(
   const inWindow = all.filter((entry) => entry.seq >= window.startSeq)
   if (compaction === undefined || compaction.coversSeq <= 0) return { dated: inWindow }
   const budget = retainTokens !== undefined && Number.isSafeInteger(retainTokens) && retainTokens >= 0 ? retainTokens : DEFAULT_COMPACTION_RETAIN_TOKENS
-  const retained = retainedCoveredMessages(events, all.filter((entry) => entry.seq <= compaction.coversSeq && entry.seq < window.startSeq), compaction.coversSeq, budget)
+  // Reasoning aging: a covered answer retained beside the summary never brings
+  // its reasoning back — the tool results it reasoned over are compacted away.
+  // Stripped BEFORE selection, so the retain budget is sized without it.
+  const covered = all.filter((entry) => entry.seq <= compaction.coversSeq && entry.seq < window.startSeq)
+    .map((entry) => ({ ...entry, message: withoutReasoning(entry.message) }))
+  const retained = retainedCoveredMessages(events, covered, compaction.coversSeq, budget)
   return { dated: [...retained, ...inWindow] }
 }
 
@@ -1208,6 +1228,9 @@ function compactedHistoryMessage(compaction: { readonly summary: string; readonl
 function historyMessageCost(message: ModelMessage): number {
   let cost = estimateContentTokens(message.content)
   if (message.toolCalls !== undefined) cost += estimateTokens(JSON.stringify(message.toolCalls))
+  // Replayed reasoning is input like any other text. The projection already
+  // dropped every record the request will not carry.
+  if (message.reasoning !== undefined) cost += estimateTokens(message.reasoning.text)
   return cost
 }
 
@@ -1224,7 +1247,7 @@ export function estimateConversationTokens(input: {
 }): number {
   const window = historyWindow(input.events, 'compact', input.compaction)
   let total = input.compaction !== undefined ? estimateContentTokens(compactedHistoryMessage(input.compaction).content) : 0
-  for (const entry of historyMessages(input.events, window, input.compaction, input.compactionRetainTokens, input.attachments).dated) {
+  for (const entry of keepReplayableReasoning(historyMessages(input.events, window, input.compaction, input.compactionRetainTokens, input.attachments).dated)) {
     total += historyMessageCost(entry.message)
   }
   return total

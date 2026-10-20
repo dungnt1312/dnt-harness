@@ -356,6 +356,8 @@ export interface ProviderSummary {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
+  /** What this provider serves; absent means chat-only. `['stt']` hides it from chat lists. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -368,6 +370,8 @@ export interface ProviderInput {
   readonly apiKey?: string
   readonly enabled?: boolean
   readonly models?: readonly string[]
+  /** Replaces the whole kinds list when present; empty array restores chat-only. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Replaces the whole per-model settings map when present. */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -627,13 +631,26 @@ export interface HookCommandRow {
   readonly command: string
   /** Seconds (Claude); omitted = 60. */
   readonly timeout?: number
+  /** Claude fields the editor does not model (`if`, `async`, …), saved back untouched. */
+  readonly [field: string]: unknown
+}
+
+/**
+ * A hook of a type dnt-harness does not run (`prompt`, `agent`, …). The
+ * editor shows it read-only and saves it back exactly as written.
+ */
+export interface KeptHookRow {
+  readonly type: string
+  readonly [field: string]: unknown
 }
 
 /** One Claude Code matcher group. */
 export interface HookMatcherGroupRow {
   /** Regex over the tool name / source / trigger; omitted or `*` matches all. */
   readonly matcher?: string
-  readonly hooks: readonly HookCommandRow[]
+  readonly hooks: readonly (HookCommandRow | KeptHookRow)[]
+  /** Claude fields the editor does not model, saved back untouched. */
+  readonly [field: string]: unknown
 }
 
 export type HookEvent =
@@ -651,8 +668,11 @@ export type HookEvent =
   /** Claude event dnt-harness keeps in the file but does not fire yet. */
   | 'PermissionRequest'
 
-/** The `hooks` section of a Claude Code settings file. */
-export type HooksSectionRow = Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>>
+/**
+ * The `hooks` section of a Claude Code settings file. Events dnt-harness does
+ * not know are carried as written so a save keeps them.
+ */
+export type HooksSectionRow = Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>> & { readonly [event: string]: unknown }
 
 export interface EffectiveHookRow {
   readonly id: string

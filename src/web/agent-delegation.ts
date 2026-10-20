@@ -43,6 +43,7 @@ export function projectInheritedMessages(events: readonly SessionEvent[], maxCha
     let line: string | undefined
     if (event?.type === 'user/message' && event.origin !== 'context' && event.origin !== 'command' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
     else if (event?.type === 'assistant/message' && (event.toolCalls === undefined || event.toolCalls.length === 0) && event.content.trim() !== '') {
+      // `content` only: stored reasoning is never inherited by a child (phase 05).
       line = `Assistant: ${event.content.trim()}`
     }
     if (line === undefined) continue
@@ -287,7 +288,7 @@ const ROLE_CACHE_MS = 5_000
 
 export interface DelegationDeps {
   readonly definitions: AgentDefinitionService
-  readonly executor: Pick<ChildExecutor, 'spawn' | 'childrenOfRoot' | 'wait' | 'cancel' | 'reconcile' | 'activeOfRoot' | 'runningChildrenOfRoot'> & Partial<Pick<ChildExecutor, 'markReported' | 'owedChildrenOfTurn'>>
+  readonly executor: Pick<ChildExecutor, 'spawn' | 'childrenOfRoot' | 'wait' | 'cancel' | 'reconcile' | 'activeOfRoot' | 'runningChildrenOfRoot'> & Partial<Pick<ChildExecutor, 'markReported' | 'owedChildrenOfTurn' | 'message'>>
   /** The executing session, root or child. */
   readonly session: (sessionId: SessionId) => Promise<Session | undefined>
   readonly childModelFor: (
@@ -353,6 +354,8 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'spawn returns immediately, so several children run at the same time. wait blocks until the named children settle or timeoutMs passes (default 5 min, max 30 min), whichever is first; prefer long waits over repeated short ones. A wait that times out only means the work is not finished: each running child reports progress (elapsed time, steps, last activity, health). Reviews and research often take 10 to 30 minutes. Cancel only a child whose health is "stalled" or whose work you no longer need; cancelling and respawning loses its context.',
       'One level only: a child can never delegate further.',
       'Children you leave running are joined when your turn would close: their reports come back to you as a message, and you get one more step to use them. Calling wait yourself is still the way to get a result earlier or to work on something else in between.',
+      'background:true on spawn (or a role marked background) lets the child outlive your turn: closing the turn neither waits for nor cancels it, and its report arrives later as its own message that wakes this conversation. Use it for long work you do not need before replying; a user Stop still cancels it.',
+      'message talks to a child you spawned (childIds names one, prompt is the text): a running child gets it as its next turn with delivery:"queue" (default), or at once with delivery:"steer", which ends its current turn. A finished child runs again with its whole history, the same role, tools and folders as at spawn; its new report arrives like a spawn\'s. Prefer message over a new spawn when the child already holds the context.',
       'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
       'Write the prompt as you would brief a colleague who cannot see this conversation: name the files and the facts it needs, and say what the answer must contain. The child\'s final message is all you get back.',
       'Children share the project filesystem with their root. Coordinate edits to the same files and re-read before writing; unrelated conversations never own or block this project.',
@@ -383,10 +386,11 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
         case 'list': return JSON.stringify({ children: await deps.executor.childrenOfRoot(scope.sessionId, workspaceId) })
         case 'wait': return wait(deps, args, scope.sessionId, workspaceId, exec.signal, scope.turnId)
         case 'cancel': return cancel(deps, args, scope.sessionId, workspaceId)
+        case 'message': return message(deps, args, scope.sessionId, workspaceId, scope.turnId)
         case 'reconcile': return reconcile(deps, args, scope.sessionId, workspaceId)
         case 'catalog': return catalog(deps, workspaceId, scope.projectId)
         default:
-          throw new Error(`unknown action '${action}'; use spawn, wait, cancel, reconcile or catalog`)
+          throw new Error(`unknown action '${action}'; use spawn, wait, message, cancel, reconcile or catalog`)
       }
     },
   }
@@ -395,9 +399,9 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
 const PARAMETERS: ToolDefinition['parameters'] = {
   type: 'object',
   properties: {
-    action: { type: 'string', description: 'spawn | wait | list | cancel | reconcile | catalog (default spawn)' },
+    action: { type: 'string', description: 'spawn | wait | message | list | cancel | reconcile | catalog (default spawn)' },
     definition: { type: 'string', description: 'spawn: the role name, from the catalog' },
-    prompt: { type: 'string', description: 'spawn: the brief, in prose — what to do, the files and facts it needs, and what the answer must contain' },
+    prompt: { type: 'string', description: 'spawn: the brief, in prose — what to do, the files and facts it needs, and what the answer must contain. message: the text for the child' },
     requiredResult: { type: 'string', description: 'spawn: the shape of the answer you need back' },
     inherit: { type: 'string', description: `spawn: "none" (default) or "brief" — also hand the child up to ${MAX_INHERITED_CHARS} chars of this conversation's recent messages (no tool output); costs context, so prefer naming what it needs in the prompt` },
     objective: { type: 'string', description: 'spawn: alternative structured form — what the child must accomplish (use prompt instead)' },
@@ -405,7 +409,9 @@ const PARAMETERS: ToolDefinition['parameters'] = {
     references: { type: 'array', items: { type: 'string' }, description: 'spawn: files or facts the child should start from' },
     grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them. Naming any mcp__ tool limits MCP to those names' },
     model: { type: 'string', description: 'spawn: a model alias, provider:model, or bare model name; omit to inherit this conversation\'s' },
-    childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child' },
+    background: { type: 'boolean', description: 'spawn: true to let the child outlive this turn and report back later on its own; omit to follow the role (default false)' },
+    childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child. message: exactly one id' },
+    delivery: { type: 'string', description: 'message to a running child: "queue" (default, its next turn) or "steer" (ends its current turn, runs now). A finished child always runs again' },
     timeoutMs: { type: 'number', description: `wait: longest to block in ms; returns early when the children settle. Default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}. Prefer minutes to avoid busy polling.` },
   },
   required: [],
@@ -444,6 +450,8 @@ async function spawn(
   }
   const both = (packet.prompt?.trim() ?? '') !== '' && (packet.objective?.trim() ?? '') !== ''
   const grantTools = Array.isArray(args['grantTools']) ? stringList(args['grantTools']) : undefined
+  const background = args['background']
+  if (background !== undefined && typeof background !== 'boolean') throw new Error("'background' must be true or false")
   const model = deps.childModelFor(
     parent,
     workspaceId,
@@ -466,6 +474,7 @@ async function spawn(
     ...(model !== undefined ? { model } : {}),
     ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
     ...(deps.grantsOf !== undefined ? { grants: deps.grantsOf(parentSessionId) } : {}),
+    ...(background !== undefined ? { background } : {}),
   })
   // A built-in grant the role lacks is reported, never silently dropped: the
   // model would otherwise plan around a missing tool. MCP names are checked
@@ -564,6 +573,36 @@ async function wait(
   return JSON.stringify({
     children: handles,
     ...(unsettled.length > 0 ? { note: runningNote(unsettled) } : {}),
+  })
+}
+
+async function message(
+  deps: DelegationDeps,
+  args: Record<string, unknown>,
+  parentSessionId: SessionId,
+  workspaceId: WorkspaceId,
+  turnId: string | undefined,
+): Promise<string> {
+  const ids = stringList(args['childIds'])
+  if (ids.length !== 1) throw new Error("'childIds' must name exactly one child to message")
+  const prompt = typeof args['prompt'] === 'string' ? args['prompt'] : ''
+  if (prompt.trim() === '') throw new Error("'prompt' must carry the message text")
+  const delivery = args['delivery'] ?? 'queue'
+  if (delivery !== 'queue' && delivery !== 'steer') throw new Error("'delivery' must be \"queue\" or \"steer\"")
+  if (deps.executor.message === undefined) throw new Error('messaging children is not available here')
+  if (turnId === undefined) throw new Error('Agent message requires the calling root\'s active Turn')
+  const [owned] = await ownedChildIds(deps, ids, parentSessionId)
+  if (owned === undefined) throw new Error(`no such child of this conversation: ${ids[0]}`)
+  const handle = await deps.executor.message(workspaceId, parentSessionId, turnId, owned, prompt, delivery)
+  const running = handle.status === 'running'
+  return JSON.stringify({
+    childSessionId: handle.childSessionId,
+    definition: handle.definitionName,
+    status: handle.status,
+    note: running
+      ? (delivery === 'steer' ? 'the child stops its current turn and handles your message now' : 'the child handles your message after its current turn')
+      : 'the child runs again with your message',
+    next: 'call Agent with action:"wait" for the report, or keep working — unreported children are joined when your turn would close',
   })
 }
 

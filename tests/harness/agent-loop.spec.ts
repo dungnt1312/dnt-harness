@@ -18,7 +18,7 @@ import {
   type ModelRequest,
   type Session,
 } from 'dnt-harness'
-import { FakeScriptedLlm } from '../support/fake-llm.ts'
+import { FakeScriptedLlm, type ScriptStep } from '../support/fake-llm.ts'
 
 interface Harness {
   kernel: Kernel
@@ -28,7 +28,7 @@ interface Harness {
 }
 
 /** Boot the full harness with a scripted provider and one agent. */
-function harness(replies: readonly string[], provider?: LlmProvider): Harness {
+function harness(replies: readonly ScriptStep[], provider?: LlmProvider): Harness {
   const kernel = new Kernel()
   kernel.ctx.plugin(SessionsService)
   kernel.ctx.plugin(LlmService)

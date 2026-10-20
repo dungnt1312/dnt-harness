@@ -23,6 +23,7 @@ src/harness/
 ├── mcp/       MCP client (stdio + Streamable HTTP), config/secrets, health/retry/breaker
 ├── hooks/     Claude Code hooks: settings.json layers, shell runner, verdicts
 ├── instructions/ CLAUDE.md layers + @imports
+├── config/    Global app-config file: layered limits, revisioned snapshots, edit/reload
 └── limits.ts  Centralized bounded-execution defaults
 ```
 
@@ -65,7 +66,10 @@ session/grants      the session's extra file-tool folders (full list, last
                     wins, `revision` per change; `approvalId` when an approval
                     granted one)
 session/child-meta  child-session provenance (parent turn, definition, brief, inherit audit)
+                    and the snapshot a resume rebuilds from (instructions, tool
+                    ceiling, skills, grants, inherited context, background)
 agent/child-spawn   durable spawn intent + brief, written before a child agent starts
+agent/child-resume  a finished child runs again for a later turn (its opening input id)
 agent/child-result  a child agent's settled status (+ its failure, when failed)
 mcp/call            one MCP tool call (hashed args/results, duration, error flag)
 hook/run            one hook execution (event, matcher, exit code, decision)
@@ -634,6 +638,68 @@ compaction*), plus composer-attachment limits
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
 silently under-count).
 
+### Global limits configuration (`config/`)
+
+All 23 numeric limits can be changed without a restart. Their keys, units, and
+accepted ranges are listed in [`limits-config.ts`](../src/harness/limits-config.ts)
+(`LIMIT_FIELDS`). Values stay in their native units (ms, bytes, chars, tokens,
+count, ratio); nothing converts them. The two compaction rollout switches
+(`compactionEffectiveEnabled`, `compactionPrecomputeEnabled`) are host options
+only (`limitDefaults` or `limits`): the file refuses them as unknown keys.
+
+- **File.** One sparse document per data home: `<data-dir>/app-config.json`
+  (`APP_CONFIG_FILE`; a memory-mode web host uses its temp home), shaped
+  `{ "v": 1, "limits": { "toolOutputLimit": 20000 } }`. A key missing from the
+  file means "inherit". This is not the provider `configFile`.
+- **Layers**, lowest to highest: library `DEFAULT_LIMITS`, then the host
+  profile (`limitDefaults`), then the file, then explicit `limits` options. An
+  explicit value locks its field, so an edit to that field fails with `locked`.
+  The web bin's profile is `WEB_LIMIT_DEFAULTS`: automatic compaction at 0.85,
+  effective compaction on, and approvals that wait (`approvalExpiryMs` 0).
+  Those are web-host defaults only: the library and the headless bin keep
+  the library values. Unsetting a field (reset) inherits whatever the lower layers
+  currently say. It never pins today's number.
+- **Snapshots.** [`AppConfigService`](../src/harness/config/service.ts) publishes
+  frozen `{ revision, values }` snapshots through `ctx.get('limits-reader')`.
+  The revision starts at 0 at boot and advances only when an effective value
+  changes. Boot, edit (hash-checked set/unset, then an atomic write), and
+  reload share one serialized path. `describe()` reads the disk without
+  activating anything.
+- **When a change applies.** Each operation captures the snapshot once, at its
+  own boundary, and keeps it until it finishes. Nothing running is
+  interrupted:
+
+  | Limits | Captured |
+  |---|---|
+  | `streamFirstEventMs`, `streamIdleMs`, `logicalRequestMs`, `stepRetries`, `stepRetryBaseMs` | per logical model request, retries included |
+  | `readOnlyToolConcurrency` | per model step, for that step's tool batch |
+  | `toolOutputLimit`, `toolTimeoutMs`, `bashMaxWaitMs`, `subagentBackgroundBashMaxMs` | per tool call, after approval and just before dispatch (the Bash schema advertises the current budget at each request, so changing `toolTimeoutMs` or `bashMaxWaitMs` changes the tool schema and invalidates the provider prompt cache on the next request) |
+  | `approvalExpiryMs`, `questionExpiryMs` | when the approval or question is created |
+  | `delegationJoinMs` | when each join starts |
+  | `automaticCompactionPressure`, `compactionPrecomputePressure` | at each settled-turn decision; a compaction already running is not cancelled |
+  | `compactionRetainTokens`, `attachmentTextLimit` | at each context assembly; a compaction captures attachment text when it starts |
+  | `compactionDeadlineMs`, `compactionOutputTokens`, `compactionCandidateWaitMs` | when each compaction summary (or its wait for a background candidate) starts |
+  | `maxAttachmentBytes` | before an upload body is read; the image and video tools keep the startup cap |
+  | `maxAttachmentsPerMessage`, `maxPendingInputs` | when a message is validated or durably queued; inputs already accepted stay |
+
+- **Reload, never watch.** There is no file watcher and no code HMR. A
+  hand-edited file takes effect only on an explicit reload (the web API, or
+  **Apply file changes** in the UI) or on a restart. The headless bin reads the
+  file once, at startup.
+- **Invalid file.** Malformed JSON, a version other than `v: 1`, unknown
+  sections or keys, and out-of-range values all count as invalid. Hosts do not
+  repair or overwrite an invalid file. At boot, both bins refuse to start and
+  print the error, and nothing is left behind: the data-home lock is never
+  taken, and a memory-mode web host removes the temp home it created.
+  To recover, fix the file, or rename it aside to keep its contents (defaults
+  then apply), and restart. At runtime, an invalid file makes edit and reload
+  fail with `invalid`, and the last good snapshot stays active.
+- **Legacy reader.** `ctx.get('limits')` remains the static startup value for
+  existing consumers. Code that should follow live edits calls
+  `readLimits(ctx)` ([`limits-reader.ts`](../src/harness/config/limits-reader.ts))
+  at its boundary. It falls back to that static value on hosts without a
+  reader.
+
 ## Mode-driven context assembly
 
 Every model request is assembled by one context builder
@@ -937,6 +1003,15 @@ root stops waiting:
   silence is reported as `provider transport interrupted after Ns without
   output (likely a gateway idle cutoff)`: a proxy in front of the provider
   dropped the connection while the model wrote one large buffered tool call.
+- *The endpoint rejects the output cap.* For a model with no operator or
+  catalog limit the adapter sends a 32 000-token guess. If the endpoint rejects
+  it, the adapter resends once with the limit it names (known formats only,
+  ≤ 256 000) or with no cap, counting the resend as a physical attempt, and
+  remembers the result in memory for that route until the key, endpoint or
+  model changes. A rejected operator/catalog cap fails the turn with an
+  actionable message (`lower maxOutputTokens`), never a squeeze or a replay —
+  also when a relay wraps it in a 502. A genuine `input + completion > window`
+  error stays a context overflow even in `max_tokens` wording and squeezes.
 - *Hit the output-token limit.* The OpenAI adapter sends `max_tokens` from the
   model catalog (`maxOutputTokens`, overridable per model in a provider's
   `modelSettings`), so the gateway's own default does not cap the reply. A
@@ -963,6 +1038,35 @@ root stops waiting:
   the call's abort signal, so Stop returns at once instead of sitting out the
   timeout.
 
+**Messaging and resuming a child.** `Agent action:"message"`
+(`ChildExecutor.message`) sends one child of this root a prompt. A running child
+takes it as durable `input/queued` in its own log and runs it as its next turn
+(`delivery:"queue"`) or at once, ending the current turn as `steered`
+(`"steer"`). A finished child runs again: the parent records
+`agent/child-resume` (the commit point, through the same admission writer and
+closing fence as spawn, charged to the calling turn), and the child's agent is
+rebuilt only from the pinned `session/child-meta` snapshot — a resume never
+re-reads the role file and never gains a tool or folder. Each run is scoped:
+its result is the `agent/child-result` after the newest spawn/resume record,
+and its report, partial work, files and progress are read from the run's
+opening input on. A resume interrupted by a restart reads `interrupted`, never
+the previous run's result. Children spawned before the snapshot existed, and
+`uncertain` children, refuse to resume.
+
+**Background children.** `background: true` (spawn argument, or the role's
+frontmatter) keeps a child out of the turn join and the turn-completion
+cleanup; a root Stop and root deletion still cancel it. When it settles, the
+executor hands the report to the host (`onBackgroundSettled`), which queues it
+as durable `input/queued` with `origin: 'child'` — an idle root wakes, a busy
+one gets it after its turn, and the turn admits it as a `continuation` message.
+A `wait` watching the child delivers the report itself; a Stop never wakes the
+root; a report the host could not take stays owed to the root's next join or
+`wait`. The obligation survives a restart without a new record: the queued
+report names its child (`input/queued` `childSessionId`), and recovery owes
+every settled background run that has no such input after its result. Nothing
+auto-runs; the report waits for the root's next join or `wait`. A report the
+model only got through `wait` before the crash is offered once more.
+
 **Lifecycle boundary.** `spawn` checks, in order: the brief and inherit fields
 (`SpawnError('packet' | 'inherit')`), that the parent is a root owned by the
 requested workspace and project (`'ownership'`) and not itself a child
@@ -975,8 +1079,8 @@ established, which leaves it `uncertain` (below). Settling releases the
 conversation's active count; the per-turn attempt stays recorded until the
 root turn's `agent/turn-settled`. A child
 session is driven by the executor only: the message routes answer 409 for any
-session carrying `session/child-meta`, so a child can never be resumed as a
-plain root Agent.
+session carrying `session/child-meta`, so a child is resumed only through
+`ChildExecutor.message`, never as a plain root Agent.
 
 **Uncertain children.** A rejected append is not proof of absence: the record
 may have reached storage before the parent `Session` poisoned. When the

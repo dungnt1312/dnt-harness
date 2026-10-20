@@ -461,6 +461,61 @@ describe('bounded delegation', () => {
     }
   }, 15_000)
 
+  it('recovery indexes child relationships without loading unrelated or settled histories', async () => {
+    const isolated = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-recover-lazy-'))
+    try {
+      let rootId = ''
+      let settledChildId = ''
+      let unrelatedId = ''
+      {
+        const kernel = new Kernel()
+        kernel.ctx.plugin(fileSessions(isolated))
+        const ws = new WorkspaceService(isolated)
+        await ws.boot()
+        await kernel.ctx.sessions.boot()
+        const root = kernel.ctx.sessions.create(ws.defaultWorkspace)
+        rootId = root.id
+        // A child whose parent already recorded its terminal result: recovery
+        // indexes the relationship but has no interrupted work to repair.
+        const settled = kernel.ctx.sessions.create(ws.defaultWorkspace)
+        settledChildId = settled.id
+        settled.append({ type: 'session/child-meta', parentSessionId: root.id, parentTurnId: 't1', definition: 'explorer', objective: 'inspect' })
+        settled.append({ type: 'turn/start', turnId: 'ct1' as never })
+        settled.append({ type: 'turn/end', turnId: 'ct1' as never, reason: 'completed' })
+        await settled.durable()
+        root.append({ type: 'agent/child-spawn', childSessionId: settled.id, parentTurnId: 't1', definition: 'explorer', objective: 'inspect' })
+        root.append({ type: 'agent/child-result', childSessionId: settled.id, parentTurnId: 't1', status: 'completed' })
+        await root.durable()
+        // An unrelated conversation carrying its own (potentially large) history.
+        const unrelated = kernel.ctx.sessions.create(ws.defaultWorkspace)
+        unrelatedId = unrelated.id
+        unrelated.append({ type: 'turn/start', turnId: 'ut1' as never })
+        unrelated.append({ type: 'assistant/message', stepId: 'us1' as never, content: 'just chatting' })
+        await unrelated.durable()
+        await kernel.stop()
+      }
+      const kernel = new Kernel()
+      kernel.ctx.plugin(fileSessions(isolated))
+      await kernel.ctx.sessions.boot()
+      const sessions = kernel.ctx.sessions
+      const executor = new ChildExecutor(kernel.ctx)
+      expect(await executor.recoverFromStorage()).toBe(1)
+      // The relationship is indexed...
+      expect(sessions.workspaceOf(settledChildId as never)).toBeDefined()
+      // ...but recovery keeps only ids: unrelated and already-settled histories
+      // must stay on disk, never materialized in memory.
+      expect(() => sessions.get(unrelatedId as never)).toThrow()
+      expect(() => sessions.get(settledChildId as never)).toThrow()
+      // Both remain listable from their summaries without being loaded.
+      expect(sessions.summary(unrelatedId as never)).toBeDefined()
+      expect(sessions.summary(settledChildId as never)).toBeDefined()
+      expect(rootId).not.toBe('')
+      await kernel.stop()
+    } finally {
+      await fs.rm(isolated, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   it('the child ceiling denies tools outside definition âˆ© grant even in Full access', async () => {
     const harness = await bootChildHarness([
       { toolCalls: [{ name: 'Bash', args: { command: 'echo hacked' } }] },

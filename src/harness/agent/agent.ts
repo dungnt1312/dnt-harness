@@ -1,12 +1,14 @@
 import type { Context } from '../../kernel/index.ts'
 import { newExecutionId, newStepId, newTurnId, type ExecutionId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
-import { resolveLimits, type HarnessLimits } from '../limits.ts'
+import { readLimits } from '../config/limits-reader.ts'
 import { MAX_SQUEEZE_LEVEL } from '../context/budget.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
 import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
 import { LogicalRequest } from '../llm/request-lifecycle.ts'
 import { encodedBytes, protocolError, validateCompletion, validateToolBatch, WIRE_LIMITS } from '../llm/completion.ts'
+import { capturedReasoning, reasoningSourceFor, StreamRedactor } from '../llm/reasoning.ts'
+import type { ReasoningPayload } from '../llm/types.ts'
 import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
 import { agentScope, type AgentScope } from './scope.ts'
@@ -17,7 +19,7 @@ export interface AcceptedInput {
   readonly content: string
   readonly inputId: InputId
   readonly attachments?: readonly AttachmentRef[]
-  readonly origin?: 'hook'
+  readonly origin?: 'hook' | 'child'
   readonly summary?: string
 }
 
@@ -662,6 +664,14 @@ export class Agent {
     // request as too large would be sent the identical request forever.
     let full = ''
     let calls: readonly ToolCall[] = []
+    // Thinking text of the CURRENT attempt only: reset with `full`/`calls`, so
+    // an abandoned or retried attempt never leaks into the answer that finally
+    // succeeds. Published only on a valid completion.
+    let thinking = ''
+    let reasoningSource: string | undefined
+    let reasoningField: string | undefined
+    let thinkingRedacted = false
+    let thinkingRedactor = new StreamRedactor()
     // The reply ended at the model's output-token limit (finish `length`).
     let truncated = false
     let request: ModelRequest = { messages: [] }
@@ -671,7 +681,10 @@ export class Agent {
     // be retried by abandoning the step wholesale and re-asking under a fresh
     // id. Only once per step: after the re-ask, a second failure is final.
     let discardBudget = 1
-    const owner = new LogicalRequest({ firstProgressMs: this.limits().streamFirstEventMs, idleMs: this.limits().streamIdleMs, totalMs: this.limits().logicalRequestMs, retryBaseMs: this.limits().stepRetryBaseMs, maxAttempts: Math.min(4, this.limits().stepRetries + 1) })
+    // One policy per logical request: every retry keeps it even if the
+    // limits are republished while this request waits out a backoff.
+    const policy = readLimits(this.ctx).values
+    const owner = new LogicalRequest({ firstProgressMs: policy.streamFirstEventMs, idleMs: policy.streamIdleMs, totalMs: policy.logicalRequestMs, retryBaseMs: policy.stepRetryBaseMs, maxAttempts: Math.min(4, policy.stepRetries + 1) })
     const cancelOwner = (): void => owner.cancel()
     signal?.addEventListener('abort', cancelOwner, { once: true })
     if (signal?.aborted) owner.cancel()
@@ -703,6 +716,12 @@ export class Agent {
       owner.assertLive(); assertLive()
       full = ''
       calls = []
+      thinking = ''
+      reasoningSource = undefined
+      reasoningField = undefined
+      thinkingRedacted = false
+      // Per attempt: an abandoned attempt's held tail is dropped, never persisted.
+      thinkingRedactor = new StreamRedactor()
       truncated = false
 
       const attemptController = new AbortController()
@@ -747,6 +766,15 @@ export class Agent {
               }
               validateToolBatch(calls)
               completed = true
+              // The redactor's held tail is released only now, on a valid completion.
+              const held = thinkingRedactor.flush()
+              if (held !== '') {
+                thinking += held
+                this.session.append({ type: 'assistant/chunk', stepId, delta: held, thinking: true })
+              }
+              if (typeof event.reasoningSource === 'string' && event.reasoningSource !== '') reasoningSource = event.reasoningSource
+              if (typeof event.reasoningField === 'string' && event.reasoningField !== '') reasoningField = event.reasoningField
+              if (event.reasoningRedacted === true) thinkingRedacted = true
               if (calls.length > 0) emitted = true
               continue
             }
@@ -761,14 +789,19 @@ export class Agent {
               if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'provider output exceeds limit')
               // Thinking deltas are logged for UI fidelity but never join the
               // assembled assistant message — the model's answer is content only.
-              if (event.thinking !== true) full += event.delta
               emitted = true
-              this.session.append({
-                type: 'assistant/chunk',
-                stepId,
-                delta: event.delta,
-                ...(event.thinking === true ? { thinking: true } : {}),
-              })
+              if (event.thinking !== true) {
+                full += event.delta
+                this.session.append({ type: 'assistant/chunk', stepId, delta: event.delta })
+              } else {
+                // Thinking is masked for secret shapes BEFORE it reaches the
+                // durable log (any provider, not just the built-in adapter); a
+                // secret split across deltas is held until its run ends. The
+                // record below is assembled from exactly these persisted pieces.
+                const safe = thinkingRedactor.push(event.delta)
+                thinking += safe
+                if (safe !== '') this.session.append({ type: 'assistant/chunk', stepId, delta: safe, thinking: true })
+              }
             } else if (event.type === 'toolCalls') {
               if (calls.length > 0) throw protocolError('invalid_tool_input', 'multiple tool batches')
               validateToolBatch(event.calls)
@@ -850,6 +883,17 @@ export class Agent {
         stepId,
         content: full,
         ...(calls.length > 0 ? { toolCalls: calls } : {}),
+        // Any provider's thinking is kept for replay. No thinking, no record:
+        // an empty string is never stored as if it had been streamed. A
+        // `length` cutoff is kept as `complete: false` and never replayed.
+        ...((): { reasoning?: ReasoningPayload } => {
+          if (thinking === '') return {}
+          // Same model resolution as the adapter: the request's, else the provider's fallback.
+          const model = request.model ?? (provider !== undefined ? safeProviderModels(this.ctx, provider)[0] : undefined) ?? 'default'
+          const source = reasoningSource ?? reasoningSourceFor(provider ?? '', model)
+          const record = capturedReasoning(thinking, !truncated, source, { redacted: thinkingRedacted || thinkingRedactor.changed, ...(reasoningField !== undefined ? { field: reasoningField } : {}) })
+          return record !== undefined ? { reasoning: record } : {}
+        })(),
         ...(request.model !== undefined || provider !== undefined
           ? { controls: { ...(request.model !== undefined ? { model: request.model } : {}), ...(provider !== undefined ? { provider } : {}) } }
           : {}),
@@ -861,7 +905,7 @@ export class Agent {
     // reads after a write see it. Every call is prepared (hooks, approval) in
     // order first; each group then records its intents, runs, and records its
     // results in the model's original order.
-    const concurrency = Math.max(1, this.limits().readOnlyToolConcurrency)
+    const concurrency = Math.max(1, readLimits(this.ctx).values.readOnlyToolConcurrency)
     let group: ReadyCall[] = []
     const runPending = async (): Promise<void> => {
       if (group.length === 0) return
@@ -1019,17 +1063,17 @@ export class Agent {
   private abortError(): Error {
     return new StopRequested()
   }
-
-  private limits(): HarnessLimits {
-    const shared = (this.ctx.get('limits') ?? {}) as Partial<HarnessLimits>
-    return resolveLimits(shared)
-  }
 }
 
-/** How an admitted inbox item is labeled in the log: context, a hook rewake, or (nothing) user text. */
-function inputOrigin(item: InboxItem): { origin?: 'context' | 'hook'; summary?: string } {
+/**
+ * How an admitted inbox item is labeled in the log: context, a hook rewake, a
+ * background child's report (shown like any delegated-report continuation),
+ * or (nothing) user text.
+ */
+function inputOrigin(item: InboxItem): { origin?: 'context' | 'hook' | 'continuation'; summary?: string } {
   if (item.kind === 'injected') return { origin: 'context' }
   if (item.origin === 'hook') return { origin: 'hook', ...(item.summary !== undefined ? { summary: item.summary } : {}) }
+  if (item.origin === 'child') return { origin: 'continuation' }
   return {}
 }
 
@@ -1052,6 +1096,14 @@ function matchClaimedContents(contents: readonly string[], claimed: readonly Inb
     }
   }
   return matched
+}
+
+function safeProviderModels(ctx: Context, provider: string): readonly string[] {
+  try {
+    return (ctx.get('llm') as { providerModels?: (name: string) => readonly string[] } | undefined)?.providerModels?.(provider) ?? []
+  } catch {
+    return []
+  }
 }
 
 function safeProviderName(ctx: Context): string | undefined {

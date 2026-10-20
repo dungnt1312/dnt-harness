@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { ManagedOAuth, OAuthStore } from 'dnt-harness'
+import { senderHttp } from '../support/outbound-sender.ts'
+
+/** The token/revoke send, injected under the outbound policy envelope. */
+const sent = (handler: typeof fetch) => senderHttp((url, init) => handler(url, init))
 
 describe('managed oauth profile', () => {
   it('refuses to begin a public-resource flow with a loopback token endpoint', async () => {
@@ -24,7 +28,7 @@ describe('managed oauth profile', () => {
     const paused = new Promise<void>((resolve) => { entered = resolve })
     try {
       const store = new OAuthStore(home, randomBytes(32))
-      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'stale' })) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'stale' })) as typeof fetch))
       // Pause after the first read has observed ENOENT, before incarnation can write.
       let first = true
       vi.spyOn(fs, 'readFile').mockImplementation(async (...args: Parameters<typeof fs.readFile>) => {
@@ -80,7 +84,7 @@ describe('managed oauth profile', () => {
     try {
       let clock = 1_000
       const store = new OAuthStore(home, randomBytes(32))
-      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'late' })) as typeof fetch, () => clock)
+      const oauth = new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'late' })) as typeof fetch), () => clock)
       const input = await depositedAuthorization(oauth)
       clock += 300_001
       await expect(oauth.complete(input)).rejects.toThrow(/expired/)
@@ -92,7 +96,7 @@ describe('managed oauth profile', () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-revoke-'))
     try {
       const store = new OAuthStore(home, randomBytes(32))
-      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'late' })) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'late' })) as typeof fetch))
       const input = await depositedAuthorization(oauth)
       await oauth.revoke('ws', 'remote')
       await expect(oauth.complete(input)).rejects.toThrow(/revoked|replaced/)
@@ -109,7 +113,7 @@ describe('managed oauth profile', () => {
     try {
       const store = new OAuthStore(home, randomBytes(32))
       let config = 'original'
-      const oauth = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch, undefined, undefined, async () => config)
+      const oauth = new ManagedOAuth(store, sent((async () => { entered(); return gate }) as typeof fetch), undefined, undefined, async () => config)
       const { state } = await oauth.begin({ workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp', authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', redirectUri: 'http://127.0.0.1/callback', clientId: 'client', scopes: [], configIdentity: config })
       await oauth.deposit(state, 'code')
       const pending = oauth.complete({ state, workspaceId: 'ws', server: 'remote', principalId: 'p' })
@@ -125,7 +129,7 @@ describe('managed oauth profile', () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-atomic-'))
     try {
       const store = new OAuthStore(home, randomBytes(32))
-      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'new' })) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'new' })) as typeof fetch))
       const record = { serverUrl: 'http://127.0.0.1/mcp', resource: 'http://127.0.0.1/mcp', issuer: 'http://127.0.0.1', authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', scopes: [], discoveredAt: 1 }
       const { state } = await oauth.begin({ workspaceId: 'ws', server: 'remote', principalId: 'p', resource: record.resource, authorizationEndpoint: record.authorizationEndpoint, tokenEndpoint: record.tokenEndpoint, redirectUri: 'http://127.0.0.1/callback', clientId: 'client', scopes: [], serverRecord: record })
       await oauth.deposit(state, 'code')
@@ -141,10 +145,10 @@ describe('managed oauth profile', () => {
       const store = new OAuthStore(home, randomBytes(32))
       await store.saveTokens('ws', 'remote', expiredTokens())
       const bodies: string[] = []
-      const oauth = new ManagedOAuth(store, (async (_url, init) => {
+      const oauth = new ManagedOAuth(store, sent((async (_url, init) => {
         bodies.push(String(init?.body))
         return Response.json({ access_token: `access-${bodies.length}`, expires_in: 1 })
-      }) as typeof fetch)
+      }) as typeof fetch))
       await oauth.refresh('ws', 'remote')
       expect((await store.readTokens('ws', 'remote'))?.refreshToken).toBe('refresh-old')
       await oauth.refresh('ws', 'remote')
@@ -164,7 +168,7 @@ describe('managed oauth profile', () => {
     try {
       const store = new OAuthStore(home, randomBytes(32))
       await store.saveTokens('ws', 'remote', expiredTokens())
-      const oauth = new ManagedOAuth(store, (async () => { entered(); return response }) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => { entered(); return response }) as typeof fetch))
       const pending = oauth.refresh('ws', 'remote').catch((error: unknown) => error)
       await started
       // Revocation must finish while the token endpoint is still blocked.
@@ -192,13 +196,13 @@ describe('managed oauth profile', () => {
     try {
       const store = new OAuthStore(home, randomBytes(32))
       await store.saveTokens('ws', 'remote', expiredTokens())
-      const refreshing = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch)
+      const refreshing = new ManagedOAuth(store, sent((async () => { entered(); return gate }) as typeof fetch))
       const pending = refreshing.refresh('ws', 'remote')
       operations.push(pending)
       await started
-      const authorizing = new ManagedOAuth(store, (async () => Response.json({
+      const authorizing = new ManagedOAuth(store, sent((async () => Response.json({
         access_token: 'authorized-new', refresh_token: 'authorized-refresh',
-      })) as typeof fetch)
+      })) as typeof fetch))
       const input = await depositedAuthorization(authorizing)
       await expect(authorizing.complete(input)).resolves.toMatchObject({ accessToken: 'authorized-new' })
       release(result === 'success'
@@ -231,10 +235,10 @@ describe('managed oauth profile', () => {
         await save(ws, server, tokens)
       })
       let exchanges = 0
-      const oauth = new ManagedOAuth(store, (async () => {
+      const oauth = new ManagedOAuth(store, sent((async () => {
         exchanges += 1
         return Response.json({ access_token: exchanges === 1 ? 'authorized-first' : 'authorized-second' })
-      }) as typeof fetch)
+      }) as typeof fetch))
       const firstInput = await depositedAuthorization(oauth)
       const secondInput = await depositedAuthorization(oauth)
       const first = oauth.complete(firstInput).catch((error: unknown) => error)
@@ -278,7 +282,7 @@ describe('managed oauth profile', () => {
         if (tokens.phase === 'replacement_persisted') { entered(); await gate }
         await save(ws, server, tokens)
       })
-      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'new' })) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'new' })) as typeof fetch))
       const pending = oauth.refresh('ws', 'remote')
       operations.push(pending)
       await writing
@@ -360,7 +364,7 @@ describe('managed oauth client authentication and server records', () => {
     }) as typeof fetch
   }
   async function confidentialComplete(store: OAuthStore, method: 'client_secret_post' | 'client_secret_basic', seen: Seen[]) {
-    const oauth = new ManagedOAuth(store, recorder(seen), undefined, async () => 'shh-secret')
+    const oauth = new ManagedOAuth(store, sent(recorder(seen)), undefined, async () => 'shh-secret')
     const { state } = await oauth.begin({
       workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp',
       authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', clientId: 'client',
@@ -397,7 +401,7 @@ describe('managed oauth client authentication and server records', () => {
 
   it('refuses a confidential exchange when the secret is not available', async () => {
     await withStore(async (store) => {
-      const oauth = new ManagedOAuth(store, recorder([]), undefined, async () => undefined)
+      const oauth = new ManagedOAuth(store, sent(recorder([])), undefined, async () => undefined)
       const { state } = await oauth.begin({
         workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp',
         authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', clientId: 'client',
@@ -415,7 +419,7 @@ describe('managed oauth client authentication and server records', () => {
       const gate = new Promise<Response>((resolve) => { release = resolve })
       let entered!: () => void
       const started = new Promise<void>((resolve) => { entered = resolve })
-      const oauth = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch)
+      const oauth = new ManagedOAuth(store, sent((async () => { entered(); return gate }) as typeof fetch))
       const pending = oauth.refresh('ws', 'remote')
       await started
       try {
@@ -430,7 +434,7 @@ describe('managed oauth client authentication and server records', () => {
   it.each(['missing', 'unloadable'] as const)('keeps an active grant when its client secret is %s during refresh', async (kind) => {
     await withStore(async (store) => {
       await store.saveTokens('ws', 'remote', { ...expiredTokens(), tokenEndpointAuth: 'client_secret_post' })
-      const oauth = new ManagedOAuth(store, recorder([]), undefined, async () => {
+      const oauth = new ManagedOAuth(store, sent(recorder([])), undefined, async () => {
         if (kind === 'unloadable') throw new Error('secret vault unavailable')
         return undefined
       })
@@ -481,7 +485,7 @@ describe('pasting the final redirect address', () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-oauth-'))
     try {
       const store = new OAuthStore(home, randomBytes(32))
-      return await body(new ManagedOAuth(store, (async () => Response.json({ access_token: 'a', refresh_token: 'r', expires_in: 3600 })) as typeof fetch))
+      return await body(new ManagedOAuth(store, sent((async () => Response.json({ access_token: 'a', refresh_token: 'r', expires_in: 3600 })) as typeof fetch)))
     } finally { await fs.rm(home, { recursive: true, force: true }) }
   }
 

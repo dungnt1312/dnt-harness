@@ -440,6 +440,13 @@ const PATHS: Readonly<Record<string, ReactNode>> = {
     </>
   ),
   stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
+  mic: (
+    <>
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M5 10v1a7 7 0 0 0 14 0v-1" />
+      <path d="M12 18v4" />
+    </>
+  ),
   server: (
     <>
       <rect x="3" y="4" width="18" height="6" rx="1.5" />

@@ -29,6 +29,8 @@ import {
 } from 'dnt-harness'
 import { MAX_SQUEEZE_LEVEL, squeezeBudget, DEFAULT_BUDGET } from '../../src/harness/context/budget.ts'
 import { isContextExceeded } from '../../src/harness/llm/openai.ts'
+import { buildContext } from '../../src/harness/context/builder.ts'
+import { BUNDLED_MODES, DEFAULT_MODE_ID } from '../../src/harness/modes/bundled.ts'
 import { agentScope } from '../../src/harness/agent/scope.ts'
 import { agentTool, formatChildReports, type DelegationDeps } from '../../src/web/agent-delegation.ts'
 import { AgentDefinitionService } from 'dnt-harness'
@@ -47,6 +49,37 @@ describe('context-exceeded recovery', () => {
     expect(isContextExceeded(401, 'context_length_exceeded')).toBe(false)
     expect(isContextExceeded(400, 'invalid api key')).toBe(false)
     expect(isContextExceeded(500, 'prompt is too long')).toBe(false)
+  })
+
+  it('never reads a rejected output cap as an overflow: squeezing history cannot fix it', () => {
+    for (const detail of [
+      'max_tokens is too large: 32000. This model supports at most 16384 completion tokens, whereas you provided 32000.',
+      'max_tokens: 32000 > 8192, which is the maximum allowed number of output tokens for claude-x',
+      'max_tokens must be less than or equal to 4096',
+      // Groq quotes the field and mentions the context window; still a cap error.
+      '`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` is less than the `context_window` for this model',
+      'Range of max_tokens should be [1, 8192]',
+      "Invalid 'max_completion_tokens': integer above maximum value. Expected a value <= 16384, but got 32000 instead.",
+    ]) {
+      expect(isContextExceeded(400, detail), detail).toBe(false)
+      expect(isContextExceeded(502, detail), detail).toBe(false)
+    }
+    // A genuine overflow that merely mentions max_tokens still counts.
+    expect(isContextExceeded(400, "This model's maximum context length is 128000 tokens. However, you requested 140000 tokens (130000 in the messages, 10000 in the completion).")).toBe(true)
+    // vLLM reports input + cap > window in its cap wording; once the cap is no
+    // longer a guess that is a real overflow, and squeezing must still run.
+    expect(isContextExceeded(400, "'max_tokens' or 'max_completion_tokens' is too large: 3000. This model's maximum context length is 8192 tokens and your request has 7000 input tokens (3000 > 8192 - 7000).")).toBe(true)
+  })
+
+  it('a squeezed request lowers the output ceiling with the prompt, so input plus cap shrinks', () => {
+    const budget = { ...DEFAULT_BUDGET, contextLimitTokens: 100_000 }
+    const ceilingAt = (squeeze: number): number => buildContext({
+      events: [{ type: 'user/message', turnId: 't', content: 'x'.repeat(30_000), seq: 1, timestamp: 1 }] as never,
+      mode: { definition: BUNDLED_MODES.find((mode) => mode.id === DEFAULT_MODE_ID)!, source: 'bundled' },
+      modeRevision: 1, model: 'm', providerName: 'p', schemas: [], activeSkills: [], pinnedMemory: [], budget, squeeze,
+    }).maxOutputTokens
+    expect(ceilingAt(1)).toBeLessThan(ceilingAt(0))
+    expect(ceilingAt(MAX_SQUEEZE_LEVEL)).toBeLessThan(ceilingAt(1))
   })
 
   it('every squeeze level shrinks the budget, and the last level is final', () => {
@@ -584,5 +617,42 @@ describe('the Agent tool wait', () => {
     const description = inTurn(() => tool.schema?.()?.description ?? '')
     expect(description).not.toMatch(/blocks until they settle/)
     expect(description).toMatch(/prefer long waits/i)
+  })
+})
+
+describe('the Agent tool message', () => {
+  const owned = { events: [{ type: 'session/child-meta', parentSessionId: 'root', seq: 1, timestamp: 1 }] }
+  function toolWith(message: (...args: unknown[]) => Promise<unknown>) {
+    const deps: DelegationDeps = {
+      definitions: new AgentDefinitionService(home),
+      executor: { message } as never,
+      session: async (id) => (id === 'child-1' ? owned : { events: [] }) as never,
+      childModelFor: () => undefined,
+      providers: () => [],
+      modelsOf: () => [],
+      admissionResolver: async ({ candidates }) => candidates,
+    }
+    return agentTool(deps)
+  }
+  const inTurn = <T>(fn: () => T): T => agentScope.run({ sessionId: 'root' as never, rootSessionId: 'root' as never, turnId: 'turn-7' as never, workspaceId: 'ws' as never }, fn)
+
+  it('routes to the executor with the calling turn and the chosen delivery', async () => {
+    const calls: unknown[][] = []
+    const tool = toolWith(async (...args) => { calls.push(args); return { childSessionId: 'child-1', definitionName: 'worker', status: 'running' } })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'Also b.ts', delivery: 'steer' }, {} as never))))
+    expect(calls).toEqual([['ws', 'root', 'turn-7', 'child-1', 'Also b.ts', 'steer']])
+    expect(out.note).toMatch(/stops its current turn/)
+  })
+
+  it('defaults to queue and rejects bad arguments before touching the executor', async () => {
+    const calls: unknown[][] = []
+    const tool = toolWith(async (...args) => { calls.push(args); return { childSessionId: 'child-1', definitionName: 'worker', status: 'queued' } })
+    await inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'Go on' }, {} as never))
+    expect(calls[0]?.[5]).toBe('queue')
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1', 'child-2'], prompt: 'x' }, {} as never))).rejects.toThrow(/exactly one/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: ' ' }, {} as never))).rejects.toThrow(/prompt/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'x', delivery: 'now' }, {} as never))).rejects.toThrow(/delivery/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['someone-else'], prompt: 'x' }, {} as never))).rejects.toThrow(/no such child/)
+    expect(calls).toHaveLength(1)
   })
 })

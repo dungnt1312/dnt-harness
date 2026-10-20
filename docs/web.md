@@ -109,10 +109,10 @@ succeeds.
 ## Starting it
 
 ```sh
-dnt-harness web     # installed via `npm i -g dnt-harness`; client is prebuilt
+dnt-harness web     # installed via `bun add -g dnt-harness`; client is prebuilt
 # from a source checkout:
-npm run build:web   # build the React client into web-dist/ (one time)
-npm run web         # serve at http://127.0.0.1:3082 (default port)
+bun run build:web   # build the React client into web-dist/ (one time)
+bun run web         # serve at http://127.0.0.1:3082 (default port)
 ```
 
 The web bin (`src/bins/web.ts`) accepts:
@@ -140,13 +140,13 @@ model selection:
 ```json
 {
   "version": 2,
-  "defaults": { "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": null },
+  "defaults": { "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": null },
   "providers": [{
     "id": "deepseek",
     "name": "deepseek",
     "baseUrl": "https://api.deepseek.com",
     "apiKey": "sk-…",
-    "models": ["deepseek-chat", "deepseek-reasoner"],
+    "models": ["deepseek-flash", "deepseek-v4-pro"],
     "enabled": true
   }]
 }
@@ -160,8 +160,12 @@ fallback. All provider/default mutations run through one serialized,
 persist-before-publish transaction.
 
 Every endpoint speaks the standard `POST {baseUrl}/chat/completions` SSE wire
-format (tool-call fragment accumulation, `reasoning_content` → thinking
-deltas); DeepSeek is simply one such endpoint. API keys are masked when
+format (tool-call fragment accumulation; `reasoning_content`, `reasoning` or
+`reasoning_text` → thinking deltas, replayed on later requests under the same
+field); DeepSeek is simply one such endpoint. An optional per-provider
+`compatibility: { reasoningField?, requireReasoning?, replayReasoning? }`
+overrides the field, whether empty reasoning is still sent, and whether
+reasoning is sent back at all. API keys are masked when
 serialized to the client (`keyMasked`), and the raw key leaves the server only
 through `GET /api/providers/:id/key`, on request from the paired browser
 session (the Settings eye toggle). When the active
@@ -252,10 +256,10 @@ provider list for the Settings panel.
 ```json
 {
   "provider": "deepseek",
-  "model": "deepseek-chat",
+  "model": "deepseek-flash",
   "folder": "/workspace",
-  "models": ["deepseek-chat", "deepseek-reasoner"],
-  "providers": [{ "id": "deepseek", "name": "deepseek", "enabled": true, "keyMasked": "••••abcd", "models": ["deepseek-chat"] }]
+  "models": ["deepseek-flash", "deepseek-v4-pro"],
+  "providers": [{ "id": "deepseek", "name": "deepseek", "enabled": true, "keyMasked": "••••abcd", "models": ["deepseek-flash"] }]
 }
 ```
 
@@ -267,7 +271,7 @@ it.
 
 ```json
 // body
-{ "model": "deepseek-reasoner" }
+{ "model": "deepseek-v4-pro" }
 ```
 
 `400` when the name is not in the provider's offered models.
@@ -298,6 +302,16 @@ The response is `{ days: [{ date, model, input, cached, cacheableInput, cacheRep
 ### `GET/PUT /api/image-generation`, `/api/image-understanding`, `/api/video-generation`, `/api/commit-message`
 
 Four provider/model references behind **Settings → Providers & Models** (the **Images** sub-tab holds the first two, **Videos** the third, **Git** the fourth), all with one contract (`src/web/model-pair-store.ts`). `image-generation` serves the `GenerateImage` and `EditImage` tools, `video-generation` serves `GenerateVideo` (see `docs/capabilities.md`). The body and response are `{ provider, model }`, both strings, or both `null` when the feature is off. `PUT` answers `400` for an unknown provider id or a half-filled pair. Each pair is stored in its own file (`image-generation.json`, `image-understanding.json`, `video-generation.json`, `commit-message.json`) beside `providers.json`; the key and base URL stay on the provider entry. `image-understanding` serves `DescribeImage` when the active chat model has effective `vision: false`; unlike the other two, its model must accept image input through chat completions rather than an Images or Videos endpoint. `commit-message` serves the Git panel's Generate Commit Message button; a pair that is set but unusable is reported as its own error, never silently replaced, and with no pair the `fast` model alias stands in.
+
+### `GET/PUT /api/speech-to-text`, `POST /api/speech-to-text/transcribe`
+
+Composer dictation. `GET/PUT /api/speech-to-text` is a fifth provider/model pair with the same `{ provider, model }` contract as above (the **Voice** panel in Settings), but its `PUT` accepts only a provider that serves the `stt` kind; every other pair accepts only `chat` providers. The pair is stored beside `providers.json` like the others.
+
+`POST /api/speech-to-text/transcribe` takes the raw audio bytes as the request body (capped by the `maxAttachmentBytes` limit) and an optional `?language=` two-letter hint such as `vi`. The server forwards them as one multipart `POST {baseUrl}/audio/transcriptions` to the configured provider (the OpenAI-compatible Transcriptions API, so OpenAI, Groq and Mistral work by configuration alone; 60 s timeout, 25 MB per file) and answers `{ text }`. It does not store the audio. An unconfigured pair, a provider that no longer exists, is disabled, lacks the `stt` kind or has no base URL answers `400` with the Settings fix; a body over the `maxAttachmentBytes` limit answers `413` before any provider request (a declared `Content-Length` over the limit is refused unread; a chunked body that overflows is cut off, so its client may see the connection close instead); a provider or transport failure answers `502`.
+
+A provider's optional `kinds` field (`'chat'` and/or `'stt'`; absent means chat only) says what it serves. An `stt`-only provider never enters the chat model registry or any chat picker; it is still listed by `GET /api/providers` so the Voice panel can choose it.
+
+In the client, the composer shows a push-to-talk mic button (`web/components/composer/useDictation.ts`) only when the browser can record and the pair is set. It records with `MediaRecorder`, sends the blob on stop, and inserts the returned text at the caret. A failure leaves the draft untouched and reports the reason.
 
 ### `GET|HEAD /api/workspaces/:wid/videos/:id`
 
@@ -400,7 +414,7 @@ snapshots existed, which keep inheriting the live global defaults; the
 `GET` answers the **effective** controls:
 
 ```json
-{ "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": "high", "source": "session" }
+{ "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": "high", "source": "session" }
 ```
 
 `source` is `session` when the conversation owns a preference and
@@ -435,7 +449,7 @@ reconfigure after creating a workspace or rebooting the host.
 
 ```json
 // GET
-{ "provider": "deepseek", "model": "deepseek-chat", "thinkingLevel": null }
+{ "provider": "deepseek", "model": "deepseek-flash", "thinkingLevel": null }
 ```
 
 `PUT` accepts the same shape (`null` provider/model is an explicit blank
@@ -465,6 +479,43 @@ stream, and the context budget is recomputed for the new model on that same
 request. Each `assistant/message` records the pair that actually served it
 in its `controls`, so the log answers "what did this reply come from".
 
+
+### Global limits: `GET/PATCH /api/app-config`, `POST /api/app-config/reload`
+
+These routes manage the per-data-home `<data-dir>/app-config.json`
+(`appConfigFile` overrides the path). It is separate from the provider
+`configFile`. For layers, locks, and when each limit takes effect, see
+[harness.md](harness.md#global-limits-configuration-config). The web bin layers
+`WEB_LIMIT_DEFAULTS` (automatic compaction pressure 0.85, effective compaction,
+approvals that wait) under the file and
+passes no explicit `limits`, so no field is locked there. Only embedders
+passing `limits` create locks. When control-plane auth is on, the routes are
+admin-only: they need a browser session with the CSRF header and canonical
+Origin, or an admin bearer. Other bearer scopes get `403`.
+
+- `GET` returns the editor view: `document` and `hash` (both `null`, plus
+  `error`, while the file is invalid), the active `{ revision, values }`,
+  `inherited` (library plus host values), `fields` (metadata with `source`,
+  `locked`, `fileValue`, `shadowed`), and `outOfSync` (the disk differs from
+  what is active). Reading never activates anything.
+- `PATCH { expectedHash, edits: [{ op: "set", key, value } | { op: "unset", key }] }`
+  validates the whole batch (non-empty, one edit per key), writes the file
+  atomically, publishes it, and returns the new view. `unset` is the reset: the
+  field inherits the current defaults.
+- `POST /reload` (body `{}`) re-reads a hand-edited file and publishes it. The
+  host has no file watcher.
+
+Errors are `{ error, code, key? }`: `400 invalid` (bad shape, key, or value, or
+an invalid file on disk), `409 conflict` (stale `expectedHash`), `409 locked`
+(an explicit override owns the field), `500 io`, `500 internal` (any other
+host failure), `405 method`. A failed reload
+keeps the last good snapshot. An invalid file at startup stops the host from
+booting (see harness.md for recovery). Running operations keep the policy they
+captured; the next operation in every workspace uses the new snapshot.
+
+Settings → **Advanced** is the client: it sends only changed fields, resets
+with `unset`, keeps your edits across a conflict refresh, maps **Apply file
+changes** to reload, and asks before discarding unsaved edits.
 
 ### Legacy: `GET /api/sessions`
 
@@ -641,6 +692,12 @@ type WebEnvelope =
   registrations.
 - The browser client (`web/lib/api.ts`) uses `EventSource` and reconnects on its
   own; the UI derives the connection state (`connecting` / `open` / `reconnecting`).
+- `?view=delegations` is an opt-in projection: the snapshot or resume replay
+  and every live `session` frame keep only `agent/child-spawn`,
+  `agent/child-resume` and `agent/child-result` events. It is meant for a
+  parent the client reads only delegation facts from (`useSessionStream`'s
+  `delegationsOnly`), so it skips the full history replay. The stored log and
+  default clients are unchanged, and `approval` frames are not filtered.
 - Thinking-capable models stream `assistant/chunk` frames marked
   `"thinking": true`; the client renders them in a collapsible thinking panel
   and they never enter model history.
@@ -774,17 +831,18 @@ boundaries matter more than the feature:
   Closing the last terminal is a decision and is never undone automatically.
 - **Default shell** is a browser-local preference (`terminalShell` in
   `dnt-harness.workbench.v1`), set from the Terminal view's shell menu. Unset, it
-  defers to the host's own order: the platform's login shell first (zsh on
-  macOS), then Bash, then PowerShell when Bash is absent on Windows. A
+  defers to the host's own order: the platform's login shell first (on macOS
+  the account's login shell, zsh by default or Bash after `chsh`), then Bash,
+  then PowerShell when Bash is absent on Windows. A
   remembered shell the host no longer offers falls back to that order instead
   of failing every open.
 - **Shells** come from the shared resolver (`capabilities/shell/detect.ts`) and
   the client renders only what the host reports — zsh and Bash on macOS, Bash
   elsewhere (labelled Git Bash on Windows), and on Windows
-  PowerShell and cmd. On Windows the PTY is created with `useConptyDll`: the
-  default kill path forks a console-list helper that dies with
-  `AttachConsole failed` once the shell has exited, and both paths were
-  measured to reap a backgrounded grandchild.
+  PowerShell and cmd. On Windows the PTY comes from `bun-pty` (ConPTY via
+  portable-pty). Closing it ends the whole console session: background jobs
+  of cmd (`start /b`), PowerShell and Git Bash (`&`) were measured to die with
+  the shell.
 - **cwd** is the conversation's project folder, or the host's `--root`
   otherwise. As with `Bash`, a shell is not path-confined: the user can `cd`
   anywhere the OS user can.
@@ -805,9 +863,63 @@ One stream carries every terminal in a workspace: browsers cap HTTP/1.1 at
 about six connections per origin and the chat stream already holds one.
 Keystrokes POST to `/input` batched per 16 ms frame rather than per character.
 
-`node-pty` is imported lazily. Without it the routes answer `501` with the
-install hint and the rest of the product is untouched; see the README for the
-one-time npm install-script approval.
+On macOS and Linux under Bun the PTY is Bun's built-in `Bun.spawn({ terminal })`.
+On macOS both shells start as login shells (`-l -i`), as Terminal.app does,
+so `/etc/zprofile` and `~/.zprofile` (where Homebrew adds itself to PATH) are
+read; the account's login shell is used by its exact path (a Homebrew zsh or
+bash included) unless `DNT_HARNESS_BASH` pins bash. When the host names no
+locale (`LC_ALL`, `LC_CTYPE` and `LANG` all unset, common under launchd or an
+IDE), the shell gets `LC_CTYPE=UTF-8` so its line editor accepts UTF-8 input;
+an explicit locale is kept. Linux keeps a non-login interactive bash (`-i`).
+On Windows it is `bun-pty` (a prebuilt Rust library loaded through `bun:ffi`,
+no install script), imported lazily. If it cannot load, the routes answer
+`501` with the reason and the rest of the product is untouched.
+
+**Platform support (this release).** Windows (bun-pty/ConPTY) is gated by
+the `windows-smoke` CI job on windows-2025: `bun scripts/pty-smoke-windows.mjs
+--require` (bash, PowerShell, cmd I/O, resize, natural exit, kill with
+background-job cleanup, 16 terminals) and the same terminal routes on a
+PM2-launched server (`scripts/pm2-smoke-windows.mjs`), green in
+[run 39178618295](https://github.com/dungnt1312/dnt-harness/actions/runs/39178618295).
+Linux and macOS (Bun 1.4.3 built-in PTY) are gated by
+`bun scripts/pty-probes.mjs --require [--shell zsh|bash]` in the
+`runtime-probes` CI job: bash on ubuntu-24.04 and zsh 5.9 plus bash 3.2.57 on
+macos-15 (arm64), all green in [run 39177692003](https://github.com/dungnt1312/dnt-harness/actions/runs/39177692003).
+The probes cover input/output, resize, remove, HUP→KILL escalation of a
+HUP-trapping shell and job, natural exit with a leftover background job, idle
+reap, `disposeAll` of 16 terminals within the shutdown budget, bounded
+create/close, split UTF-8, the default (login) shell on macOS, and an unrelated
+process that must never be signalled. **macOS terminal support (zsh and Bash)
+is claimed** on that run plus a local run on real macOS 26 (arm64).
+
+Session membership is read per platform: `/proc/<pid>/stat` on Linux, and on
+macOS `ps` for the process list plus getsid(2) (through `bun:ffi`) for each
+process's session. macOS reports no session id in `ps`, and the controlling
+tty is not an anchor: once the shell exits the kernel revokes the tty, so the
+jobs it left behind show `??` with parent 1 — getsid still names their
+session. See [release-checklist.md](release-checklist.md).
+
+### Teardown semantics
+
+- A terminal moves `running → closing → exited | failedTeardown`. Delete, idle
+  reap, natural exit and shutdown all share one idempotent teardown. On POSIX
+  it closes the PTY, sends HUP to the shell and its session members, escalates
+  to KILL after 1 s, and then reports an explicit failure. On Windows closing
+  the ConPTY is the kill; the exit is confirmed only once the shell PID is
+  gone, never on bun-pty's synthetic exit event alone.
+- `DELETE …/terminals/:tid` **awaits** teardown. It answers `200 {killed:true}`
+  only after exit is confirmed, `500 {killed:false,error}` when teardown fails,
+  and `409` while another close is in progress. A failed terminal keeps its
+  record, refuses input/resize (`closing`), and is retried by another DELETE,
+  the reaper, or shutdown.
+- Host shutdown awaits `disposeAll()` (4 s terminal budget, concurrent). The
+  whole close is bounded by `SHUTDOWN_DEADLINE_MS` (13.5 s, under PM2's 15 s
+  `kill_timeout`). A teardown failure is logged with the remaining PIDs, never
+  sent in an HTTP response.
+- **Limitation:** an external SIGKILL or host crash during teardown can leave
+  the shell and its jobs running. No orphan reaping is persisted. Intentionally
+  detached daemons (`setsid`, `nohup … & disown`) leave the PTY session and are
+  never cleaned up.
 
 ## The approval bridge
 
@@ -891,7 +1003,7 @@ graceful close and a second to an immediate exit.
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
 | `components/workbench` | Files browser/viewer with create/rename/delete and edit file contents (Edit/Save in the viewer), Git (Zed-style writable change list, commit box, remote buttons, askpass modal, output log and Restricted Mode banner), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
-| `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
+| `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit`, plus the global Advanced limits panel |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
 | `hooks/` | SSE subscription, theme, media queries, transcript follow, focus restore, preferences |

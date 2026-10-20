@@ -8,9 +8,9 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'dnt-harness'
+import { bashTool, DEFAULT_LIMITS, fsTools, Kernel, ToolsService, type LimitsSnapshot, type ToolExecution } from 'dnt-harness'
 import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
-import { detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
+import { darwinShellOptions, detectLoginShell, detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
 
 const exec: ToolExecution = { root: process.cwd() }
 
@@ -167,14 +167,16 @@ describe('bash tool', () => {
     expect(bash!.label).toBe(process.platform === 'win32' ? 'Git Bash' : 'Bash')
   })
 
-  it('leads the macOS catalog with zsh and still offers bash after it', () => {
+  it('leads the macOS catalog with the login shell and still offers the other one', () => {
     if (process.platform !== 'darwin') return
     const catalog = shellCatalog()
-    expect(catalog[0]).toMatchObject({ id: 'zsh', label: 'zsh', executable: expect.stringMatching(/\/zsh$/) })
-    expect(catalog.map((option) => option.id)).toContain('bash')
+    const login = detectLoginShell().executable ?? ''
+    const lead = login.endsWith('/bash') ? 'bash' : 'zsh'
+    expect(catalog[0]?.id).toBe(lead)
+    expect(catalog.map((option) => option.id).sort()).toEqual(['bash', 'zsh'])
   })
 
-  it('resolves the zsh option to an existing executable with interactive args', () => {
+  it('resolves the zsh option to an existing executable started as a login shell on macOS only', () => {
     const zsh = shellCatalog().find((option) => option.id === 'zsh')
     if (process.platform !== 'darwin') {
       expect(zsh).toBeUndefined()
@@ -182,7 +184,28 @@ describe('bash tool', () => {
     }
     expect(zsh).toBeDefined()
     expect(existsSync(zsh!.executable)).toBe(true)
-    expect(zsh!.args).toEqual(['-i'])
+    expect(zsh!.args).toEqual(['-l', '-i'])
+  })
+
+  it('starts the macOS login shell like Terminal.app: first, by its exact path, as a login shell', () => {
+    expect(darwinShellOptions('/opt/homebrew/bin/zsh', '/bin/bash')).toEqual([
+      { id: 'zsh', label: 'zsh', executable: '/opt/homebrew/bin/zsh', args: ['-l', '-i'] },
+      { id: 'bash', label: 'Bash', executable: '/bin/bash', args: ['-l', '-i'] },
+    ])
+    expect(darwinShellOptions('/opt/homebrew/bin/bash', '/bin/bash').map((option) => [option.id, option.executable])).toEqual([
+      ['bash', '/opt/homebrew/bin/bash'],
+      ['zsh', existsSync('/bin/zsh') ? '/bin/zsh' : 'zsh'],
+    ])
+    // DNT_HARNESS_BASH pins bash explicitly: the login path only decides the order.
+    expect(darwinShellOptions('/opt/homebrew/bin/bash', '/custom/bash', true)[0]).toMatchObject({ id: 'bash', executable: '/custom/bash' })
+    // Login shell unknown or something else (fish): zsh, the macOS default, leads.
+    expect(darwinShellOptions(undefined, '/bin/bash').map((option) => option.id)).toEqual(['zsh', 'bash'])
+    expect(darwinShellOptions('/opt/homebrew/bin/fish', undefined).map((option) => option.id)).toEqual(['zsh'])
+  })
+
+  it('keeps the Linux interactive shell a non-login bash', () => {
+    if (process.platform !== 'linux') return
+    expect(shellCatalog()).toEqual([expect.objectContaining({ id: 'bash', args: ['-i'] })])
   })
 
   it.runIf(process.platform === 'win32')('the tag sweep alone kills a tagged tree whose root no walk can reach', async () => {
@@ -218,4 +241,65 @@ describe('bash tool', () => {
     expect(output.length).toBeLessThan(4_000)
     expect(output).toMatch(/truncated/)
   }, 20_000)
+
+  it('schema and execution read the current limits', async () => {
+    let snapshot: LimitsSnapshot = Object.freeze({ revision: 0, values: DEFAULT_LIMITS })
+    const tool = bashTool({ limits: { read: () => snapshot }, timeoutMs: 5_000 })
+    const waitDescription = (): string => (tool.schema?.()?.parameters.properties['timeoutMs'] as { description: string }).description
+    expect(waitDescription()).toContain('default 120000, max 600000')
+
+    snapshot = Object.freeze({ revision: 1, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100, bashMaxWaitMs: 200 }) })
+    expect(waitDescription()).toContain('default 100, max 200')
+
+    // The clamp is taken once at start: a later publication does not re-time it.
+    let started = Date.now()
+    const running = tool.execute({ command: 'sleep 5; echo never' }, exec)
+    snapshot = Object.freeze({ revision: 2, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 60_000, bashMaxWaitMs: 60_000 }) })
+    let output = await running
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
+    expect(Date.now() - started).toBeLessThan(3_000)
+
+    // An explicit argument above the current maximum clamps to it.
+    snapshot = Object.freeze({ revision: 3, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100, bashMaxWaitMs: 200 }) })
+    started = Date.now()
+    output = await tool.execute({ command: 'sleep 5; echo never', timeoutMs: 60_000 }, exec)
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
+    expect(Date.now() - started).toBeLessThan(3_000)
+
+    // A trusted execution snapshot outranks the reader.
+    snapshot = Object.freeze({ revision: 4, values: DEFAULT_LIMITS })
+    started = Date.now()
+    output = await tool.execute({ command: 'sleep 5; echo never' }, { ...exec, limitsSnapshot: Object.freeze({ revision: 5, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100 }) }) })
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
+    expect(Date.now() - started).toBeLessThan(3_000)
+  }, 20_000)
+
+  it('a fixed-option Bash keeps its configured timeout through the tool pipeline', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.setRootResolver(() => ({ root: process.cwd() }))
+    kernel.ctx.tools.register(bashTool({ timeoutMs: 200 }))
+    try {
+      const started = Date.now()
+      const result = await kernel.ctx.tools.execute({ id: 'fixed', name: 'Bash', args: { command: 'sleep 5; echo never' } })
+      expect(result.output).toContain('[terminated by timeout; killed]')
+      expect(result.output).not.toContain('never')
+      expect(Date.now() - started).toBeLessThan(3_000)
+    } finally {
+      await kernel.stop()
+    }
+  }, 10_000)
+
+  it('static callers keep their configured wait budget and schema', async () => {
+    const tool = bashTool({ timeoutMs: 2_000 })
+    const description = (tool.parameters.properties['timeoutMs'] as { description: string }).description
+    expect(description).toContain('default 2000, max 600000')
+    expect(tool.schema).toBeUndefined()
+    const output = await bashTool({ timeoutMs: 100 }).execute({ command: 'sleep 5; echo never' }, exec)
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
+  }, 10_000)
 })

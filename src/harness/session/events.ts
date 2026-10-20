@@ -2,7 +2,7 @@ import { assertNever } from '../../kernel/index.ts'
 import type { ExecutionId, StepId, TurnId } from '../../util/brand.ts'
 import { isImageMediaType, type AttachmentLookup, type AttachmentRef } from '../attachments/store.ts'
 import type { ContextManifest } from '../context/builder.ts'
-import type { ContentPart, ModelMessage, ToolCall } from '../llm/types.ts'
+import type { ContentPart, ModelMessage, ReasoningPayload, ToolCall } from '../llm/types.ts'
 import type { ModeDefinition } from '../modes/types.ts'
 
 /** Fields the session itself stamps onto every appended event. */
@@ -35,7 +35,10 @@ export type SessionEvent =
   | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' | 'hook'; readonly summary?: string } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
-  | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
+  // `reasoning`: the attempt's thinking text and the field it streamed under,
+  // for any provider that streamed some. Absent on legacy logs and replies
+  // without thinking. Never part of `content`, child reports or delegation text.
+  | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls; readonly reasoning?: ReasoningPayload } & SessionEventStamp)
   | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly executionId?: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
   // A tool run by host prompt expansion before the first model step (Claude
   // command `!` shell). Separate event names keep model history free of an
@@ -84,10 +87,13 @@ export type SessionEvent =
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
-  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true; readonly origin?: 'hook'; readonly summary?: string } & SessionEventStamp)
+  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true; readonly origin?: 'hook' | 'child'; readonly summary?: string; readonly childSessionId?: string } & SessionEventStamp)
   // `origin: 'hook'`: an `asyncRewake` hook's result the host queued for the
   // model (lower-trust data, never something the user typed); `summary` is the
   // one line the user sees for it.
+  // `origin: 'child'`: a background child's report the host queued for its
+  // root (`childSessionId` names the child, so recovery knows it was
+  // delivered); admitted as a `continuation` user message.
   // `runsNow`: the host found the session idle at acceptance and dispatches a
   // turn for it at once — the UI shows it as a sent message, not a queued one.
   // The user edited a still-waiting input: later readers take this content.
@@ -111,7 +117,10 @@ export type SessionEvent =
   | ({ readonly type: 'session/grants'; readonly revision: number; readonly roots: readonly SessionGrant[]; readonly approvalId?: string } & SessionEventStamp)
   // Child records: writers emit `brief`; `objective` is the legacy field older
   // logs carry, so readers take `brief ?? objective`. The inherit audit fields
-  // record how much parent context a child received — never the text itself.
+  // record how much parent context a child received.
+  // The pinned snapshot (`instructions` … `inheritedContext`) is what a resume
+  // rebuilds the child from — never the role file as it reads today. Logs
+  // written before it carry no `toolCeiling` and cannot be resumed.
   | ({
       readonly type: 'session/child-meta'
       readonly parentSessionId: string
@@ -123,6 +132,14 @@ export type SessionEvent =
       readonly inherit?: 'none' | 'brief'
       readonly inheritedHash?: string
       readonly inheritedChars?: number
+      readonly instructions?: string
+      readonly definitionSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
+      readonly toolCeiling?: readonly string[]
+      readonly skills?: readonly string[]
+      readonly grants?: readonly { readonly path: string; readonly access: 'read' | 'write' }[]
+      readonly inheritedContext?: string
+      /** Outlives the spawning turn and reports by notification (every run). */
+      readonly background?: true
     } & SessionEventStamp)
   // A root running as an agent role (automations): the pinned role snapshot
   // its agent is rebuilt from. Written once, before the first turn.
@@ -135,6 +152,11 @@ export type SessionEvent =
       readonly skills?: readonly string[]
     } & SessionEventStamp)
   | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly brief?: string; readonly objective?: string } & SessionEventStamp)
+  // A finished child run again for a later turn: the parent's commit point for
+  // that run. `inputId` names the child-log input the run opens with, where the
+  // run's own events start. A result counts only for the newest spawn/resume
+  // record before it.
+  | ({ readonly type: 'agent/child-resume'; readonly childSessionId: string; readonly parentTurnId: string; readonly inputId: string } & SessionEventStamp)
   | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
   // `message` (optional, capped): the hook's user-facing text — systemMessage,
@@ -448,15 +470,14 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
         messages.push({ role: 'user', content: userMessageContent(event.content, event.attachments, attachments) })
         break
       case 'assistant/message':
-        messages.push(
-          event.toolCalls === undefined
-            ? { role: 'assistant', content: event.content }
-            : {
-                role: 'assistant',
-                content: event.content,
-                toolCalls: event.toolCalls.map((call, index) => effectiveCalls.get(event.stepId)?.[index] ?? call),
-              },
-        )
+        // Reasoning rides along as recorded; the context builder drops cut-off
+        // records and the adapter picks the wire field.
+        messages.push({
+          role: 'assistant',
+          content: event.content,
+          ...(event.toolCalls !== undefined ? { toolCalls: event.toolCalls.map((call, index) => effectiveCalls.get(event.stepId)?.[index] ?? call) } : {}),
+          ...(event.reasoning !== undefined ? { reasoning: event.reasoning } : {}),
+        })
         break
       case 'tool/result':
         messages.push({ role: 'tool', content: event.output, toolCallId: event.callId })
@@ -489,6 +510,7 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'session/child-meta':
       case 'session/role':
       case 'agent/child-spawn':
+      case 'agent/child-resume':
       case 'agent/child-result':
       case 'mcp/call':
       case 'hook/run':

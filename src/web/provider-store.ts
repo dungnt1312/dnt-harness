@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
 import { isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { legacyReasoningCompatibility, normalizeReasoningCompatibility, type ReasoningCompatibility } from '../harness/llm/reasoning.ts'
 
 /** Per-model operator overrides stored on one provider entry. */
 export interface ModelSettings {
@@ -24,6 +25,9 @@ export function maxOutputTokenOverrides(entry: ProviderConfig): Record<string, n
   return out
 }
 
+/** What one configured provider serves: chat completions, transcription, or both. */
+export type ProviderKind = 'chat' | 'stt'
+
 /** One configured OpenAI-completions provider, persisted as JSON. */
 export interface ProviderConfig {
   readonly id: string
@@ -32,7 +36,67 @@ export interface ProviderConfig {
   readonly apiKey: string
   readonly models: readonly string[]
   readonly enabled: boolean
+  /** Absent means `['chat']`; `['stt']` keeps the provider out of every chat surface. */
+  readonly kinds?: readonly ProviderKind[]
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
+  /**
+   * Reasoning overrides, opencode-style `{ reasoningField?, requireReasoning?,
+   * replayReasoning? }`, normalized here at the store boundary. Absent: the
+   * field is learned from each stream. Only the providers.json file sets it.
+   */
+  readonly compatibility?: ReasoningCompatibility
+  /**
+   * The stored `compatibility` value exactly as written when it did not
+   * validate (or carried keys dnt does not use). Never applied; written back
+   * on save so a hand-edited entry is not erased by an unrelated mutation.
+   */
+  readonly rawCompatibility?: unknown
+}
+
+/**
+ * Normalize the stored overrides. A phase-05 `reasoning: { field?, required }`
+ * entry is still read and rewritten as compatibility on the next save; when
+ * both exist, `compatibility` wins and a warning says so. An invalid value is
+ * warned about, not applied, and kept as `rawCompatibility`.
+ */
+export function parseCompatibility(candidate: Record<string, unknown>, providerId = '?'): { readonly compatibility?: ReasoningCompatibility; readonly rawCompatibility?: unknown } {
+  const raw = candidate['compatibility']
+  const legacy = candidate['reasoning']
+  const hasRaw = raw !== undefined && raw !== null
+  const hasLegacy = legacy !== undefined && legacy !== null
+  // The validation messages name keys/fields only, never values from the entry.
+  const warn = (message: string): void => console.warn(`provider-store: provider '${providerId}': ${message}`)
+  if (hasRaw && hasLegacy) warn("both 'compatibility' and legacy 'reasoning' are set; using 'compatibility'")
+  if (hasRaw) {
+    try {
+      const parsed = normalizeReasoningCompatibility(raw)
+      const keep = Object.keys(raw as object).some((key) => !(key in parsed)) ? { rawCompatibility: raw } : {}
+      return { ...(Object.keys(parsed).length > 0 ? { compatibility: parsed } : {}), ...keep }
+    } catch (error) {
+      warn(`ignoring invalid reasoning compatibility: ${error instanceof Error ? error.message : 'invalid'}`)
+      if (!hasLegacy) return { rawCompatibility: raw }
+    }
+  }
+  if (!hasLegacy) return {}
+  try {
+    return { compatibility: legacyReasoningCompatibility(legacy) }
+  } catch (error) {
+    warn(`ignoring invalid legacy reasoning entry: ${error instanceof Error ? error.message : 'invalid'}`)
+    return hasRaw ? { rawCompatibility: raw } : {}
+  }
+}
+
+/** Parse a `kinds` value (request body or JSON row): junk drops, absent/empty means undefined (chat). */
+export function parseKinds(raw: unknown): readonly ProviderKind[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const kinds = [...new Set(raw.filter((kind): kind is ProviderKind => kind === 'chat' || kind === 'stt'))]
+  return kinds.length === 0 ? undefined : [...kinds].sort()
+}
+
+/** Does this provider serve the named kind? Absent kinds means chat-only. */
+export function servesKind(entry: ProviderConfig, kind: ProviderKind): boolean {
+  const kinds = entry.kinds ?? ['chat']
+  return kinds.includes(kind)
 }
 
 export interface ModelDefaults {
@@ -120,7 +184,9 @@ export function loadProviders(file: string): ProviderConfig[] {
 /** Parse the versioned envelope, dropping malformed providers. */
 export function parseProviderStore(raw: string): ProviderStore {
   try {
-    const parsed: unknown = JSON.parse(raw)
+    // Windows editors and PowerShell 5 `-Encoding utf8` prepend a BOM, which
+    // JSON.parse rejects; an otherwise valid store must not read as empty.
+    const parsed: unknown = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return emptyProviderStore()
     }
@@ -193,6 +259,7 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
     const id = candidate['id']; const name = candidate['name']; const baseUrl = candidate['baseUrl']; const apiKey = candidate['apiKey']
     if (typeof id !== 'string' || id === '' || typeof name !== 'string' || name === '' || typeof baseUrl !== 'string' || baseUrl === '' || typeof apiKey !== 'string') continue
     const models = Array.isArray(candidate['models']) ? candidate['models'].filter((model): model is string => typeof model === 'string') : []
+    const kinds = parseKinds(candidate['kinds'])
     const modelSettings: Record<string, ModelSettings> = {}
     if (candidate['contextLimits'] !== null && typeof candidate['contextLimits'] === 'object' && !Array.isArray(candidate['contextLimits'])) {
       for (const [model, tokens] of Object.entries(candidate['contextLimits'] as Record<string, unknown>)) {
@@ -212,9 +279,24 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
         if (Object.keys(value).length > 0) modelSettings[model] = { ...modelSettings[model], ...value }
       }
     }
-    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}) })
+    const compat = parseCompatibility(candidate, id)
+    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(kinds !== undefined ? { kinds } : {}), ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}), ...compat })
   }
   return out
+}
+
+/**
+ * The on-disk shape: an unusable or partly unknown `compatibility` is written
+ * back exactly as it was read, so saving never erases what an operator wrote.
+ */
+function serializableStore(store: ProviderStore): unknown {
+  return {
+    ...store,
+    providers: store.providers.map(({ compatibility, rawCompatibility, ...rest }) => {
+      const value = rawCompatibility ?? compatibility
+      return value !== undefined ? { ...rest, compatibility: value } : rest
+    }),
+  }
 }
 
 /** Persist definitions and global defaults together through one atomic rename. */
@@ -224,7 +306,7 @@ export async function saveProviderStore(file: string, store: ProviderStore): Pro
   // the replacement file and parent directory before reporting a commit.
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
   try {
-    await new Promise<void>((resolve, reject) => writeFile(temp, JSON.stringify(store, null, 2), 'utf8', (error) => error === null ? resolve() : reject(error)))
+    await new Promise<void>((resolve, reject) => writeFile(temp, JSON.stringify(serializableStore(store), null, 2), 'utf8', (error) => error === null ? resolve() : reject(error)))
     const replacement = await open(temp, 'r')
     try { await flushIfSupported(replacement) } finally { await replacement.close() }
     await new Promise<void>((resolve, reject) => rename(temp, file, (error) => error === null ? resolve() : reject(error)))

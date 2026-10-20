@@ -35,9 +35,29 @@ Full docs live in [`docs/`](docs/README.md):
 ## Install
 
 ```sh
-npm i -g dnt-harness     # Node >= 22.19.0
+bun add -g dnt-harness   # Bun >= 1.4.3 (the verified runtime for this release)
 dnt-harness              # web UI at http://127.0.0.1:3082
 ```
+
+**Runtimes.** The runtime is Bun **1.4.3** (`engines.bun >=1.4.3`). That is
+the version verified for outbound policy (real Undici under Bun) and PTY
+teardown; older Bun is unsupported. Developing from source also needs Node
+**>= 22.19** (22.20 LTS or 24): Vitest and Vite run under Node, and
+`bun run test` fails fast through `scripts/node-preflight.mjs` on older Node.
+`bun run probe:runtime` checks the installed Bun (Undici dispatcher honored,
+DNS policy). See [docs/migration-runtime-hardening.md](docs/migration-runtime-hardening.md)
+for behaviour changes in this release.
+
+**Platform support.** Terminal (PTY) support is claimed only where it has
+been verified. Windows (bun-pty/ConPTY) is gated by the
+`windows-smoke` CI job (`bun scripts/pty-smoke-windows.mjs --require` plus a
+PM2-launched server, on windows-2025). Linux and macOS (Bun built-in PTY)
+are gated by the `runtime-probes` CI job (`bun scripts/pty-probes.mjs
+--require`): bash on Linux (ubuntu-24.04), and zsh plus the system bash 3.2
+on macOS (macos-15, arm64), both green in
+[run 39198490537](https://github.com/dungnt1312/dnt-harness/actions/runs/39198490537). **macOS terminal support
+(zsh and Bash) is claimed** on that CI evidence and on a local run on real
+macOS 26 (arm64). See [docs/release-checklist.md](docs/release-checklist.md).
 
 `dnt-harness` has three subcommands; everything after the subcommand is passed
 to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
@@ -47,7 +67,7 @@ to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
 | `dnt-harness [web] [--port N --root DIR --yolo --auth --allowed-host H --oauth-origin https://H --data-dir DIR]` | serve the web UI (default) |
 | `dnt-harness chat [--message "hi"]` | headless REPL or one-shot |
 | `dnt-harness pair [--data-dir DIR]` | mint a pairing code for a running `--auth` server |
-| `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `npm i -g pm2`) |
+| `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `bun add -g pm2`) |
 | `dnt-harness restart [--name N]` | restart the pm2 process, keeping the flags it was started with |
 | `dnt-harness upgrade [--name N]` | install the latest version from npm, then restart the pm2 process |
 
@@ -58,28 +78,43 @@ the folder you ran it from as the default `--root`. For start on boot, run
 
 Sessions and provider config live in `~/.dnt-harness/`. Add a provider in
 Settings, or set `DEEPSEEK_API_KEY` in the environment before the first start.
-The package ships TypeScript source and runs it through `tsx`; the web client
-is prebuilt, so no build step is needed after installing.
+The package ships TypeScript source and runs it with Bun directly; the web
+client is prebuilt, so no build step is needed after installing.
+
+### Upgrading from 0.2.x (Node)
+
+0.3.0 runs on Bun instead of Node + tsx, so the launcher needs `bun` on PATH.
+`dnt-harness upgrade` from a 0.2.x install still uses npm and leaves a launcher
+that cannot start without Bun. Move over once, by hand:
+
+```sh
+# install Bun >= 1.4.3 first: https://bun.sh
+npm rm -g dnt-harness
+bun add -g dnt-harness
+dnt-harness restart      # only if it runs under pm2
+```
+
+Sessions and providers in `~/.dnt-harness/` are unchanged. A pm2 process that
+was started under 0.2.x should be re-registered with `dnt-harness start pm2`
+so pm2 launches it through Bun.
 
 ## Getting started (from source)
 
 ```sh
-npm install
-npm test         # vitest run
-npm run typecheck
+bun install             # Bun 1.4.3
+bun run preflight:node  # Node >= 22.19 must be first on PATH for Vitest/Vite
+bun run test            # vitest run under Node (not `bun test`, Bun's own runner)
+bun run typecheck
+bun run build:web
+bun run probe:runtime   # Bun runtime probes (Undici dispatcher, DNS policy)
 ```
 
-The Workbench terminal needs `node-pty`, which places a prebuilt binary (and
-on Windows a bundled ConPTY DLL) from its install script. `pnpm-workspace.yaml`
-already allows that build; with npm 11 or newer the script is blocked by
-default and the terminal then reports itself unavailable, so approve it once:
-
-```sh
-npm install-scripts approve node-pty
-```
-
-Everything else runs normally without it — a missing PTY backend disables the
-terminal and nothing else.
+The Workbench terminal uses Bun's built-in PTY on POSIX (Linux and macOS,
+gated in CI, see above). On macOS it opens your login shell (zsh by default)
+as a login shell, like Terminal.app. On Windows
+it uses `bun-pty`, which ships a prebuilt Rust PTY library for each platform
+and loads it through `bun:ffi`: no install script and no build toolchain. Everything else runs normally without it — a missing PTY backend
+disables the terminal and nothing else.
 
 ## Configuration
 
@@ -93,6 +128,13 @@ Optional: `DEEPSEEK_BASE_URL` (defaults to the public API). Never commit the key
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
 ```
 
+Runtime limits (timeouts, output caps, queue and attachment bounds, compaction
+pressure) live in `<data-dir>/app-config.json`. Both bins read it, and the web
+host edits it live under Settings → **Advanced** (`/api/app-config`). A
+hand-edited file applies on **Apply file changes** or on restart. An invalid
+file stops the host from starting until you fix it or rename it aside. See
+[the harness docs](docs/harness.md#global-limits-configuration-config).
+
 ### Renamed from mini-dsh
 
 The project was called **mini-dsh**. Existing installs keep working without changes:
@@ -105,15 +147,15 @@ The project was called **mini-dsh**. Existing installs keep working without chan
 ## Chat
 
 ```sh
-npm run chat           # REPL; registers DeepSeek only when the key is set
-npx tsx src/bins/headless.ts --message "hello"   # one-shot
+bun run chat           # REPL; registers DeepSeek only when the key is set
+bun src/bins/headless.ts --message "hello"   # one-shot
 ```
 
 ## Web
 
 ```sh
-npm run build:web      # build the React client into web-dist/
-npm run web            # serve it at http://127.0.0.1:3082 (--yolo, --root, --port)
+bun run build:web      # build the React client into web-dist/
+bun run web            # serve it at http://127.0.0.1:3082 (--yolo, --root, --port)
 ```
 
 The toolbar switches the active model (`PUT /api/model`, offered names come

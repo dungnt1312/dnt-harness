@@ -23,7 +23,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
+import { replayView } from './replay-view.ts'
 import { createReadStream } from 'node:fs'
+import { handleAppConfigApi } from './app-config-api.ts'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
 import { promises as fs, type Dirent } from 'node:fs'
@@ -48,14 +50,21 @@ import { composeAuthority, type AskRequirement, type AuthorityDecision } from '.
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
 import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
-import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
+import type { HarnessLimits } from '../harness/limits.ts'
+import { APP_CONFIG_FILE, AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
+import { AppConfigService } from '../harness/config/service.ts'
+import type { LimitsReader } from '../harness/config/types.ts'
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
+import { DEEPSEEK_MODELS } from '../harness/llm/deepseek.ts'
 import { expressibleThinkingLevel, isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { advertisedModelError, effectiveBudget } from '../harness/llm/effective-model.ts'
+import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
-import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import type { LlmProvider, ModelMessage, ModelRequest, ReasoningPayload, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import { replayableReasoning } from '../harness/llm/reasoning.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -105,12 +114,15 @@ import {
   type ModelAlias,
   type ModelSettings,
   type ProviderConfig,
+  servesKind,
+  parseKinds,
   maxOutputTokenOverrides,
   validateModelAliasName,
 } from './provider-store.ts'
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { migrateRootModes } from '../harness/modes/root-migration.ts'
+import { rootModeRecord } from '../harness/modes/root-mode-record.ts'
 import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition, type AgentSource } from '../harness/agents/definition-service.ts'
 import { narrowCeiling, roleCandidates } from '../harness/agents/mcp-candidates.ts'
 import {
@@ -134,6 +146,7 @@ import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/e
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
 import { McpDispatchError } from '../harness/mcp/boundaries.ts'
 import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
+import { serversUsingSecret } from '../harness/mcp/secret-dependencies.ts'
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
@@ -164,6 +177,8 @@ import { generateVideoTool } from '../harness/tools/video-tools.ts'
 import { VideoStore, VideoStoreError } from '../harness/attachments/video-store.ts'
 import { loadPair, savePair, validatePairBody, type ModelPair } from './model-pair-store.ts'
 import { resolveImageApi } from './image-generation-store.ts'
+import { resolveSttApi } from './speech-to-text-store.ts'
+import { transcribe } from '../harness/stt/transcriptions.ts'
 import { resolveVisionApi } from './image-understanding-store.ts'
 import { resolveVideoApi } from './video-generation-store.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
@@ -349,8 +364,22 @@ export interface WebServerOptions {
    * `requiresUserInteraction` still apply.
    */
   readonly yolo?: boolean
-  /** Harness limits override (watchdogs, resource caps, and queue bounds). */
+  /**
+   * Explicit harness limits (watchdogs, resource caps, and queue bounds). Each
+   * valid field wins over the app-config file and locks that field; invalid
+   * fields fall through to lower layers.
+   */
   readonly limits?: Partial<HarnessLimits>
+  /** Host profile limit defaults, layered under the app-config file (the web bin's compaction pressure). */
+  readonly limitDefaults?: Partial<HarnessLimits>
+  /**
+   * Global app-config file (limits overrides); defaults to
+   * `<data home>/app-config.json`, or the memory-mode temp home. Separate from
+   * the provider `configFile`.
+   */
+  readonly appConfigFile?: string
+  /** Test seam for app-config file I/O; production reads utf8 and writes atomically. */
+  readonly appConfigIo?: ConfigStoreIo
   /** Host-level tool deny patterns (supports `*`); cannot be widened by mode/workspace/child/approval. */
   readonly blockedTools?: readonly string[]
   /** Read-only user skill layer (e.g. `~/.claude/skills`); workspace skills shadow it by name. */
@@ -477,6 +506,8 @@ export interface WebServer {
   readonly port: number
   readonly kernel: Kernel
   readonly auth: ControlPlaneAuthService
+  /** Global configuration coordinator; also mounted as `app-config` and `limits-reader`. */
+  readonly appConfig: AppConfigService
   close(): Promise<void>
 }
 
@@ -637,18 +668,27 @@ export interface PublicProvider {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
+  /** What this provider serves; absent means chat-only. `['stt']` hides it from chat lists. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
 
 /** The provider/model references kept beside providers.json, one file each. */
-const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation', 'commit-message'] as const
+const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation', 'commit-message', 'speech-to-text'] as const
 type ModelPairName = (typeof MODEL_PAIR_NAMES)[number]
 const MODEL_PAIR_ROUTES: Readonly<Record<string, { readonly name: ModelPairName; readonly label: string }>> = {
   '/api/image-generation': { name: 'image-generation', label: 'image generation' },
   '/api/image-understanding': { name: 'image-understanding', label: 'image understanding' },
   '/api/commit-message': { name: 'commit-message', label: 'commit message' },
   '/api/video-generation': { name: 'video-generation', label: 'video generation' },
+  '/api/speech-to-text': { name: 'speech-to-text', label: 'speech-to-text' },
+}
+
+/** The query string's `language` when it is a plausible ISO-639-1 code. */
+function languageOf(url: string | undefined): string | undefined {
+  const match = /[?&]language=([a-z]{2})(?:&|$)/.exec(url ?? '')
+  return match?.[1]
 }
 
 function publicProvider(entry: ProviderConfig): PublicProvider {
@@ -659,12 +699,63 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
     enabled: entry.enabled,
     keyMasked: maskKey(entry.apiKey),
     models: [...entry.models],
+    ...(entry.kinds !== undefined ? { kinds: entry.kinds } : {}),
     ...(entry.modelSettings !== undefined ? { modelSettings: entry.modelSettings } : {}),
   }
 }
 
+/**
+ * What a boot in progress has acquired. A failed boot releases it: teardown
+ * steps in reverse, then the partial kernel, then the data-home lock — only
+ * once canonical writers settled — and last the temp home this boot created.
+ * No MCP connection or agent run starts before boot completes, so none is stopped here.
+ */
+interface BootScope {
+  readonly teardown: (() => void | Promise<void>)[]
+  /** A canonical-writer step failed to settle: ownership must be retained. */
+  unsafe: boolean
+  kernel?: Kernel
+  agents?: { readonly persistenceSafe: boolean }
+  lock?: DataHomeLock
+  tempHome?: string
+}
+
+async function releaseFailedBoot(boot: BootScope): Promise<void> {
+  await runCleanup([
+    ...boot.teardown.toReversed(),
+    async () => {
+      if (boot.kernel === undefined) return
+      try { await boundedCleanup(() => boot.kernel!.stop()) } catch (error) { boot.unsafe = true; throw error }
+    },
+    async () => {
+      if (boot.agents?.persistenceSafe === false) boot.unsafe = true
+      if (boot.lock === undefined) return
+      if (boot.unsafe) throw new Error('ownership retained: canonical writers unresolved')
+      await boot.lock.release()
+    },
+    async () => {
+      if (boot.tempHome !== undefined && !boot.unsafe) await fs.rm(boot.tempHome, { recursive: true, force: true })
+    },
+  ])
+}
+
 /** Boot the harness on a kernel and expose it over HTTP. */
 export async function createWebServer(options: WebServerOptions): Promise<WebServer> {
+  const boot: BootScope = { teardown: [], unsafe: false }
+  try {
+    return await startWebServer(options, boot)
+  } catch (error) {
+    try {
+      await releaseFailedBoot(boot)
+    } catch (cleanupError) {
+      const causes = cleanupError instanceof AggregateError ? cleanupError.errors : [cleanupError]
+      console.error('web: failed boot left resources behind:', ...causes)
+    }
+    throw error
+  }
+}
+
+async function startWebServer(options: WebServerOptions, boot: BootScope): Promise<WebServer> {
   // Validated before anything is built: a typo here would otherwise only show
   // up as a provider rejecting the redirect.
   const oauthOrigins = parseOAuthOrigins(options.oauthOrigins ?? [])
@@ -683,6 +774,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   const kernel = new Kernel()
+  boot.kernel = kernel
   if (options.home !== undefined) {
     // Streaming chunks ride relaxed appends (one fsync per durability barrier
     // instead of per token); the env opt-out restores strict per-record syncs.
@@ -694,9 +786,37 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.plugin(LlmService)
   kernel.ctx.plugin(ToolsService)
   kernel.ctx.plugin(AgentsService)
+  boot.agents = kernel.ctx.agents
 
-  const limits: HarnessLimits = resolveLimits(options.limits)
-  kernel.ctx.provide('limits', limits)
+  // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
+  // hosts bind them to a fresh temp home so tests stay hermetic.
+  const resourceHome = options.home ?? (boot.tempHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
+  // Global limits: booted before any consumer or the data-home lock, so an
+  // invalid file refuses startup with nothing to unwind. Operations capture
+  // `appConfig.read()` at their own boundary; `limits` stays the static
+  // startup value for legacy readers.
+  const appConfig = new AppConfigService(
+    new AppConfigStore(options.appConfigFile ?? path.join(resourceHome, APP_CONFIG_FILE), options.appConfigIo),
+    {
+      ...(options.limitDefaults !== undefined ? { hostDefaults: options.limitDefaults } : {}),
+      ...(options.limits !== undefined ? { explicit: options.limits } : {}),
+    },
+  )
+  await appConfig.boot()
+  const liveLimits = (): Readonly<HarnessLimits> => appConfig.read().values
+  /**
+   * The compaction policy the compaction host and background precompute read
+   * when each job step starts: every property takes the current snapshot.
+   */
+  const compactionLimits: Pick<HarnessLimits, 'compactionEffectiveEnabled' | 'compactionDeadlineMs' | 'compactionOutputTokens' | 'compactionCandidateWaitMs'> = {
+    get compactionEffectiveEnabled() { return liveLimits().compactionEffectiveEnabled },
+    get compactionDeadlineMs() { return liveLimits().compactionDeadlineMs },
+    get compactionOutputTokens() { return liveLimits().compactionOutputTokens },
+    get compactionCandidateWaitMs() { return liveLimits().compactionCandidateWaitMs },
+  }
+  kernel.ctx.provide('limits', liveLimits())
+  kernel.ctx.provide('limits-reader', appConfig)
+  kernel.ctx.provide('app-config', appConfig)
 
   // ── workspace registry ───────────────────────────────────────
   const workspaces = new WorkspaceService(options.home ?? process.cwd())
@@ -709,14 +829,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.provide('workspaces', workspaces)
   // App storage first: `memoryStorageCarveout` keys on it as hostStorageRoot.
   const deniedRoots = options.home !== undefined ? [options.home, ...(options.secretRoots ?? [])] : undefined
-  // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
-  // hosts bind them to a fresh temp home so tests stay hermetic.
-  const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
   const modes = new ModesService(resourceHome)
   const skills = new SkillsService(resourceHome, options.bundledSkillsDir, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
   // Not under workspaces/: boot adopts every directory there as a workspace.
   const checkpoints = new CheckpointStore(path.join(resourceHome, 'compaction'))
+  boot.teardown.push(async () => {
+    try { await boundedCleanup(() => checkpoints.close()) } catch (error) { boot.unsafe = true; throw error }
+  })
   // Settings → Usage: durable cross-workspace token accounting.
   const usageLog = options.home !== undefined ? await openUsageLog(path.join(options.home, 'usage.jsonl')) : memoryUsageLog()
   // Workspace-authored system prompt replacements (Settings → System Prompts).
@@ -726,7 +846,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.provide('memory', memory)
   // Composer attachments: content-addressed blobs beside the workspace's other
   // resources, so a memory-mode host gets a hermetic temp home like the rest.
-  const attachments = new AttachmentStore(resourceHome, { maxBytes: limits.maxAttachmentBytes })
+  // The static cap is a fallback only: uploads pass the cap they captured.
+  const attachments = new AttachmentStore(resourceHome, { maxBytes: liveLimits().maxAttachmentBytes })
   const videos = new VideoStore(resourceHome)
   // Claude Code subagent layers: bundled < ~/.claude/agents < <ws>/agents <
   // <project>/.claude/agents.
@@ -758,6 +879,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         console.error(`web: delegation inbox drain failed for ${root}: ${String(error)}`)
       })
     }
+  }, async (root, handle) => {
+    // A background child settled: its report becomes durable host input for
+    // its root — an idle root wakes, a busy one gets it after its turn.
+    const entry = sessions.get(root)
+    const deps = depsRef.current
+    if (entry === undefined || deps === undefined || shuttingDown) return false
+    return queueHostInput(entry, deps, formatChildReports([handle]), 'child', `Background agent ${handle.definitionName} ${handle.status}`, handle.childSessionId)
   })
   kernel.ctx.provide('agent-definitions', agentDefinitions)
   // Claude Code custom slash commands: ~/.claude/commands < plugins <
@@ -783,7 +911,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       const entry = sessions.get(delivery.rootSessionId as SessionId)
       const deps = depsRef.current
       if (entry === undefined || deps === undefined || shuttingDown) return false
-      return queueHookRewake(entry, deps, delivery.content, delivery.summary)
+      return queueHostInput(entry, deps, delivery.content, 'hook', delivery.summary)
     },
   })
   // Claude Code hooks from settings.json layers (user/workspace/project/local).
@@ -807,6 +935,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     },
   })
   const ownerLock = await DataHomeLock.acquire(resourceHome)
+  boot.lock = ownerLock
   const mutations = new MutationStore(resourceHome)
   await mutations.recover()
   // An interrupted `migrate-mcp` run is rolled back to its verified backup
@@ -854,7 +983,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const oauthStore = new OAuthStore(path.join(resourceHome, 'oauth'), oauthKey)
   // A confidential client's secret is resolved from the workspace secrets at
   // each exchange; it never sits beside the tokens.
-  const oauth = new ManagedOAuth(oauthStore, fetch, () => Date.now(), async (workspaceId, serverName) => {
+  // OAuth network calls go through the shared policy transport (outbound-http.ts).
+  const oauth = new ManagedOAuth(oauthStore, undefined, () => Date.now(), async (workspaceId, serverName) => {
     const config = await mcpStore.loadMcp(workspaceId)
     const ref = managedAuthOf(config.servers[serverName])?.clientSecret
     if (ref === undefined) return undefined
@@ -863,6 +993,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
   const mcpClientGeneration = new Map<string, number>()
+  // The generation a client was published under, readable from the client
+  // itself: a fence that deletes the map entry cannot change what a caller
+  // already holding the client reports for its call.
+  const mcpRuntimeGeneration = new WeakMap<McpServerClient, number>()
   /** Singleton connection promises prevent duplicate processes per workspace/server. */
   const mcpConnecting = new Map<string, Promise<McpServerClient>>()
   /** Disable/close cancellation epochs prevent late connection publication. */
@@ -899,7 +1033,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         name: 'deepseek',
         baseUrl: process.env['DEEPSEEK_BASE_URL']?.trim() || 'https://api.deepseek.com',
         apiKey: key,
-        models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+        models: [...DEEPSEEK_MODELS],
         enabled: true,
       }]
       durableDefaults = repairDefaults(durableDefaults, list)
@@ -913,6 +1047,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // apart from `disposers` so that churn never drops the host's long-lived
   // listeners (the automation run watcher used to vanish with them).
   const providerRegistrations = new Map<string, () => void>()
+  boot.teardown.push(() => {
+    for (const dispose of [...disposers.values(), ...providerRegistrations.values()]) dispose()
+    disposers.clear()
+    providerRegistrations.clear()
+  })
 
   /** Live workspace mode state, lazily initialized on first selection. */
   const controls = new Map<WorkspaceId, WorkspaceControls>()
@@ -930,6 +1069,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return state
   }
 
+  // Keys route-identity credential fingerprints (HMAC, per-install secret next
+  // to providers.json, shared with the CLI). Never logged.
+  const credentialHasher = loadCredentialHasher(path.dirname(configFile)).hash
   const instantiate = (entry: ProviderConfig): LlmProvider =>
     new OpenAiCompletionsProvider({
       name: entry.id,
@@ -937,6 +1079,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       baseUrl: entry.baseUrl,
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
       maxOutputTokens: maxOutputTokenOverrides(entry),
+      credentialHasher,
+      ...(entry.compatibility !== undefined ? { compatibility: entry.compatibility } : {}),
     })
 
   const injectionNames = (): readonly string[] =>
@@ -948,7 +1092,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   const usableIds = (): readonly string[] => [
     ...injectionNames(),
-    ...list.filter(isUsableConfigured).map((entry) => entry.id),
+    ...list.filter((entry) => isUsableConfigured(entry) && servesKind(entry, 'chat')).map((entry) => entry.id),
   ]
 
   const repairGlobalDefaults = (candidate: ModelDefaults, candidateList: readonly ProviderConfig[] = list): ModelDefaults => {
@@ -966,7 +1110,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
     if (candidate.provider !== null && candidate.model !== null) {
       const configured = candidateList.find((entry) => entry.id === candidate.provider)
-      if (configured?.enabled && configured.models.includes(candidate.model)) return candidate
+      if (configured?.enabled && servesKind(configured, 'chat') && configured.models.includes(candidate.model)) return candidate
     }
     return repairDefaults(candidate, candidateList)
   }
@@ -979,7 +1123,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       providerRegistrations.set(provider.name, kernel.ctx.llm.register(provider))
     }
     for (const entry of list) {
-      if (!isUsableConfigured(entry) || providerRegistrations.has(entry.id)) continue
+      // stt-only providers never join the chat LLM registry: they would appear
+      // in every model picker while serving nothing but /audio/transcriptions.
+      if (!isUsableConfigured(entry) || !servesKind(entry, 'chat') || providerRegistrations.has(entry.id)) continue
       providerRegistrations.set(entry.id, kernel.ctx.llm.register(instantiate(entry)))
     }
   }
@@ -987,18 +1133,15 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const validateProviderModel = (providerId: string, model?: string): { provider: string; model: string | undefined } => {
     const id = providerId
     if (id === '' || !usableIds().includes(id)) throw new Error(`no usable provider '${providerId}'`)
-    const available = kernel.ctx.llm.providerModels(id)
-    if (model !== undefined && available.length > 0 && !available.includes(model)) {
-      throw new Error(`unknown model '${model}' for provider '${id}'; available: ${available.join(', ')}`)
-    }
+    // Same rule and message as the CLI, from the shared resolver.
+    const unknown = advertisedModelError(id, kernel.ctx.llm.providerModels(id), model)
+    if (unknown !== undefined) throw new Error(unknown)
     return { provider: id, model }
   }
 
   /** The budget of a pair: the operator's override (verified), else the catalog's documented window. */
-  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget => {
-    const configured = provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
-    return resolveModelBudget({ model, ...(configured !== undefined ? { contextTokens: configured } : {}) })
-  }
+  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget =>
+    effectiveBudget(model, provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model])
 
   /**
    * The model behind the Git panel's Generate Commit Message button: the
@@ -1310,9 +1453,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // mid-flight simply has no reader left, and dispose emits nothing anyway.
   const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
   const processes = new ProcessRegistry(processEvents)
+  boot.teardown.push(async () => {
+    try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { boot.unsafe = true; throw error }
+  })
+  boot.teardown.push(() => processes.disposeAll())
   kernel.ctx.provide('processes', processes)
   kernel.ctx.provide('process-events', processEvents)
-  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, maxWaitMs: limits.bashMaxWaitMs, processes }))
+  kernel.ctx.tools.register(bashTool({ processes, limits: appConfig }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
 
@@ -1428,7 +1575,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       void appendJob(entry, { stage: 'preparing' })
       try {
         let result: { coversSeq: number; summary: string; path?: string }
-        if (limits.compactionEffectiveEnabled) result = await effectiveCompaction(entry, trigger, signal)
+        if (liveLimits().compactionEffectiveEnabled) result = await effectiveCompaction(entry, trigger, signal)
         else {
           const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal, trigger === 'automatic' ? 'auto' : 'manual')
           signal.throwIfAborted()
@@ -1476,7 +1623,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * live session, so a candidate is judged against the conversation as it is when someone
    * asks for it, not as it was when the summary started.
    */
-  const candidates: CompactionPrecompute | undefined = limits.compactionEffectiveEnabled && limits.compactionPrecomputeEnabled
+  // The rollout switches are host options the app-config file never edits, so this boot read stays current.
+  const candidates: CompactionPrecompute | undefined = liveLimits().compactionEffectiveEnabled && liveLimits().compactionPrecomputeEnabled
     ? new CompactionPrecompute({
       stream: (modelRequest, streamOptions) => agentScope.exit(() => kernel.ctx.llm.stream(modelRequest, streamOptions)),
       identity: (sessionId) => {
@@ -1501,7 +1649,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         if (entry === undefined) return 'no-fit'
         const events = entry.session.committedEvents
         const standing = recoverCanonicalCheckpoint(events)
-        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens }
+        const shared = { events, compactionRetainTokens: liveLimits().compactionRetainTokens }
         const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
         const now = estimateConversationTokens({ ...shared, compaction: { summary: prepared.summary, coversSeq: prepared.cutoff } })
         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
@@ -1519,7 +1667,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         const entry = sessions.get(sessionId as SessionId)
         return entry === undefined ? false : compactionVisionOf(entry)
       },
-      limits,
+      limits: compactionLimits,
       recordUsage: (sessionId, usage) => {
         const entry = sessions.get(sessionId as SessionId)
         if (entry === undefined) return
@@ -1618,7 +1766,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}), ...roleIdentityOf(entry.session) }
     const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
     return assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: new AbortController().signal }, sideEffects: false,
-      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
+      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: liveLimits().compactionEffectiveEnabled } })
   }
 
   const measureCheckpoint = async (
@@ -1672,7 +1820,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * events of the attempt that succeeded.
    */
   const retryingCompactionStream = (sessionId: SessionId, request: ModelRequest, streamOptions: StreamOptions, settled?: (events: readonly StreamEvent[], startedAt: number) => void): AsyncIterable<StreamEvent> => (async function* () {
-    const owner = new LogicalRequest({ firstProgressMs: limits.streamFirstEventMs, idleMs: limits.streamIdleMs, totalMs: limits.logicalRequestMs, retryBaseMs: limits.stepRetryBaseMs, maxAttempts: Math.min(4, limits.stepRetries + 1) })
+    // One policy per logical request: every retry of this request keeps it.
+    const policy = liveLimits()
+    const owner = new LogicalRequest({ firstProgressMs: policy.streamFirstEventMs, idleMs: policy.streamIdleMs, totalMs: policy.logicalRequestMs, retryBaseMs: policy.stepRetryBaseMs, maxAttempts: Math.min(4, policy.stepRetries + 1) })
     try {
       for (;;) {
         const buffered: StreamEvent[] = []
@@ -1709,6 +1859,17 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * effects; anything that does not fit — a dropped uncovered turn, an unsafe loss, a budget
    * error — yields undefined and the host folds.
    */
+  /**
+   * The final answer of a compaction handoff (captured snapshot, reconstructed
+   * snapshot, cache-aware summary): its complete reasoning rides along exactly
+   * like any other assistant message of the request. One rule, three paths.
+   */
+  const handoffAnswer = (answer: { readonly content: string; readonly reasoning?: ReasoningPayload }): ModelMessage => {
+    const message: ModelMessage = { role: 'assistant', content: answer.content, ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}) }
+    const reasoning = replayableReasoning(message)
+    return reasoning !== undefined ? { role: 'assistant', content: answer.content, reasoning } : { role: 'assistant', content: answer.content }
+  }
+
   const reconstructFromLog = async (entry: SessionEntry): Promise<EffectiveCompactionSnapshot | undefined> => {
     try {
       const sessionId = entry.session.id
@@ -1733,7 +1894,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         turnId: found.turnId,
         request: withoutAnswer,
         projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
-        finalAnswer: { role: 'assistant', content: found.answer.content },
+        // Phase 05: the same handoff rule as capture (window, route, tools), applied to the log record.
+        finalAnswer: handoffAnswer(found.answer),
         identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
         // The prefix's newest provider measurement calibrated this assembly; the fit check reuses it.
         ...(assembled.manifest.budget.measured?.ratio !== undefined ? { estimateRatio: assembled.manifest.budget.measured.ratio } : {}),
@@ -1768,7 +1930,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           const checkpoint = await legacyBody(entry, legacyTrigger, legacySignal)
           return { coversSeq: checkpoint.coversSeq, summary: checkpoint.summary }
         },
-        limits,
+        limits: compactionLimits,
         ...(candidates !== undefined ? { candidates } : {}),
         contextWindowTokens: () => compactionWindowOf(entry),
         nativeVision: () => compactionVisionOf(entry),
@@ -1837,7 +1999,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         signal.throwIfAborted()
         const fromSeq = seed?.coversSeq ?? 0
         const refs = entry.session.events.flatMap((event) => event.type === 'user/message' && event.seq > fromSeq ? [...(event.attachments ?? [])] : [])
-        const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
+        // This compaction's attachment projection follows the policy current when it began.
+        const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: liveLimits().attachmentTextLimit }) : undefined
         signal.throwIfAborted()
         const pair = summarizerModelOf(entry.session)
         const compactionStream = (request: ModelRequest, streamOptions?: StreamOptions) => retryingCompactionStream(entry.session.id, request, {
@@ -1874,7 +2037,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         // demonstrate room for both the summary instruction and its output.
         const cachePrefixFits = previous !== undefined && JSON.stringify({ messages: previous.messages, tools: previous.tools }).length <= 200_000
         const cached = pair !== undefined && finalAnswer !== undefined && cachePrefixFits && previous?.providerName === pair.providerName && previous.model === pair.model
-          ? createCacheAwareCompactionSummarizer(compactionStream, previous, finalAnswer, { signal })
+          // Phase 05: the same handoff rule as the snapshot paths.
+          ? createCacheAwareCompactionSummarizer(compactionStream, previous, handoffAnswer(finalAnswer), { signal })
           : undefined
         const summarizer = cached === undefined ? fallback : async (input: Parameters<typeof fallback>[0]) => {
           try { return await cached() } catch (error) {
@@ -1914,12 +2078,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       const manifest = lastManifests.get(entry.session.id)
       if (manifest === undefined || manifest.budget.availableTokens <= 0) return
       const pressure = pressureTokensOf(manifest.budget) / manifest.budget.availableTokens
-      if (pressure < limits.compactionPrecomputePressure) return
+      if (pressure < liveLimits().compactionPrecomputePressure) return
       const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
       if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
       const window = compactionWindowOf(entry)
       // Sized as sent: the identity pair, and without images for a text-only model.
-      assertFitsWindow(handoffSnapshot(snapshot, snapshot.identity, compactionVisionOf(entry)), { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
+      assertFitsWindow(handoffSnapshot(snapshot, snapshot.identity, compactionVisionOf(entry)), { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: liveLimits().compactionOutputTokens })
       void candidates.start(snapshot, candidateLifetime.signal).catch(() => {})
     } catch {
       // Too large to summarize in one request, or the session is going away: not a candidate.
@@ -1929,7 +2093,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // A completed turn's last clean request becomes a persisted snapshot. This runs
   // after `turn/end` is durable (agent/turn-settled), never on stream EOF.
   kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
-    if (!limits.compactionEffectiveEnabled || reason !== 'completed' || compactionClosing) return
+    if (!liveLimits().compactionEffectiveEnabled || reason !== 'completed' || compactionClosing) return
     const scope = agentScope.getStore()
     if (scope?.sessionId === undefined || scope.childOf !== undefined) return
     const entry = sessions.get(scope.sessionId)
@@ -1945,7 +2109,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         events,
         turnId,
         pending,
-        finalAnswer: { role: 'assistant', content: answer.content },
+        // Phase 05: one shared rule for every handoff path (see handoffAnswer).
+        finalAnswer: handoffAnswer(answer),
         identity: compactionIdentity(entry, requestPrefixHash({ messages: pending.request.messages, ...(pending.request.tools !== undefined ? { tools: pending.request.tools } : {}) })),
         store: snapshotStore,
       })
@@ -1963,7 +2128,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   })
 
   kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
-    if (limits.automaticCompactionPressure <= 0 || reason !== 'completed' || compactionClosing) return
+    // The threshold is read at each settled decision; a running compaction is never re-judged.
+    const pressure = liveLimits().automaticCompactionPressure
+    if (pressure <= 0 || reason !== 'completed' || compactionClosing) return
     const scope = agentScope.getStore()
     if (scope?.sessionId === undefined || scope.workspaceId === undefined || scope.childOf !== undefined) return
     const entry = sessions.get(scope.sessionId)
@@ -1973,7 +2140,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     if (manifest === undefined) return
     const { availableTokens } = manifest.budget
     const latest = latestCalibration(entry.session.committedEvents, { model: manifest.model, provider: manifest.provider })
-    if (availableTokens <= 0 || settledPressureTokens(manifest, latest) / availableTokens < limits.automaticCompactionPressure) return
+    if (availableTokens <= 0 || settledPressureTokens(manifest, latest) / availableTokens < pressure) return
     const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
     if (boundary === undefined || automaticBoundaries.get(scope.sessionId) === boundary.seq) return
     automaticBoundaries.set(scope.sessionId, boundary.seq)
@@ -2090,9 +2257,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       await disableMcpForTurn(scope, workspaceId, error)
     }
     const contents = [...claim.contents]
-    // A hook rewake is hook data, not a prompt: it never reaches the prompt
-    // hooks and is never expanded as a slash command.
-    const isRewake = (index: number): boolean => claim.origins?.[index] === 'hook'
+    // Host input (a hook rewake, a background child's report) is data, not a
+    // prompt: it never reaches the prompt hooks and is never expanded as a
+    // slash command.
+    const isRewake = (index: number): boolean => claim.origins?.[index] !== undefined
     const prompts = contents.filter((_, index) => !isRewake(index))
     // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
     // first turn fires SubagentStart instead (matcher = agent type).
@@ -2178,7 +2346,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       scope.workspaceId,
       scope.sessionId,
       state.turnId,
-      { timeoutMs: limits.delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
+      // Captured as this join starts; a later update never re-times it.
+      { timeoutMs: liveLimits().delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
     )
     return handles !== undefined && handles.length > 0 ? formatChildReports(handles) : undefined
   })
@@ -2533,7 +2702,8 @@ ${entry.description}`.toLowerCase().includes(query))
       return { bytes, mediaType: sniffImageMediaType(bytes) ?? 'application/octet-stream' }
     },
     resolvePath: (exec, target) => resolveInGrants(exec, target, 'read'),
-    maxBytes: limits.maxAttachmentBytes,
+    // Captured when the tools register: generated images keep the startup cap.
+    maxBytes: liveLimits().maxAttachmentBytes,
   }
   kernel.ctx.tools.register(generateImageTool(imageToolOptions))
   kernel.ctx.tools.register(editImageTool(imageToolOptions))
@@ -2552,7 +2722,7 @@ ${entry.description}`.toLowerCase().includes(query))
     store: (workspaceId, body, signal) => videos.putStream(workspaceId, body, signal),
     read: imageToolOptions.read,
     resolvePath: imageToolOptions.resolvePath,
-    maxImageBytes: limits.maxAttachmentBytes,
+    maxImageBytes: liveLimits().maxAttachmentBytes,
   }))
 
   // AskUserQuestion: the model pauses for a human choice. The question
@@ -2576,7 +2746,9 @@ ${entry.description}`.toLowerCase().includes(query))
       const definitionName = scope.childOf?.definition
       const principalId = sessionPrincipals.get(scope.rootSessionId ?? scope.sessionId)
       const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
-      const expiresAt = Date.now() + limits.questionExpiryMs
+      // Captured at question creation: a pending question keeps its deadline.
+      const questionExpiryMs = liveLimits().questionExpiryMs
+      const expiresAt = Date.now() + questionExpiryMs
       let settled = false
       const finish = (apply: () => void): void => {
         if (settled) return
@@ -2593,7 +2765,7 @@ ${entry.description}`.toLowerCase().includes(query))
       }
       const timer = setTimeout(() => {
         finish(() => resolve({ kind: 'declined', reason: 'no answer before the question expired' }))
-      }, limits.questionExpiryMs)
+      }, questionExpiryMs)
       timer.unref?.()
       const onAbort = (): void => {
         finish(() => reject(new Error('cancelled: stop requested while asking the user')))
@@ -2968,9 +3140,14 @@ ${entry.description}`.toLowerCase().includes(query))
     }
     let lastToken: string | undefined
     const tokenSource = async (rejected?: string): Promise<string | undefined> => {
+      // Once shutdown begins, no refresh/rotation may persist a token: a
+      // connect left pending past the bounded cleanup must not write the
+      // OAuth store after close() resolved.
+      if (mcpHostClosing) throw new McpTransportError(`MCP server '${serverName}' unavailable: host is closing`)
       const token = rejected !== undefined
         ? await oauth.replaceRejected(workspaceId, serverName, rejected)
         : await oauth.accessToken(workspaceId, serverName)
+      if (mcpHostClosing) throw new McpTransportError(`MCP server '${serverName}' unavailable: host is closing`)
       if (token === undefined) throw new McpTransportError(`MCP server '${serverName}' auth_required: requires managed OAuth authorization`)
       lastToken = token
       return token
@@ -2981,6 +3158,7 @@ ${entry.description}`.toLowerCase().includes(query))
       tokenSource,
       replaceRejected: () => tokenSource(lastToken),
       onInsufficientScope: async (scope: string | undefined): Promise<void> => {
+        if (mcpHostClosing) return
         await oauth.markScopeRequired(workspaceId, serverName, scope).catch((error: unknown) => {
           console.warn(`web: could not record missing OAuth scope for '${serverName}': ${error instanceof Error ? error.message : String(error)}`)
         })
@@ -3074,6 +3252,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         mcpClients.set(key, client)
         mcpClientGeneration.set(key, generationAtStart)
+        mcpRuntimeGeneration.set(client, generationAtStart)
         await client.listTools()
         await reconcileMcpTools(workspaceId, serverName, client)
         client.startHealthChecks(async () => {
@@ -3086,6 +3265,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         mcpClients.set(key, client)
         mcpClientGeneration.set(key, generationAtStart)
+        mcpRuntimeGeneration.set(client, generationAtStart)
         mcpConnectFailures.delete(key)
         return client
       } catch (error) {
@@ -3185,6 +3365,10 @@ ${entry.description}`.toLowerCase().includes(query))
             throw new Error(`MCP tool '${fullName}' is not exposed in this workspace`)
           }
           const scopedClient = await ensureMcpServer(scope.workspaceId, serverName)
+          // The generation of the runtime that will carry this call, not the
+          // current counter: a fence landing in between retires that runtime,
+          // and its call is then refused unsent rather than labeled new.
+          const runtimeGeneration = mcpRuntimeGeneration.get(scopedClient) ?? generationOf(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
           // The tool pipeline mints this host identity before durable intent;
@@ -3199,7 +3383,7 @@ ${entry.description}`.toLowerCase().includes(query))
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
-              generation: generationOf(scope.workspaceId, serverName),
+              generation: runtimeGeneration,
               epoch: ownerLock.epoch,
               configRevision: scopedConfig.revision ?? 1,
               secretRevision: 1,
@@ -3210,9 +3394,14 @@ ${entry.description}`.toLowerCase().includes(query))
               return { text, isError: result.isError }
             },
           }, auditFaultFile(workspaceId))
-          const text = dispatched.output.length > 60_000
+          const truncated = dispatched.output.length > 60_000
             ? `${dispatched.output.slice(0, 60_000)}\n… [truncated ${dispatched.output.length - 60_000} chars]`
             : dispatched.output
+          // A config or secret change retired the runtime mid-call. Stopping
+          // it cannot recall a request the server may already have acted on.
+          const text = dispatched.outcome === 'indeterminate' && generationOf(scope.workspaceId, serverName) !== runtimeGeneration
+            ? `${truncated}\n\nMCP server '${serverName}' configuration changed while this call was in flight. The call may already have run on the server; it was not undone and will not be repeated.`
+            : truncated
           const session = depsRef.current?.sessions.get(scope.sessionId)?.session
           if (session !== undefined) {
             session.append({
@@ -3220,6 +3409,8 @@ ${entry.description}`.toLowerCase().includes(query))
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
+              // Hashes the model-visible text: the truncated output plus any
+              // in-flight configuration-change note, not the raw server reply.
               resultHash: auditHash(text),
               durationMs: Date.now() - started,
               isError: dispatched.outcome !== 'success',
@@ -3352,15 +3543,7 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   function stampRootMode(session: Session, resolved: ResolvedMode): Extract<SessionEvent, { type: 'session/mode' }> {
     const previous = sessionModeOf(session.events)
-    const snapshot = resolved.definition
-    session.append({
-      type: 'session/mode',
-      modeId: snapshot.id,
-      revision: (previous?.revision ?? 0) + 1,
-      snapshot,
-      source: resolved.source,
-      hash: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
-    })
+    session.append(rootModeRecord(resolved, (previous?.revision ?? 0) + 1))
     return sessionModeOf(session.events) as Extract<SessionEvent, { type: 'session/mode' }>
   }
 
@@ -3540,7 +3723,7 @@ ${entry.description}`.toLowerCase().includes(query))
       ? { turnId: armed, request: compactionRequestOf(request) }
       : undefined
     // Effective capture rides the same stream, but only for a root step that was armed at assembly.
-    const observed = limits.compactionEffectiveEnabled && scope?.childOf === undefined && scope?.turnId !== undefined
+    const observed = liveLimits().compactionEffectiveEnabled && scope?.childOf === undefined && scope?.turnId !== undefined
       ? captures.tap(sessionId, scope.turnId, upstream)
       : upstream
     return (async function* tap() {
@@ -3682,6 +3865,8 @@ ${entry.description}`.toLowerCase().includes(query))
     readonly preview?: PreviewCompaction
   }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest; commitPrefix: () => void }> {
     const { scope, projected, sideEffects, preview } = input
+    // One limits policy for this whole assembly (history tail, attachment text).
+    const assemblyLimits = liveLimits()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     const session = await scopedSession(scope?.sessionId)
     let effective = session === undefined
@@ -3844,7 +4029,7 @@ ${entry.description}`.toLowerCase().includes(query))
     // log holds references, and the model needs the content itself.
     const referenced = events.flatMap((event) => (event.type === 'user/message' ? [...(event.attachments ?? [])] : []))
     const loadedAttachments = referenced.length > 0
-      ? await attachments.load(workspaceId, referenced, { textLimit: limits.attachmentTextLimit })
+      ? await attachments.load(workspaceId, referenced, { textLimit: assemblyLimits.attachmentTextLimit })
       : undefined
 
     projected.assemblySignal?.throwIfAborted()
@@ -3881,7 +4066,7 @@ ${entry.description}`.toLowerCase().includes(query))
       activeSkills,
       ...(skillCatalog !== undefined ? { skillCatalog } : {}),
       pinnedMemory,
-      compactionRetainTokens: limits.compactionRetainTokens,
+      compactionRetainTokens: assemblyLimits.compactionRetainTokens,
       budget,
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       // The provider's last report calibrates this assembly's budget (ZCode parity).
@@ -3958,13 +4143,17 @@ ${entry.description}`.toLowerCase().includes(query))
         ...(effective.provider != null ? { providerName: effective.provider } : {}),
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
         contextId,
+        // Stable per conversation: the provider can route every request of this
+        // session to the same shard, keeping its prefix cache warm. Only a
+        // dispatched root/child request is stamped, never a preview.
+        ...(scope !== undefined ? { sessionAffinity: scope.sessionId } : {}),
       }),
       messages: assembled.messages,
       outputCeilingTokens: assembled.maxOutputTokens,
       ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}),
     }
     // Arm the effective capture with the request EXACTLY as dispatched (root steps only).
-    if (sideEffects && limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
+    if (sideEffects && assemblyLimits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
       captures.arm(scope.sessionId, scope.turnId, request, assembled.compactionProjection)
     }
     return { assembled, request, commitPrefix }
@@ -4117,7 +4306,8 @@ ${entry.description}`.toLowerCase().includes(query))
     authorityResolver: hostAuthority,
     receiptRegistry: approvalReceipts,
     defaultMode: options.defaultMode ?? 'ask',
-    expiryMs: limits.approvalExpiryMs,
+    expiryMs: liveLimits().approvalExpiryMs,
+    expiryMsOf: () => liveLimits().approvalExpiryMs,
     // The scope is the call's own (stamped on re-evaluation), never whatever
     // happens to be ambient when a settings change re-checks pending asks.
     forceAsk: (call, scope) => {
@@ -4277,6 +4467,7 @@ ${entry.description}`.toLowerCase().includes(query))
   const terminals = createTerminalService(
     options.terminals?.spawner !== undefined ? { spawner: options.terminals.spawner } : {},
   )
+  boot.teardown.push(() => terminals.disposeAll())
   const terminalsEnabled = options.terminals?.enabled ?? true
   // Resolved, not passed through: hosts are commonly started with `--root .`,
   // and a terminal reporting its cwd as "." tells a client nothing about where
@@ -4522,7 +4713,8 @@ ${entry.description}`.toLowerCase().includes(query))
     pending,
     pendingQuestions,
     staticDir,
-    limits,
+    limitsReader: appConfig,
+    appConfig,
     approvalHandle,
     dangerousGuard,
     yolo: options.yolo === true,
@@ -4705,21 +4897,14 @@ ${entry.description}`.toLowerCase().includes(query))
     })
   })
 
+  boot.teardown.push(() => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }))
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(options.port ?? 0, options.host ?? '127.0.0.1', resolve)
   })
 
   const address = server.address()
-  if (address === null || typeof address === 'string') {
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    for (const dispose of [...disposers.values(), ...providerRegistrations.values()]) dispose()
-    disposers.clear()
-    providerRegistrations.clear()
-    await kernel.stop()
-    await ownerLock.release()
-    throw new Error('web: unexpected listen address')
-  }
+  if (address === null || typeof address === 'string') throw new Error('web: unexpected listen address')
 
   const publicHost = options.host ?? '127.0.0.1'
   deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
@@ -4736,8 +4921,13 @@ ${entry.description}`.toLowerCase().includes(query))
     port: address.port,
     kernel,
     auth: deps.auth,
+    appConfig,
     close: () => closePromise ??= (async () => {
       shuttingDown = true
+      // First: from here no MCP connect may start and no OAuth token may be
+      // refreshed or saved (resolveMcpAuth's tokenSource refuses).
+      mcpHostClosing = true
+      oauth.close()
       scheduler.stop()
       compactionClosing = true
       candidateLifetime.abort(new Error('server closing'))
@@ -4745,31 +4935,80 @@ ${entry.description}`.toLowerCase().includes(query))
       processes.closeAdmission()
       kernel.ctx.agents.closeAdmission()
       for (const entry of sessions.values()) entry.agent.stop()
-      mcpHostClosing = true
       const agentDrivers = kernel.ctx.agents
       let teardownSafe = true
+      // Worst-case budget, all inside bins/web.ts SHUTDOWN_DEADLINE_MS (13.5s,
+      // below PM2 kill_timeout 15s). Every step is bounded:
+      //   operator channel 0.5 + MCP connects 0.5 + agents 1 (+1 fence)
+      //   + hooks 1 + compactions 1 + candidates 1 + processes 1.5   = 7.5s
+      //   terminals: started first, run concurrently, capped at
+      //   TERMINAL_SHUTDOWN_BUDGET_MS (4s) — so +0s on the chain    = 7.5s
+      //   persistence reserved: checkpoints 1 + process events 1
+      //   + usage‖automations 1                                      = 10.5s
+      //   HTTP close‖MCP disconnect 1 + kernel.stop 1                = 12.5s
+      //   ownerLock.release + unbounded sync steps: 1s slack         = 13.5s
+      // Stop accepting BEFORE dropping connections: a keep-alive client (undici's
+      // pool) reconnects the instant its sockets die, and a socket accepted while
+      // teardown runs would keep server.close() pending until the bounded HTTP
+      // step below times out. close() first, then sweep; the HTTP step sweeps
+      // again for anything accepted in between.
+      const httpClosed = new Promise<void>((resolve, reject) => {
+        server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())
+      })
+      httpClosed.catch(() => {})
+      const terminalsDone = (async () => {
+        server.closeAllConnections()
+        try {
+          await terminals.disposeAll()
+        } catch (error) {
+          // Report survivors (PIDs/session ids) now: a later step or the host
+          // deadline must not be able to swallow this.
+          console.error('terminal teardown incomplete at shutdown:', error instanceof Error ? error.message : error)
+          throw error
+        }
+      })()
+      // Rejection is consumed by the awaiting step below, never left unhandled.
+      terminalsDone.catch(() => {})
       await runCleanup([
-        async () => { await retireOperatorChannel?.() },
+        async () => { await boundedCleanup(async () => { await retireOperatorChannel?.() }, 500) },
         async () => {
           for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
-          await Promise.allSettled([...mcpConnecting.values()])
+          // A connect still pending after this bound is not retained ownership:
+          // it is marked cancelled (re-checked before it can publish), and any
+          // client it created is already in `mcpClients`, which the HTTP‖MCP
+          // disconnect step below tears down. A slow initialize must not fail
+          // shutdown (regression from 7059b43; server-g5 close race).
+          await boundedCleanup(async () => { await Promise.allSettled([...mcpConnecting.values()]) }, 500).catch(() => {
+            // Keys are `${workspaceId}:${serverName}` — no secrets.
+            const pending = [...mcpConnecting.keys()]
+            if (pending.length > 0) console.warn(`web: shutdown left ${pending.length} MCP connect(s) pending (cancelled): ${pending.join(', ')}`)
+          })
         },
-        () => { server.closeAllConnections(); terminals.disposeAll() },
-        () => agentDrivers.stopAll(),
+        () => agentDrivers.stopAll({ timeoutMs: 1_000 }),
         async () => { await boundedCleanup(() => backgroundHooks.closeAll()) },
         async () => { await boundedCleanup(async () => { await Promise.allSettled([...compactions.values()].flatMap((reservation) => reservation.done === undefined ? [] : [reservation.done])) }) },
         async () => { await boundedCleanup(() => candidates?.close() ?? Promise.resolve()) },
-        () => processes.disposeAll(),
+        async () => { await boundedCleanup(() => processes.disposeAll(), 1_500) },
+        () => terminalsDone,
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
-        async () => { await boundedCleanup(() => usageLog.flush()) },
-        async () => { await boundedCleanup(() => automations.flush()) },
-        () => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())),
         async () => {
-          const results = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
+          const results = await Promise.allSettled([boundedCleanup(() => usageLog.flush()), boundedCleanup(() => automations.flush())])
+          const errors = results.filter(result => result.status === 'rejected')
+          if (errors.length) throw new AggregateError(errors, 'log flush failed')
+        },
+        async () => {
+          const results = await Promise.allSettled([
+            boundedCleanup(() => { server.closeAllConnections(); return httpClosed }),
+            boundedCleanup(async () => {
+              const disconnects = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
+              const failed = disconnects.filter(result => result.status === 'rejected')
+              if (failed.length) throw new AggregateError(failed, 'MCP teardown failed')
+            }),
+          ])
           mcpClients.clear()
           const errors = results.filter(result => result.status === 'rejected')
-          if (errors.length) throw new AggregateError(errors, 'MCP teardown failed')
+          if (errors.length) throw new AggregateError(errors, 'HTTP/MCP teardown failed')
         },
         () => {
           const errors: unknown[] = []
@@ -4805,7 +5044,10 @@ interface HandlerDeps {
   /** Live AskUserQuestion waiters, answered by `POST /api/questions/:id`. */
   readonly pendingQuestions: Map<string, PendingQuestion>
   readonly staticDir: string
-  readonly limits: HarnessLimits
+  /** Live limits; each bound is read at its own enforcement point. */
+  readonly limitsReader: LimitsReader
+  /** Global configuration coordinator behind the `/api/app-config` routes. */
+  readonly appConfig: AppConfigService
   readonly approvalHandle: ApprovalHandle
   readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>
   readonly yolo: boolean
@@ -6238,9 +6480,9 @@ async function handleApi(
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
           // Revoke locally first so a racing refresh cannot write the grant back;
           // the same call also asks the provider to void the token.
-          if (managed) await deps.oauth.revoke(wsId, serverName, revocationEndpoint)
+          const revocation = managed ? await deps.oauth.revoke(wsId, serverName, revocationEndpoint) : undefined
           await deps.oauthStore.deleteServer(wsId, serverName)
-          send(200, { deleted: serverName })
+          send(200, { deleted: serverName, ...(revocation !== undefined ? { revocation } : {}) })
           return
         }
         if (req.method === 'POST' && serverName !== undefined && action === undefined) {
@@ -6468,33 +6710,32 @@ async function handleApi(
         const value = body['value']
         await deps.updateMcpSecrets(wsId, (secrets) => { secrets[key] = value })
         // Rotation reconnects AFFECTED enabled servers before responding.
-        const config = await deps.mcpStore.loadMcp(wsId)
-        const ref = `\${${key}}`
-        const affected = Object.values(config.servers).filter((server) => {
-          if (!server.enabled) return false
-          const values = [
-            ...Object.values(server.env ?? {}),
-            ...Object.values(server.headers ?? {}),
-            ...(authSecretRef(server.auth) !== undefined ? [authSecretRef(server.auth) as string] : []),
-          ]
-          return values.includes(ref)
-        })
+        const affected = serversUsingSecret(await deps.mcpStore.loadMcp(wsId), key, { enabledOnly: true })
         try {
-          for (const server of affected) {
-            await deps.cancelMcpConnection(wsId, server.name)
-            deps.mcpCancelled.delete(`${wsId}:${server.name}`)
-            await deps.ensureMcpServer(wsId, server.name)
+          for (const name of affected) {
+            await deps.cancelMcpConnection(wsId, name)
+            deps.mcpCancelled.delete(`${wsId}:${name}`)
+            await deps.ensureMcpServer(wsId, name)
           }
         } catch (error) {
           send(502, { error: `secret rotated but affected MCP server failed to reconnect: ${String(error instanceof Error ? error.message : error)}` })
           return
         }
-        send(200, { rotated: key, reconnected: affected.map((server) => server.name) })
+        send(200, { rotated: key, reconnected: affected })
         return
       }
       if (req.method === 'DELETE' && key !== undefined) {
+        // The write fences the workspace before it is acknowledged: no new
+        // dispatch runs on a runtime built from the deleted value. Nothing is
+        // revoked at the secret's issuer — a plain secret has no revocation
+        // endpoint here — so that is reported apart from the local fence.
         await deps.updateMcpSecrets(wsId, (secrets) => { delete secrets[key] })
-        send(200, { deleted: key })
+        send(200, {
+          deleted: key,
+          localFence: 'fenced',
+          affectedServers: serversUsingSecret(await deps.mcpStore.loadMcp(wsId), key),
+          remoteRevocation: 'not_applicable',
+        })
         return
       }
       send(405, { error: 'method not allowed' })
@@ -6525,6 +6766,15 @@ async function handleApi(
         }
         const wsId = implicitWorkspace(deps)
         const session = deps.kernel.ctx.sessions.create(wsId)
+        // Like any new root, it owns a snapshot of the workspace default mode.
+        deps.stampRootMode(session, deps.controlsFor(wsId).modeDefinition)
+        try {
+          await session.durable()
+        } catch (error) {
+          await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
+          send(500, { error: `session mode snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
+          return
+        }
         deps.sessions.set(session.id, {
           session,
           agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId }),
@@ -6684,6 +6934,9 @@ async function handleApi(
       return
     }
 
+    // ── global configuration (limits) ────────────────────────
+    if (await handleAppConfigApi(req, pathname, deps.appConfig, send, readJson)) return
+
     // ── global provider/model defaults ───────────────────────
     if (pathname === '/api/model-defaults') {
       if (req.method === 'GET') {
@@ -6712,7 +6965,12 @@ async function handleApi(
         return
       }
       if (req.method === 'PUT') {
-        const checked = validatePairBody(await readJson(req), (id) => deps.providers().some((entry) => entry.id === id))
+        // Speech-to-text may point at an stt-only provider; the other pairs
+        // drive chat-adjacent endpoints and stay on chat providers.
+        const eligible = pairRoute.name === 'speech-to-text'
+          ? (id: string) => deps.providers().some((entry) => entry.id === id && servesKind(entry, 'stt'))
+          : (id: string) => deps.providers().some((entry) => entry.id === id && servesKind(entry, 'chat'))
+        const checked = validatePairBody(await readJson(req), eligible)
         if (!checked.ok) {
           send(400, { error: checked.error })
           return
@@ -6733,6 +6991,33 @@ async function handleApi(
     // Settings → Usage: daily token rows across every workspace.
     if (pathname === '/api/usage' && req.method === 'GET') {
       send(200, deps.usageLog.daily())
+      return
+    }
+
+    // Composer dictation: raw audio bytes in, text out. The configured
+    // provider sees the audio; this server only proxies, it never stores.
+    if (pathname === '/api/speech-to-text/transcribe' && req.method === 'POST') {
+      const resolved = resolveSttApi(deps.modelPair('speech-to-text'), deps.providers())
+      if (!resolved.ok) {
+        send(400, { error: resolved.reason })
+        return
+      }
+      const maxBytes = deps.limitsReader.read().values.maxAttachmentBytes
+      // A declared oversize body is refused before reading it, so the client
+      // gets the 413; a chunked body that overflows is cut off mid-read.
+      const declared = Number(req.headers['content-length'])
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        send(413, { error: `audio exceeds the ${maxBytes} byte limit` })
+        return
+      }
+      try {
+        const bytes = await readBytes(req, maxBytes)
+        const text = await transcribe(resolved.config, bytes, { language: languageOf(req.url) })
+        send(200, { text })
+      } catch (error) {
+        if (error instanceof AttachmentError) send(413, { error: `audio exceeds the ${maxBytes} byte limit` })
+        else send(502, { error: `transcription failed: ${String(error instanceof Error ? error.message : error)}` })
+      }
       return
     }
 
@@ -7608,7 +7893,8 @@ async function handleApi(
       if (view === null) {
         res.writeHead(204); res.end(); return
       }
-      send(200, { ...view, ...(deps.limits.automaticCompactionPressure > 0 ? { policy: { automaticCompactionPressure: deps.limits.automaticCompactionPressure } } : {}) })
+      const { automaticCompactionPressure } = deps.limitsReader.read().values
+      send(200, { ...view, ...(automaticCompactionPressure > 0 ? { policy: { automaticCompactionPressure } } : {}) })
       return
     }
 
@@ -7726,12 +8012,14 @@ async function handleApi(
         if (id === undefined && req.method === 'POST') {
           requireWorkspace(deps, wsId, true) // archived: no new content
           const name = decodeURIComponent(String(req.headers['x-file-name'] ?? '')).trim()
-          const bytes = await readBytes(req, deps.limits.maxAttachmentBytes)
+          // One cap per upload, captured before the body is read and shared by store validation.
+          const maxBytes = deps.limitsReader.read().values.maxAttachmentBytes
+          const bytes = await readBytes(req, maxBytes)
           const stored = await deps.attachments.put(wsId, {
             name: name === '' ? 'attachment' : name,
             mediaType: String(req.headers['content-type'] ?? ''),
             bytes,
-          })
+          }, { maxBytes })
           send(201, stored)
           return
         }
@@ -7854,7 +8142,7 @@ async function handleApi(
             return
           }
           // `NaN < 1` is false, so a bare range check lets NaN and Infinity
-          // through to node-pty, which throws a plain Error and turns a bad
+          // through to the PTY backend, which throws a plain Error and turns a bad
           // request into a 500.
           const cols = terminalDimension(body['cols'])
           const rows = terminalDimension(body['rows'])
@@ -7872,14 +8160,20 @@ async function handleApi(
           return
         }
         if (req.method === 'DELETE') {
-          deps.terminals.kill(id)
+          // Answers only once the shell is physically gone; a teardown that
+          // could not be proven is an explicit failure the client can retry.
+          await deps.terminals.kill(id)
           send(200, { killed: true })
           return
         }
         send(405, { error: 'method not allowed' })
       } catch (error) {
         if (!(error instanceof TerminalError)) throw error
-        const status = error.code === 'unavailable' ? 501 : error.code === 'not-found' ? 404 : 400
+        if (error.code === 'teardown-failed') {
+          send(500, { killed: false, error: error.message })
+          return
+        }
+        const status = error.code === 'unavailable' ? 501 : error.code === 'not-found' ? 404 : error.code === 'closing' ? 409 : 400
         send(status, { error: error.message })
       }
       return
@@ -8315,6 +8609,8 @@ async function handleApi(
 
     // ── provider registry (app-wide; selection is per workspace) ──
     if (req.method === 'GET' && pathname === '/api/providers') {
+      // The Settings rail edits every entry; stt-only ones simply never enter
+      // the chat lists below and are marked so the Voice panel can find them.
       send(200, deps.providers().map(publicProvider))
       return
     }
@@ -9447,19 +9743,20 @@ async function acceptMessage(
 }
 
 /**
- * Queue an `asyncRewake` hook's result for a root conversation: durable
- * `input/queued` with `origin: 'hook'`, then the same drain a queued message
- * uses — an idle conversation wakes, a running turn keeps it queued behind
- * it, nothing is ever steered. False when the conversation cannot take it
- * (child, closed, unavailable, no model, queue full).
+ * Queue host input for a root conversation — an `asyncRewake` hook's result
+ * (`hook`) or a background child's report (`child`): durable `input/queued`
+ * with that origin, then the same drain a queued message uses — an idle
+ * conversation wakes, a running turn keeps it queued behind it, nothing is
+ * ever steered. False when the conversation cannot take it (child, closed,
+ * unavailable, no model, queue full).
  */
-async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: string, summary: string): Promise<boolean> {
+async function queueHostInput(entry: SessionEntry, deps: HandlerDeps, content: string, origin: 'hook' | 'child', summary: string, childSessionId?: string): Promise<boolean> {
   if (entry.closed || deps.unavailableSessions.has(entry.session.id)) return false
   if (entry.session.events.some((event) => event.type === 'session/child-meta')) return false
   const effectiveModel = deps.resolveEffectiveModel(entry.session, entry.workspaceId)
   if (effectiveModel.model === undefined || effectiveModel.model === null || effectiveModel.provider === undefined || effectiveModel.provider === null) return false
   const stillPending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
-  if (stillPending.length >= deps.limits.maxPendingInputs) return false
+  if (stillPending.length >= deps.limitsReader.read().values.maxPendingInputs) return false
   const inputId = newInputId()
   const runsNow = !entry.agent.busy
     && !deps.childExecutor.delegationPending(entry.session.id)
@@ -9469,8 +9766,9 @@ async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: 
     type: 'input/queued',
     inputId,
     content,
-    origin: 'hook',
+    origin,
     summary,
+    ...(childSessionId !== undefined ? { childSessionId } : {}),
     ...(runsNow ? { runsNow: true as const } : {}),
   })
   await entry.session.durable()
@@ -9506,7 +9804,7 @@ async function submitMessage(
     return { ok: false, status: 400, error: "'delivery' must be 'queue' or 'steer'" }
   }
   const delivery: 'queue' | 'steer' = rawDelivery === 'steer' ? 'steer' : 'queue'
-  const parsedAttachments = parseAttachments(body['attachments'], deps.limits.maxAttachmentsPerMessage)
+  const parsedAttachments = parseAttachments(body['attachments'], deps.limitsReader.read().values.maxAttachmentsPerMessage)
   if (!parsedAttachments.ok) return parsedAttachments
   const refs = parsedAttachments.refs
   // An attachment is a message on its own; only a wholly empty submission is
@@ -9558,9 +9856,12 @@ async function submitMessage(
 
   // Bound check before anything is adopted or stopped: a refused message
   // leaves the agent and the running turn exactly as they were.
+  // The bound is read here, synchronously with the durable append below: a
+  // lowered bound refuses new admissions and never drops accepted inputs.
   const stillPending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
-  if (stillPending.length >= deps.limits.maxPendingInputs) {
-    return { ok: false, status: 429, error: `too many queued inputs (limit ${deps.limits.maxPendingInputs})` }
+  const maxPendingInputs = deps.limitsReader.read().values.maxPendingInputs
+  if (stillPending.length >= maxPendingInputs) {
+    return { ok: false, status: 429, error: `too many queued inputs (limit ${maxPendingInputs})` }
   }
 
   // Durable acceptance before the driver sees the input, and before a steer
@@ -9633,7 +9934,7 @@ async function amendQueuedInput(
     // Present means replacement (an empty array drops them); absent means the
     // queued list rides along. Same validation a sent message's refs get.
     if (body['attachments'] !== undefined) {
-      const parsed = parseAttachments(body['attachments'], deps.limits.maxAttachmentsPerMessage)
+      const parsed = parseAttachments(body['attachments'], deps.limitsReader.read().values.maxAttachmentsPerMessage)
       if (!parsed.ok) return parsed
       for (const ref of parsed.refs) {
         try {
@@ -10016,7 +10317,9 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
     ...(deps.yolo ? { yolo: true } : {}),
     mode: { id: state.modeDefinition.definition.id, name: state.modeDefinition.definition.name, revision: state.modeRevision },
     projects,
-    providers: deps.providers().map(publicProvider),
+    // Chat surfaces (composer picker, Environment panel) consume this list:
+    // stt-only providers stay out of it; the Voice panel reads /api/providers.
+    providers: deps.providers().filter((entry) => servesKind(entry, 'chat')).map(publicProvider),
     ...(folder !== undefined ? { folder } : {}),
   }
 }
@@ -10138,14 +10441,14 @@ function compactionRequestOf(request: ModelRequest): ModelRequest {
  * exactly that turn's last model request. Anything else (a failed or
  * cancelled later turn, a different turn, no text answer) returns undefined.
  */
-function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): string | undefined {
+function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): { readonly content: string; readonly reasoning?: ReasoningPayload } | undefined {
   const end = events.findLast((event) => event.type === 'turn/end')
   if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
   const start = events.findLast((event) => event.type === 'turn/start' && event.turnId === prefix.turnId)
   if (start === undefined) return undefined
   const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
   if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
-  return answer.content
+  return { content: answer.content, ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}) }
 }
 
 /**
@@ -10262,11 +10565,13 @@ async function createProvider(
   if (name === '') return { ok: false, status: 400, error: "body needs a non-empty string 'name'" }
   if (baseUrl === '' || !/^https?:\/\//.test(baseUrl)) return { ok: false, status: 400, error: `'${baseUrl}' is not an http(s) URL` }
   const models = Array.isArray(body['models']) ? (body['models'] as unknown[]).filter((model): model is string => typeof model === 'string') : []
+  const kinds = parseKinds(body['kinds'])
   const entry = await deps.mutateProviderStore(({ providers, defaults }) => {
     const base = slugify(name); let id = base; let bump = 2
     while (providers.some((candidate) => candidate.id === id)) id = `${base}-${bump++}`
     const created: ProviderConfig = {
       id, name, baseUrl: baseUrl.replace(/\/$/, ''), apiKey, models, enabled: true,
+      ...(kinds !== undefined ? { kinds } : {}),
       ...((): { modelSettings?: Record<string, ModelSettings> } => {
         const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
         return sanitized !== undefined ? { modelSettings: sanitized } : {}
@@ -10297,6 +10602,10 @@ async function patchProvider(
     if (typeof body['apiKey'] === 'string') entry = { ...entry, apiKey: body['apiKey'].trim() }
     if (typeof body['enabled'] === 'boolean') entry = { ...entry, enabled: body['enabled'] }
     if (models !== undefined) entry = { ...entry, models }
+    if (body['kinds'] !== undefined) {
+      const kinds = parseKinds(body['kinds'])
+      entry = kinds === undefined ? (() => { const { kinds: _dropped, ...rest } = entry; void _dropped; return rest })() : { ...entry, kinds }
+    }
     if (isRecord(body['modelSettings']) || isRecord(body['contextLimits'])) {
       const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
       if (sanitized !== undefined) entry = { ...entry, modelSettings: sanitized }
@@ -10467,6 +10776,22 @@ function withoutRestorationText(event: Extract<SessionEvent, { type: 'compaction
 }
 
 /**
+ * The client frame of a durable event. Phase 05 audit: an assistant message's
+ * stored `reasoning` is a provider-bound replay payload, not UI data; the UI
+ * already shows thinking from `assistant/chunk` events (unchanged), so the
+ * SSE stream never multiplies that disclosure with a second copy.
+ */
+export function clientEvent(event: SessionEvent): SessionEvent {
+  if (event.type === 'compaction/restoration') return withoutRestorationText(event)
+  if (event.type === 'assistant/message' && event.reasoning !== undefined) {
+    const { reasoning: _reasoning, ...rest } = event
+    void _reasoning
+    return rest
+  }
+  return event
+}
+
+/**
  * The replay profile a fresh SSE client needs: `context/body` payloads (fetched
  * on demand by hash) are dropped, content chunks of steps that later carry a
  * durable `assistant/message` are dropped, and reasoning chunks fold to one
@@ -10492,8 +10817,8 @@ function compactReplayEvents(events: readonly SessionEvent[], heldCompactionSeq 
   for (const event of events) {
     if (heldCompactionSeq > 0 && event.seq >= heldCompactionSeq) break
     if (event.type === 'context/body') continue
-    if (event.type === 'compaction/restoration') {
-      compacted.push(withoutRestorationText(event))
+    if (event.type === 'compaction/restoration' || event.type === 'assistant/message') {
+      compacted.push(clientEvent(event))
       continue
     }
     if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
@@ -10700,8 +11025,12 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
   reconcileInterruptedProcesses(entry, deps)
 
+  const streamUrl = new URL(req.url ?? '/', 'http://localhost')
+  // `view=delegations` is an opt-in wire projection for a parent the client only
+  // reads delegation facts from; canonical records and default clients stay intact.
+  const delegationsOnly = streamUrl.searchParams.get('view') === 'delegations'
   // Native reconnect headers supersede the initial cached-navigation cursor.
-  const rawCursor = req.headers['last-event-id'] ?? new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor')
+  const rawCursor = req.headers['last-event-id'] ?? streamUrl.searchParams.get('cursor')
   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1
@@ -10717,7 +11046,12 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     }
     return 0
   }
-  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event })
+  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: clientEvent(event) })
+  // Live and released session frames honor the same projection as the replay.
+  const streamSessionFrame = (envelope: WebEnvelope, sequence: number | undefined): void => {
+    if (envelope.kind === 'session' && replayView([envelope.event], delegationsOnly).length === 0) return
+    streamFrame(envelope, sequence)
+  }
   const heldSeq = findHeldCompaction()
   // The replay below stops before the held success, so the success and the
   // tail already appended behind it seed the queue: they ship on commit.
@@ -10728,7 +11062,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // filtering and its own compaction keep working unchanged. A held compaction
   // success also cuts the replay tail: reconnect must not see the uncommitted
   // state either.
-  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events], held?.seq ?? 0)
+  const replay = compactReplayEvents([...replayView(resumable ? session.events.filter((event) => event.seq > cursor) : session.events, delegationsOnly)], held?.seq ?? 0)
   streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, held === undefined ? latest : (held.seq - 1))
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
@@ -10759,8 +11093,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     if (event.type === 'compaction/end' && event.error !== undefined) {
       const dropped = held
       held = undefined
-      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamFrame(envelope, sequence)
-      streamFrame(frame, event.seq)
+      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamSessionFrame(envelope, sequence)
+      streamSessionFrame(frame, event.seq)
       return
     }
     if (held !== undefined) {
@@ -10774,7 +11108,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
       held = { seq: event.seq, queue: [{ envelope: frame, sequence: event.seq }] }
       return
     }
-    streamFrame(frame, event.seq)
+    streamSessionFrame(frame, event.seq)
   })
   // The commit releases the hold: drain the queued prefix in seq order.
   const disposeDurable = deps.kernel.ctx.on('session/durable', (emitter) => {
@@ -10782,7 +11116,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     if (session.committedSeq < held.seq) return
     const draining = held
     held = undefined
-    for (const { envelope, sequence } of draining.queue) streamFrame(envelope, sequence)
+    for (const { envelope, sequence } of draining.queue) streamSessionFrame(envelope, sequence)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {

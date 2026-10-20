@@ -1,3 +1,7 @@
+---
+status: completed
+---
+
 # Plan: Settings → Usage tab
 
 Spec: `docs/superpowers/specs/2026-10-08-usage-stats-tab-design.md`

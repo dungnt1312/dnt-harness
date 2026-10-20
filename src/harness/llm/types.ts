@@ -32,10 +32,18 @@ export class ProviderError extends Error {
   transportSettled = true
   readonly retryAfterMs: number | undefined
   readonly status: number | undefined
+  /**
+   * Adapter-internal request classification, finer than `reason` (which is a
+   * persisted public vocabulary): e.g. `output_cap_rejected` keeps reason
+   * `unknown` — terminal, never squeezed — while saying why. Absent when the
+   * adapter had nothing more specific to say. Never persisted.
+   */
+  readonly classification: ProviderErrorClassification | undefined
 
-  constructor(message: string, options?: { readonly retryAfterMs?: number; readonly status?: number; readonly transient?: boolean; readonly contextExceeded?: boolean; readonly reason?: ProviderErrorReason; readonly phase?: ProviderErrorPhase }) {
+  constructor(message: string, options?: { readonly retryAfterMs?: number; readonly status?: number; readonly transient?: boolean; readonly contextExceeded?: boolean; readonly reason?: ProviderErrorReason; readonly phase?: ProviderErrorPhase; readonly classification?: ProviderErrorClassification }) {
     super(message)
     this.name = 'ProviderError'
+    this.classification = options?.classification
     this.retryAfterMs = typeof options?.retryAfterMs === 'number' && Number.isFinite(options.retryAfterMs) && options.retryAfterMs >= 0 ? Math.min(30_000, Math.ceil(options.retryAfterMs)) : undefined
     this.status = Number.isSafeInteger(options?.status) && options!.status! >= 100 && options!.status! <= 599 ? options?.status : undefined
     this.reason = options?.reason ?? (options?.contextExceeded ? 'context_exceeded' : 'unknown')
@@ -68,6 +76,29 @@ export type ContentPart =
       readonly name?: string
     }
 
+/**
+ * The model's reasoning for one assistant message, kept apart from `content`.
+ * Recorded for any provider that streams reasoning, and sent back on later
+ * requests (see `reasoning.ts`).
+ *
+ * - `field`: the wire field the reasoning arrived under (`reasoning_content`,
+ *   `reasoning`, …); replayed under the same field to the same provider/model.
+ *   Absent on records written before it existed.
+ * - `complete`: the attempt reached a valid semantic completion other than an
+ *   output-token cutoff. A `length` reply is `false` and is never replayed.
+ * - `source`: the provider and model that produced it (`reasoningSourceFor`).
+ *   Another route still receives the text, but picks its own field.
+ * - `redacted`: secret-shaped substrings were masked before persistence, so the
+ *   text is not byte-faithful to what the provider streamed.
+ */
+export interface ReasoningPayload {
+  readonly text: string
+  readonly field?: string
+  readonly complete: boolean
+  readonly source: string
+  readonly redacted?: true
+}
+
 /** One message in model history. */
 export interface ModelMessage {
   readonly role: 'system' | 'user' | 'assistant' | 'tool'
@@ -77,6 +108,8 @@ export interface ModelMessage {
   readonly toolCalls?: readonly ToolCall[]
   /** Which call this result answers; tool messages only. */
   readonly toolCallId?: string
+  /** Durable reasoning of an assistant message; the adapter decides the wire field. */
+  readonly reasoning?: ReasoningPayload
 }
 
 /**
@@ -137,21 +170,33 @@ export interface ModelRequest {
   readonly squeeze?: number
   /**
    * Output-token budget this request asks for. It can only LOWER the cap an
-   * adapter would send (catalog or operator value); it never raises one.
+   * adapter would send (operator, catalog, or the 32,000-token fallback that
+   * the adapter may relearn once per route); it never raises one. When the
+   * adapter learned to send no cap, it is the request's own bound.
    * Absent keeps ordinary behavior. Invalid values are ignored.
    */
   readonly maxOutputTokens?: number
   /**
    * Host-only ceiling (remaining context window after input and margin). It
-   * lowers a cap the adapter would send anyway but never invents one, so a
-   * model with no known output limit keeps the gateway default.
+   * bounds an existing output cap and never invents one; a value below 1 means
+   * no room is left and the adapter refuses before the network.
    */
   readonly outputCeilingTokens?: number
+  /**
+   * Host-stamped stable identity of the conversation for provider-side cache
+   * affinity. Folded into affinity headers, and — only where the endpoint
+   * declares support — into `prompt_cache_key`. Never serialized as itself.
+   */
+  readonly sessionAffinity?: string
 }
 
 export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'
 export type CompletionPolicy = 'strict' | 'finish-eof' | 'legacy-iterable'
 export type ProviderErrorReason = 'cancelled' | 'connect' | 'read' | 'reset' | 'first_progress_timeout' | 'idle_timeout' | 'total_timeout' | 'rate_limit' | 'server_error' | 'auth_configuration' | 'quota' | 'context_exceeded' | 'malformed_protocol' | 'invalid_tool_input' | 'incomplete_completion' | 'output_limit' | 'length' | 'content_filter' | 'unknown'
+/** See {@link ProviderError.classification}. */
+// `reasoning_replay_rejected`: the endpoint refused history whose reasoning it
+// requires back. Public reason stays `unknown` (terminal).
+export type ProviderErrorClassification = 'context_exceeded' | 'payload_too_large' | 'output_cap_rejected' | 'missing_required_cap' | 'quota' | 'auth' | 'rate_limit' | 'server_error' | 'request' | 'reasoning_replay_rejected'
 export type ProviderErrorPhase = 'connect' | 'headers' | 'stream' | 'completion' | 'cleanup'
 export interface ModelCompletion {
   readonly type: 'completion'
@@ -159,6 +204,15 @@ export interface ModelCompletion {
   readonly transport: 'done' | 'eof' | 'legacy'
   readonly policy: CompletionPolicy
   readonly transportSettled: boolean
+  /**
+   * The provider/model the reply's reasoning belongs to (`reasoningSourceFor`).
+   * Unset: the turn loop derives it from the request.
+   */
+  readonly reasoningSource?: string
+  /** The wire field the reply's reasoning streamed under, when any did. */
+  readonly reasoningField?: string
+  /** The adapter masked secret-shaped text in this reply's thinking deltas (not byte-faithful). */
+  readonly reasoningRedacted?: true
 }
 
 /** What a provider yields while streaming one completion. */
@@ -207,4 +261,12 @@ export interface StreamOptions {
   readonly requestOwner?: import('./request-lifecycle.ts').LogicalRequest
   /** Adapter calls only after verified local transport settlement, including late cleanup. */
   readonly onTransportSettled?: () => void
+  /**
+   * Present under harness ownership: the adapter is about to send one
+   * corrective resend (a rejected guessed output cap) inside this stream call.
+   * The owner charges a physical attempt, closes the rejected attempt's record
+   * (settled, uncommitted) and opens a new one, so the log numbers it. Throws
+   * when the attempt budget is spent.
+   */
+  readonly correctiveAttempt?: (info: { readonly status: number }) => Promise<void>
 }

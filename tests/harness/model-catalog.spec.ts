@@ -8,6 +8,7 @@ import {
   applyThinkingOverride,
   bareModelId,
   defaultThinkingLevel,
+  expressibleThinkingLevel,
   formatContextLimit,
   getModelInfo,
   getReasoningCapability,
@@ -102,6 +103,16 @@ describe('reasoning capability', () => {
     expect(isThinkingLevel(3)).toBe(false)
     expect(getReasoningCapability('grok-4.3')?.canDisable).toBe(true)
   })
+
+  it('deepseek declares the whole accepted effort vocabulary so a stored level is sent, not dropped', () => {
+    // The upstream accepts minimal…max and maps them onto low/high/max itself.
+    // A level missing from the list is dropped from the wire and the request
+    // then runs whatever default the endpoint (or a relay) applies.
+    expect(getReasoningCapability('deepseek-v4.1-flash-free')?.levels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'medium')).toBe('medium')
+    expect(expressibleThinkingLevel('deepseek-v4.1-flash-free', 'minimal')).toBe('minimal')
+    expect(expressibleThinkingLevel('custom-deepseek-v4-mini', 'medium')).toBe('medium')
+  })
 })
 
 describe('applyThinkingOverride', () => {
@@ -146,10 +157,22 @@ describe('applyThinkingOverride', () => {
     expect(off).toEqual({ thinking: { type: 'disabled' } })
   })
 
+  it('deepseek forwards every declared effort level and disables on off', () => {
+    const medium = body()
+    applyThinkingOverride(medium, 'deepseek-v4.1-flash-free', 'medium')
+    expect(medium).toEqual({ reasoning_effort: 'medium' })
+    const minimal = body()
+    applyThinkingOverride(minimal, 'custom-deepseek-v4-mini', 'minimal')
+    expect(minimal).toEqual({ reasoning_effort: 'minimal' })
+    const low = body()
+    applyThinkingOverride(low, 'custom-deepseek-v4-mini', 'low')
+    expect(low).toEqual({ reasoning_effort: 'low' })
+    const off = body()
+    applyThinkingOverride(off, 'deepseek-v4.1-flash-free', 'off')
+    expect(off).toEqual({ thinking: { type: 'disabled' } })
+  })
+
   it('family fallbacks cover gateway aliases; unsupported pairs stay silent', () => {
-    const deep = body()
-    applyThinkingOverride(deep, 'custom-deepseek-v4-mini', 'low')
-    expect(deep).toEqual({ reasoning_effort: 'low' })
     const grok = body()
     applyThinkingOverride(grok, 'my-grok-4.3-turbo', 'off')
     expect(grok).toEqual({ reasoning_effort: 'none' })

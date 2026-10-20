@@ -12,6 +12,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WorkspaceService } from 'dnt-harness'
+import { detectShell } from '../../src/capabilities/shell/detect.ts'
+import { credentialProbe, gitShellPath, isolatedGitEnvironment } from '../helpers/git-test-process.ts'
 import {
   buildGitCommand,
   gitCommandArgs,
@@ -25,6 +27,7 @@ let scratch = ''
 let home = ''
 let repo = ''
 let markers = ''
+let globalConfig = ''
 const saved: Record<string, string | undefined> = {}
 
 /** Which repository-configured commands ran, by the marker each one leaves. */
@@ -47,7 +50,7 @@ function git(...args: string[]): void {
 }
 
 beforeAll(async () => {
-  scratch = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-git-trust-')))
+  scratch = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), "dnt-harness-git-trust-'space ")))
   home = path.join(scratch, 'home')
   repo = path.join(scratch, 'repo')
   markers = path.join(scratch, 'markers')
@@ -55,9 +58,16 @@ beforeAll(async () => {
   // A hermetic login shell: bash reads $HOME/.bash_profile, so the sentinel
   // below can only have come from the login-shell environment loader.
   await fs.writeFile(path.join(home, '.bash_profile'), 'export DNT_GIT_ENV_SENTINEL=from-login-shell\n')
-  for (const key of ['HOME', 'SHELL']) saved[key] = process.env[key]
+  globalConfig = path.join(scratch, 'empty.gitconfig')
+  await fs.writeFile(globalConfig, '')
+  const isolated = isolatedGitEnvironment(process.env, globalConfig)
+  for (const key of new Set(['HOME', 'SHELL', ...Object.keys(process.env).filter((key) => /^GIT_/i.test(key)), 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT', 'GIT_ASKPASS', 'SSH_ASKPASS'])) {
+    saved[key] = process.env[key]
+    if (isolated[key] === undefined) delete process.env[key]
+    else process.env[key] = isolated[key]
+  }
   process.env['HOME'] = home
-  process.env['SHELL'] = '/bin/bash'
+  process.env['SHELL'] = detectShell().executable ?? '/bin/bash'
 
   git('init', '-q', '-b', 'main')
   git('config', 'user.email', 't@t')
@@ -66,14 +76,16 @@ beforeAll(async () => {
   git('add', '.')
   git('commit', '-qm', 'init')
 
-  const mark = async (name: string): Promise<string> => script(name, `touch '${path.join(markers, name)}'`)
+  const mark = async (name: string): Promise<string> => script(name, `touch ${gitShellPath(path.join(markers, name))}`)
   await fs.writeFile(path.join(repo, 'a.txt'), 'a\nchanged\n')
   await fs.writeFile(path.join(repo, '.gitattributes'), '*.txt diff=evil\n')
-  git('config', 'core.fsmonitor', await mark('fsmonitor'))
-  git('config', 'core.sshCommand', await script('ssh', `touch '${path.join(markers, 'sshCommand')}'; exit 1`))
-  git('config', 'credential.helper', `!${await script('credential', `touch '${path.join(markers, 'credential')}'`)}`)
-  git('config', 'diff.external', await mark('external-diff'))
-  git('config', 'diff.evil.textconv', await script('textconv', `touch '${path.join(markers, 'textconv')}'; cat "$1"`))
+  git('config', 'core.fsmonitor', gitShellPath(await mark('fsmonitor')))
+  git('config', 'core.sshCommand', gitShellPath(await script('ssh', `touch ${gitShellPath(path.join(markers, 'sshCommand'))}; exit 1`)))
+  // Helpers accumulate across config scopes: an empty entry resets the list.
+  git('config', 'credential.helper', '')
+  git('config', '--add', 'credential.helper', `!${gitShellPath(await script('credential', `touch ${gitShellPath(path.join(markers, 'credential'))}\nprintf 'username=fixture\\npassword=fixture\\n'`))}`)
+  git('config', 'diff.external', gitShellPath(await mark('external-diff')))
+  git('config', 'diff.evil.textconv', gitShellPath(await script('textconv', `touch ${gitShellPath(path.join(markers, 'textconv'))}; cat "$1"`)))
   await fs.copyFile(await mark('pre-commit'), path.join(repo, '.git', 'hooks', 'pre-commit'))
   await fs.chmod(path.join(repo, '.git', 'hooks', 'pre-commit'), 0o755)
 })
@@ -83,7 +95,7 @@ afterAll(async () => {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
   }
-  await fs.rm(scratch, { recursive: true, force: true })
+  await fs.rm(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
 describe('project git trust persistence', () => {
@@ -203,17 +215,10 @@ describe('repository-configured commands', () => {
 
   it('an untrusted credential lookup does not reach the configured helper; a trusted one does', async () => {
     await clearMarkers()
-    const ask = async (trusted: boolean): Promise<void> => {
-      const env = { ...await projectGitEnvironment(repo), GIT_TERMINAL_PROMPT: '0' }
-      const child = await buildGitCommand(repo, ['credential', 'fill'], { trusted, env })
-      child.stdin.end('protocol=https\nhost=example.invalid\n\n')
-      child.stdout.resume()
-      child.stderr.resume()
-      await new Promise((resolve) => child.on('close', resolve))
-    }
-    await ask(false)
+    const env = isolatedGitEnvironment(await projectGitEnvironment(repo), globalConfig)
+    expect((await credentialProbe(repo, false, env)).code).not.toBe(0)
     expect(await markerNames()).not.toContain('credential')
-    await ask(true)
+    expect((await credentialProbe(repo, true, env)).code).toBe(0)
     expect(await markerNames()).toContain('credential')
   }, 20_000)
 })
@@ -225,14 +230,14 @@ describe('buildGitCommand', () => {
     const out: Buffer[] = []
     child.stdout.on('data', (chunk: Buffer) => out.push(chunk))
     await new Promise((resolve) => child.on('close', resolve))
-    expect(Buffer.concat(out).toString('utf8').trim()).toBe(repo)
+    expect(path.resolve(Buffer.concat(out).toString('utf8').trim())).toBe(repo)
   })
 
   it('uses the supplied environment instead of the project one', async () => {
     const child = await buildGitCommand(repo, ['var', 'GIT_AUTHOR_IDENT'], {
       trusted: true,
       stdin: 'ignore',
-      env: { PATH: process.env['PATH'] ?? '', HOME: home, GIT_AUTHOR_NAME: 'from-options', GIT_AUTHOR_EMAIL: 'o@o' },
+      env: isolatedGitEnvironment({ ...process.env, HOME: home, GIT_AUTHOR_NAME: 'from-options', GIT_AUTHOR_EMAIL: 'o@o' }, globalConfig),
     })
     const out: Buffer[] = []
     child.stdout.on('data', (chunk: Buffer) => out.push(chunk))
@@ -260,7 +265,7 @@ describe('login-shell project environment', () => {
     expect(parseNullEnvironment(Buffer.from('MULTI=a\nb\0'))).toEqual({ MULTI: 'a\nb' })
   })
 
-  it('carries what the login shell startup file exports, and PATH', async () => {
+  it.skipIf(process.platform === 'win32')('carries what the login shell startup file exports, and PATH', async () => {
     const env = await projectGitEnvironment(repo)
     expect(env['DNT_GIT_ENV_SENTINEL']).toBe('from-login-shell')
     expect(env['PATH']).toBeTruthy()
@@ -271,15 +276,15 @@ describe('login-shell project environment', () => {
     expect(first).toBe(second)
   }, 20_000)
 
-  it('a hook sees the login-shell variable when the project is trusted', async () => {
+  it.skipIf(process.platform === 'win32')('a hook sees the login-shell variable when the project is trusted', async () => {
     const hook = path.join(repo, '.git', 'hooks', 'pre-commit')
-    await fs.writeFile(hook, `#!/bin/sh\necho "$DNT_GIT_ENV_SENTINEL" > '${path.join(markers, 'hook-env')}'\n`, { mode: 0o755 })
+    await fs.writeFile(hook, `#!/bin/sh\necho "$DNT_GIT_ENV_SENTINEL" > ${gitShellPath(path.join(markers, 'hook-env'))}\n`, { mode: 0o755 })
     await clearMarkers()
     await runGitQuery(repo, ['commit', '-q', '--allow-empty', '-m', 'env'], true)
     expect((await fs.readFile(path.join(markers, 'hook-env'), 'utf8')).trim()).toBe('from-login-shell')
   }, 20_000)
 
-  it('falls back to the server environment when the login shell cannot run', async () => {
+  it.skipIf(process.platform === 'win32')('falls back to the server environment when the login shell cannot run', async () => {
     const original = process.env['SHELL']
     const missing = await fs.mkdtemp(path.join(scratch, 'fallback-'))
     // A shell that exists but prints no environment.

@@ -6,6 +6,7 @@ import { generateVideoTool, parseVideoCreate, parseVideoStatus, type GenerateVid
 import { resolveInGrants } from '../../src/capabilities/fs/grants.ts'
 import type { VideoRef } from '../../src/harness/attachments/video-store.ts'
 import type { ToolExecution } from '../../src/harness/tools/types.ts'
+import { senderHttp } from '../support/outbound-sender.ts'
 
 const MP4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.from('....-video')])
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('frame')])
@@ -44,6 +45,8 @@ function setup(fetchMock: typeof fetch, overrides: Partial<GenerateVideoOptions>
   const tool = generateVideoTool({
     resolve: () => CONFIGURED,
     fetch: fetchMock,
+    // Foreign download hops go through the policy envelope; only the final send is the mock.
+    outboundHttp: senderHttp((url, init) => fetchMock(url, init)),
     ...(realSleep ? {} : { sleep: async (ms: number) => { sleeps.push(ms) } }),
     store: async (workspaceId, body): Promise<VideoRef> => {
       const bytes = Buffer.from(await new Response(body).arrayBuffer())

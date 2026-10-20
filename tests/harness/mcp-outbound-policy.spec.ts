@@ -1,37 +1,45 @@
 import { createServer } from 'node:http'
 import { lookup } from 'node:dns/promises'
-import { expect, it, vi } from 'vitest'
+import { expect, it } from 'vitest'
+import { assertOutboundUrl, resolvePolicyAddresses } from '../../src/harness/mcp/outbound-policy.ts'
+import { OutboundHttp } from '../../src/harness/mcp/outbound-http.ts'
 
-const { lookups } = vi.hoisted(() => ({ lookups: [] as Function[] }))
-vi.mock('undici', async (original) => {
-  const actual = await original<typeof import('undici')>()
-  return { ...actual, Agent: class extends actual.Agent {
-    constructor(options: ConstructorParameters<typeof actual.Agent>[0]) {
-      super(options)
-      lookups.push((options!.connect as { lookup: Function }).lookup)
-    }
-  } }
-})
-import { assertOutboundUrl, dispatcherFor } from '../../src/harness/mcp/outbound-policy.ts'
-
-it('returns every validated DNS answer when lookup requests all addresses', async () => {
+it('resolves a loopback hostname to a vetted answer for the loopback profile', async () => {
   const addresses = await lookup('localhost', { all: true, verbatim: true })
-  const result = await new Promise((resolve, reject) => {
-    lookups[1]!('localhost', { all: true }, (error: Error | null, answer: unknown) => error ? reject(error) : resolve(answer))
-  })
-  expect(result).toEqual(addresses)
+  const vetted = await resolvePolicyAddresses('localhost', true)
+  expect(vetted.map(({ address }) => address).sort()).toEqual(addresses.map(({ address }) => address).sort())
+  await expect(resolvePolicyAddresses('localhost', false)).rejects.toThrow(/prohibited/)
 })
 
 it('connects through the loopback dispatcher using a hostname', async () => {
   const server = createServer((_req, res) => res.end('hostname works'))
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // Scoped resolver: no dependence on how the machine resolves `localhost`.
+  const http = new OutboundHttp({ resolver: async () => [{ address: '127.0.0.1', family: 4 }] })
   try {
     const address = server.address()
     if (address === null || typeof address === 'string') throw new Error('missing port')
-    const url = new URL(`http://localhost:${address.port}`)
-    const response = await fetch(url, { dispatcher: dispatcherFor(url) } as RequestInit)
+    const response = await http.request(`http://localhost:${address.port}`, { allowLoopback: true })
     expect(await response.text()).toBe('hostname works')
   } finally {
+    await http.close()
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+it('connects to an IPv4-only fixture via the real system resolver for localhost (falls back across vetted answers)', async () => {
+  // localhost commonly resolves to [::1, 127.0.0.1]; the fixture listens on IPv4 only.
+  const server = createServer((_req, res) => res.end('system localhost'))
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const http = new OutboundHttp()
+  try {
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('missing port')
+    const response = await http.request(`http://localhost:${address.port}/`, { allowLoopback: true })
+    expect(await response.text()).toBe('system localhost')
+  } finally {
+    await http.close()
     server.closeAllConnections()
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }

@@ -752,7 +752,7 @@ describe('sessions service over files', () => {
       },
       replace: async () => {},
       writeSummary: vi.fn(async () => {}),
-      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null, parentSessionId: null, lastUserActivityAt: 1 }),
+      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null, parentSessionId: null, lastUserActivityAt: 1, childRecovery: { meta: null, boundProjectId: null, children: {} }, modeFacts: { child: false, hasMode: false } }),
       list: async () => [id],
       remove,
     }

@@ -1,0 +1,79 @@
+$ opencode run --model ocproxy/deepseek-v4.1-flash-free "<prompt>"
+exit: 0
+
+Reviewed the uncommitted changes (`src/cart.js` modified, `src/sync.js` untracked).
+
+## High
+
+1. **`src/sync.js:3`** — Hardcoded live API secret `sk_live_9f4d177ab31c` committed in source. Fix: read from env (`process.env.SYNC_TOKEN`).
+2. **`src/sync.js:24`** — The secret is re-exported, widening its exposure to every importer. Fix: remove `SYNC_TOKEN` from `module.exports`.
+3. **`src/cart.js:20`** — `slice(0, length - 1)` silently drops the last item from the discount base (single-item cart discounts to 0). Fix: use `cart.items` (no `- 1`) or document the exclusion.
+
+## Medium
+
+4. **`src/cart.js:26`** — `.sort()` mutates `cart.items` in place as a side effect. Fix: sort a copy, `[...cart.items].sort(...)`.
+5. **`src/sync.js:14`** — `persist` drops the promise (no `await`/`return`), so failures become unhandled rejections. Fix: `return pushOrder(order)`.
+6. **`src/sync.js:20`** — Empty `catch {}` swallows all catalog errors silently. Fix: log or rethrow the error.
+7. **`src/sync.js:5`** — `pushOrder` never checks `res.ok` and has no error handling. Fix: throw on non-2xx responses.
+
+## Low
+
+8. **`src/cart.js:19`** — `percent` is unvalidated; >100 or negative yields nonsensical totals. Fix: clamp to `0–100`.
+9. **`src/cart.js:13,21`** — `subtotal` and `applyDiscount` duplicate the price×qty reduce. Fix: have `applyDiscount` call `subtotal(eligibleCart)`.
+10. **`src/sync.js:17`** — `refreshCatalog` returns nothing; callers can't observe the result. Fix: `return await fetch(...)`.
+
+----- stderr (opencode prints tool activity here) -----
+
+> build · deepseek-v4.1-flash-free
+
+$ git status
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/cart.js
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	src/sync.js
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+src/cart.js | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+$ git diff --cached --stat
+→ Read src\sync.js
+→ Read src\cart.js
+
+$ git diff
+diff --git a/src/cart.js b/src/cart.js
+index e2e02ce..0ec474d 100644
+--- a/src/cart.js
++++ b/src/cart.js
+@@ -1,6 +1,6 @@
+ 'use strict'
+ 
+-/** Minimal shopping cart with line totals. */
++/** Minimal shopping cart with line totals and discounts. */
+ 
+ function createCart() {
+   return { items: [] }
+@@ -16,4 +16,14 @@ function subtotal(cart) {
+   return total
+ }
+ 
+-module.exports = { createCart, addItem, subtotal }
++function applyDiscount(cart, percent) {
++  const eligible = cart.items.slice(0, cart.items.length - 1)
++  const total = eligible.reduce((sum, item) => sum + item.price * item.qty, 0)
++  return total * (1 - percent / 100)
++}
++
++function topItems(cart, count) {
++  return cart.items.sort((a, b) => b.price - a.price).slice(0, count)
++}
++
++module.exports = { createCart, addItem, subtotal, applyDiscount, topItems }
+

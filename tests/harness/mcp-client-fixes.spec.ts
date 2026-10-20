@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { McpServerClient, MCP_PROTOCOL_VERSION } from '../../src/harness/mcp/client.ts'
-import { assertOutboundUrl, outboundDispatcher } from '../../src/harness/mcp/outbound-policy.ts'
+import { assertOutboundUrl } from '../../src/harness/mcp/outbound-policy.ts'
+import { defaultOutboundHttp } from '../../src/harness/mcp/outbound-http.ts'
+import { senderHttp, type SentInit } from '../support/outbound-sender.ts'
 import { MCP_LIMITS } from '../../src/harness/mcp/limits.ts'
 import { fileURLToPath } from 'node:url'
 
@@ -9,13 +11,18 @@ afterEach(async () => {
   for (const client of clients.splice(0)) await client.disconnect()
   vi.restoreAllMocks()
 })
+type Send = (url: string, init: SentInit) => Promise<Response>
+/** The final send under the outbound policy envelope; tests swap its implementation. */
+let sender = vi.fn<Send>()
 function httpClient(tokens?: () => Promise<string | undefined>, runtime = {}) {
-  const client = new McpServerClient('fx', { name: 'fx', transport: 'http', url: 'https://example.test/mcp', enabled: true }, { tokenSource: tokens }, () => {}, runtime)
+  const outboundHttp = senderHttp((url, init) => sender(url, init))
+  const client = new McpServerClient('fx', { name: 'fx', transport: 'http', url: 'https://example.test/mcp', enabled: true }, { tokenSource: tokens }, () => {}, { ...runtime, outboundHttp })
   clients.push(client)
   return client
 }
 function mockHttp(tools: unknown[] = []) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+  sender = vi.fn<Send>()
+  return sender.mockImplementation(async (_url, init) => {
     const rpc = JSON.parse(String(init?.body)) as { id?: number; method: string }
     if (rpc.id === undefined) return new Response(null, { status: 202 })
     return new Response(JSON.stringify({ id: rpc.id, result: rpc.method === 'initialize'
@@ -54,9 +61,9 @@ function barrier<T = void>() {
 
 describe('MCP client audit regressions', () => {
   it('rejects DNS names resolving to private addresses at connection time', async () => {
-    await expect(fetch('https://localhost/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+    await expect(defaultOutboundHttp().request('https://localhost/')).rejects.toThrow()
     // A hostname distinct from the explicit localhost fixture has no private-address exception.
-    await expect(fetch('https://localhost.localdomain/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+    await expect(defaultOutboundHttp().request('https://localhost.localdomain/')).rejects.toThrow()
   })
 
   it('rejects a non-string pagination cursor before requesting another page', async () => {
@@ -74,7 +81,9 @@ describe('MCP client audit regressions', () => {
     for (const host of ['fe80::1', 'fe90::1', 'fea0::1', 'febf:ffff::1']) {
       expect(() => assertOutboundUrl(`https://[${host}]/`)).toThrow(/prohibited/)
     }
-    for (const host of ['fe7f::1', 'fec0::1']) expect(assertOutboundUrl(`https://[${host}]/`).protocol).toBe('https:')
+    // fec0::/10 (deprecated site-local) directly above is prohibited too; the next block up is not.
+    expect(() => assertOutboundUrl('https://[fec0::1]/')).toThrow(/prohibited/)
+    for (const host of ['fe7f::1', 'fe7f:ffff::1']) expect(assertOutboundUrl(`https://[${host}]/`).protocol).toBe('https:')
   })
 
   it('does not treat NAT64 embedded loopback as direct loopback', () => {
@@ -184,6 +193,27 @@ describe('MCP client audit regressions', () => {
     expect(current).not.toBe(old)
     expect(internal(client).transport).toBe(current)
     expect(client.transportsStarted).toBe(started)
+  })
+
+  it('admits callers once recovery starts even if the wall clock lags the recovery timer', async () => {
+    mockHttp()
+    const client = httpClient(undefined, { breakerDurationMs: 10, reconnectJitterMs: 0 })
+    await client.listTools()
+    const old = internal(client).transport!
+    // Timers run on the event loop's cached clock, which can be a few ms ahead
+    // of Date.now(); freeze the wall clock so the recovery timer fires "early".
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+    internal(client).openBreaker(async () => {})
+    internal(client).transport = old
+    const entered = barrier()
+    const release = barrier()
+    vi.spyOn(old, 'stop').mockImplementation(() => { entered.resolve(); return release.promise })
+    await entered.promise
+    const call = client.callTool('query', {}, 1_000)
+    release.resolve()
+    await expect(call).resolves.toBeDefined()
+    vi.mocked(Date.now).mockRestore()
+    await expect.poll(() => internal(client).recoveryRunning).toBe(false)
   })
 
   it.each(['retired', 'noncurrent', 'dead'] as const)('late success on a %s transport does not close the breaker or revive state', async (mode) => {
@@ -331,4 +361,26 @@ describe('MCP client audit regressions', () => {
     mockHttp([{ name: 'deep', inputSchema: schema }])
     await expect(httpClient().listTools()).rejects.toThrow(/schema is too deep/)
   })
+})
+
+describe('a retired client publishes nothing', () => {
+  it('a tools/list_changed refresh in flight when the generation is retired never calls back into the host', async () => {
+    const fixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
+    const client = new McpServerClient('fx', { name: 'fx', transport: 'stdio', command: process.execPath, args: [fixture], enabled: true }, {
+      env: { LIST_CHANGED_EVERY_MS: '30', LIST_DELAY_MS: '200' },
+    }, () => {})
+    clients.push(client)
+    await client.listTools()
+    const published = vi.fn(async () => {})
+    client.startHealthChecks(published)
+    await expect.poll(() => published.mock.calls.length, { timeout: 5_000, interval: 10 }).toBeGreaterThan(0)
+    // A refresh is in flight (the listing takes 200 ms; notifications keep coming).
+    await expect.poll(() => client.toolRefreshes, { timeout: 5_000, interval: 10 }).toBeGreaterThan(published.mock.calls.length)
+    // The host retires the generation first and stops the transport after;
+    // the transport is still up here, as it is between those two steps.
+    client.retire()
+    const atRetire = published.mock.calls.length
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(published.mock.calls.length).toBe(atRetire)
+  }, 15_000)
 })

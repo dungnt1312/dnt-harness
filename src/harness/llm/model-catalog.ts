@@ -30,6 +30,12 @@ export interface ReasoningCapability {
 export type ThinkingLevel = 'off' | ReasoningLevel
 
 const EFFORT_5: readonly ReasoningLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
+// DeepSeek accepts the whole effort vocabulary on the wire, but has only three
+// real tiers: `minimal` maps to `low`, `medium`/`xhigh` map to `high`, and the
+// unset default is `high` (api-docs.deepseek.com/guides/thinking_mode). Every
+// level is declared so a stored `medium` is accepted and sent explicitly
+// rather than dropped and left to whatever default a relay applies.
+const EFFORT_6: readonly ReasoningLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const GEMINI_STANDARD: readonly ReasoningLevel[] = ['low', 'medium', 'high']
 
 /** Every level a settings field or REST body may carry. */
@@ -204,7 +210,7 @@ function resolveCatalogValue<T>(
 
 const FALLBACK_REASONING: Readonly<Record<string, ReasoningCapability>> = {
   openai: { levels: EFFORT_5, canDisable: true, transportSupported: true },
-  deepseek: { levels: ['low', 'high', 'xhigh', 'max'], canDisable: true, transportSupported: true },
+  deepseek: { levels: EFFORT_6, canDisable: true, transportSupported: true },
   grok: { levels: ['low', 'medium', 'high', 'xhigh'], canDisable: true, transportSupported: true },
   glm: { levels: ['high', 'max'], canDisable: true, transportSupported: true },
   kimi: { levels: ['low', 'high', 'max'], canDisable: false, transportSupported: true },
@@ -296,6 +302,66 @@ export function getModelInfo(modelId: string | null | undefined): ModelInfo | nu
     ...(metadata ?? { kind: 'chat', vision: 'unknown' }),
     ...(reasoning !== undefined ? { reasoning } : {}),
   }
+}
+
+/**
+ * Documented output limits for families the capability catalog leaves out
+ * (it records vision/window only where verified). Only the output cap is
+ * claimed here, so these entries never change what the UI shows. Bare-id
+ * anchored: gateway prefixes (`openai/gpt-4o`) resolve through the last
+ * segment. Checked 2026-10 against vendor docs.
+ */
+const OUTPUT_LIMIT_PATTERNS: readonly ModelPattern<number>[] = [
+  { pattern: /^(?:chatgpt-)?gpt-4o(?:-mini)?(?:[-:].*)?$/, value: 16_384 },
+  { pattern: /^gpt-4\.1(?:-(?:mini|nano))?(?:[-:].*)?$/, value: 32_768 },
+  // GPT-4 Turbo and its dated snapshots: 4,096 output tokens.
+  { pattern: /^gpt-4-turbo(?:-(?:preview|\d{4}-\d{2}-\d{2}))?$/, value: 4_096 },
+  // V4 family (deepseek-flash, deepseek-v4-*, gateway "-free" aliases): 384K.
+  { pattern: /^deepseek-(?:flash|v4)(?:[-.:].*)?$/, value: 393_216 },
+]
+
+/**
+ * Exact snapshots whose documented output limit differs from their family's.
+ * Checked before any family pattern, so a dated SKU never inherits the alias's
+ * larger limit. Only SKUs still advertised by common gateways.
+ */
+const OUTPUT_LIMIT_EXACT: Readonly<Record<string, number>> = {
+  // The first gpt-4o snapshot predates the 16K output limit.
+  'gpt-4o-2024-05-13': 4_096,
+  'gpt-4-turbo': 4_096,
+  'gpt-4-turbo-2024-04-09': 4_096,
+  'gpt-4-turbo-preview': 4_096,
+  'gpt-4-0125-preview': 4_096,
+  'gpt-4-1106-preview': 4_096,
+  'gpt-4': 8_192,
+  'gpt-4-0613': 8_192,
+  'gpt-3.5-turbo': 4_096,
+  'gpt-3.5-turbo-0125': 4_096,
+}
+
+/**
+ * The documented maximum output for a model id and where it came from:
+ * `catalog` for an exact id (capability catalog or the snapshot table above),
+ * `family` for a pattern match. `undefined` means unknown.
+ */
+export function resolveOutputLimitSource(modelId: string | null | undefined): { readonly tokens: number; readonly source: 'catalog' | 'family' } | undefined {
+  if (modelId === null || modelId === undefined) return undefined
+  const id = normalizeModelId(modelId)
+  const bare = bareModelId(id)
+  const exact = MODEL_CATALOG[id]?.maxOutputTokens ?? OUTPUT_LIMIT_EXACT[id] ?? OUTPUT_LIMIT_EXACT[bare]
+  if (exact !== undefined) return { tokens: exact, source: 'catalog' }
+  const family = getModelInfo(modelId)?.maxOutputTokens
+  if (family !== undefined) return { tokens: family, source: 'family' }
+  for (const candidate of [id, bare]) {
+    const match = OUTPUT_LIMIT_PATTERNS.find((entry) => entry.pattern.test(candidate))
+    if (match !== undefined) return { tokens: match.value, source: 'family' }
+  }
+  return undefined
+}
+
+/** The documented maximum output for a model id; `undefined` means unknown. */
+export function resolveOutputLimit(modelId: string | null | undefined): number | undefined {
+  return resolveOutputLimitSource(modelId)?.tokens
 }
 
 /** The documented reasoning capability for an exact model ID. */
@@ -432,7 +498,8 @@ export function knownModelLimit(modelId: string): number | null {
 
   // ── DeepSeek ───────────────────────────────────────────────────
   if (m.includes('deepseek')) {
-    if (m.includes('v4') || m.includes('deepseek-4')) return CONTEXT_1M
+    // `deepseek-flash` is the current V4.1 Flash name (1M window).
+    if (m.includes('v4') || m.includes('deepseek-4') || m.includes('deepseek-flash')) return CONTEXT_1M
     return CONTEXT_128K
   }
 
@@ -536,7 +603,7 @@ export function applyThinkingOverride(body: Record<string, unknown>, model: stri
     else if (QWEN_LEVELS.includes(level)) body['enable_thinking'] = true
   } else if (id.includes('deepseek')) {
     if (level === 'off') setThinking('disabled')
-    else if (level === 'low' || level === 'high' || level === 'xhigh' || level === 'max') setEffort(level)
+    else if ((EFFORT_6 as readonly string[]).includes(level)) setEffort(level)
   } else if (id.includes('claude') || id.includes('kiro-claude')) {
     // Gateway Claude variants forward Anthropic extended_thinking fields;
     // map effort levels to budget_tokens that approximate them. Checked

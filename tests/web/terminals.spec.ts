@@ -7,7 +7,12 @@
  * behaviour and never depends on a native module being built.
  */
 import { describe, expect, it } from 'vitest'
+import { spawn as spawnChild } from 'node:child_process'
 import {
+  bunPtyLibSpawner,
+  bunPtySpawner,
+  type BunPtyModule,
+  type BunPtyRuntime,
   createTerminalService,
   TerminalError,
   type PtyHandle,
@@ -44,6 +49,8 @@ class FakePty implements PtyHandle {
   }
   kill(): void {
     this.killed = true
+    // A real PTY reports the exit shortly after a hang-up.
+    queueMicrotask(() => this.exit?.({ exitCode: 0 }))
   }
   /** Push output as the real PTY would. */
   emit(chunk: string): void {
@@ -67,7 +74,7 @@ function fakeSpawner(): { spawner: PtySpawner; spawned: FakePty[] } {
 
 function service(overrides: Parameters<typeof createTerminalService>[0] = {}) {
   const { spawner, spawned } = fakeSpawner()
-  return { spawned, terminals: createTerminalService({ spawner, ...overrides }) }
+  return { spawned, terminals: createTerminalService({ spawner, inspector: null, ...overrides }) }
 }
 
 /** Let the 16 ms coalescing timer fire. */
@@ -90,7 +97,7 @@ describe('terminal service', () => {
     // The client's view of the terminal must follow the PTY, not drift from it.
     expect(terminals.get(info.id)).toMatchObject({ cols: 120, rows: 40 })
 
-    terminals.kill(info.id)
+    await terminals.kill(info.id)
     expect(spawned[0]?.killed).toBe(true)
     expect(terminals.list(WS)).toEqual([])
   })
@@ -180,6 +187,7 @@ describe('terminal service', () => {
     const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
 
     spawned[0]?.exit?.({ exitCode: 3 })
+    await flushed()
 
     expect(events.at(-1)).toEqual({ kind: 'exit', terminalId: info.id, exitCode: 3, reason: 'exit' })
     expect(terminals.list(WS)).toEqual([])
@@ -192,8 +200,8 @@ describe('terminal service', () => {
     terminals.subscribe(WS, (event) => events.push(event))
     const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
 
-    terminals.kill(info.id)
-    // node-pty can still deliver buffered output after the kill returns.
+    await terminals.kill(info.id)
+    // A PTY backend can still deliver buffered output after the kill returns.
     spawned[0]?.emit('late output')
     await flushed()
 
@@ -243,7 +251,7 @@ describe('terminal service', () => {
     await terminals.create({ workspaceId: WS, cwd: process.cwd() })
     await terminals.create({ workspaceId: OTHER, cwd: process.cwd() })
 
-    terminals.disposeAll()
+    await terminals.disposeAll()
 
     expect(spawned.every((pty) => pty.killed)).toBe(true)
     expect(terminals.list(WS)).toEqual([])
@@ -254,7 +262,7 @@ describe('terminal service', () => {
     const { terminals } = service()
     expect(() => terminals.write('terminal-nope', 'x')).toThrow(/unknown terminal/)
     expect(() => terminals.resize('terminal-nope', 80, 24)).toThrow(TerminalError)
-    expect(() => terminals.kill('terminal-nope')).toThrow(TerminalError)
+    await expect(terminals.kill('terminal-nope')).rejects.toThrow(TerminalError)
   })
 
   it('rejects a shell this host cannot launch', async () => {
@@ -276,10 +284,10 @@ describe('terminal service', () => {
     await expect(terminals.create({ workspaceId: WS, cwd: process.cwd() })).rejects.toThrow(
       /could not start .*: posix_spawnp failed\./,
     )
-    terminals.disposeAll()
+    await terminals.disposeAll()
   })
 
-  it('reports unavailability instead of throwing on boot when node-pty is missing', async () => {
+  it('reports unavailability instead of throwing on boot when no PTY backend loads', async () => {
     // No injected spawner: the real lazy import runs. Whether it resolves
     // depends on the machine, which is exactly the state `probe()` reports.
     const terminals = createTerminalService()
@@ -291,6 +299,256 @@ describe('terminal service', () => {
         code: 'unavailable',
       })
     }
-    terminals.disposeAll()
+    await terminals.disposeAll()
+  })
+
+  it('adapts Bun.spawn({ terminal }) to the PTY handle contract', async () => {
+    const calls: { cmd: string[]; writes: string[]; resizes: number[][]; signals: unknown[]; closed: number } = { cmd: [], writes: [], resizes: [], signals: [], closed: 0 }
+    let emit: (chunk: Uint8Array) => void = () => {}
+    let finish: () => void = () => {}
+    const proc = {
+      pid: 4242,
+      exitCode: null as number | null,
+      exited: new Promise<number | null>((resolve) => { finish = () => resolve(proc.exitCode) }),
+      terminal: {
+        write: (d: string) => { calls.writes.push(d) },
+        resize: (c: number, r: number) => { calls.resizes.push([c, r]) },
+        close: () => { calls.closed += 1 },
+      },
+      kill: (signal?: number | string) => { calls.signals.push(signal) },
+    }
+    const runtime: BunPtyRuntime = {
+      spawn(cmd, options) {
+        calls.cmd = cmd
+        emit = (chunk) => options.terminal.data(undefined, chunk)
+        return proc
+      },
+    }
+    const pty = bunPtySpawner(runtime).spawn('/bin/zsh', ['-l'], { name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env: {} })
+    const data: string[] = []
+    const exits: number[] = []
+    pty.onData((chunk) => data.push(chunk))
+    pty.onExit((event) => exits.push(event.exitCode))
+    // A UTF-8 character split across two chunks must decode once, whole.
+    const bytes = new TextEncoder().encode('é')
+    emit(bytes.slice(0, 1))
+    emit(bytes.slice(1))
+    pty.write('ls\n')
+    pty.resize(100, 30)
+    pty.closeTerminal?.()
+    pty.kill()
+    pty.signal?.('SIGKILL')
+    proc.exitCode = 7
+    finish()
+    await proc.exited
+    await Promise.resolve()
+    // kill() is an explicit hang-up, never Bun's default SIGTERM (an interactive bash ignores TERM).
+    expect(calls).toEqual({ cmd: ['/bin/zsh', '-l'], writes: ['ls\n'], resizes: [[100, 30]], signals: ['SIGHUP', 'SIGKILL'], closed: 1 })
+    expect(pty.pid).toBe(4242)
+    expect(data.join('')).toBe('é')
+    expect(exits).toEqual([7])
+  })
+
+  it('stops delivering output to a data listener once its disposable is released', () => {
+    let emit: (chunk: Uint8Array) => void = () => {}
+    const runtime: BunPtyRuntime = {
+      spawn(_cmd, options) {
+        emit = (chunk) => options.terminal.data(undefined, chunk)
+        return { pid: 1, exitCode: null, exited: new Promise(() => {}), terminal: { write() {}, resize() {}, close() {} }, kill() {} }
+      },
+    }
+    const pty = bunPtySpawner(runtime).spawn('/bin/sh', [], { name: 'x', cols: 80, rows: 24, cwd: '/', env: {} })
+    const seen: string[] = []
+    const handle = pty.onData((chunk) => seen.push(chunk)) as { dispose(): void }
+    emit(new TextEncoder().encode('a'))
+    handle.dispose()
+    emit(new TextEncoder().encode('b'))
+    expect(seen).toEqual(['a'])
+  })
+})
+
+/**
+ * A stand-in for bun-pty 0.5.1 that reproduces what was measured on Windows:
+ * `kill()` fires a synthetic `onExit({ exitCode: 0 })` synchronously, and the
+ * real exit is never reported after a kill. `pid` is a real process the test
+ * controls, so "the PID is gone" is checked against the OS, not a flag.
+ */
+function fakeBunPty(pid: number, onKill: () => void = () => {}) {
+  const exitListeners: ((event: { exitCode: number }) => void)[] = []
+  const dataListeners: ((data: string) => void)[] = []
+  const calls = { writes: [] as string[], resizes: [] as number[][], kills: 0, spawned: [] as unknown[] }
+  let closing = false
+  const lib: BunPtyModule = {
+    spawn(file, args, options) {
+      calls.spawned.push({ file, args, options })
+      return {
+        pid,
+        onData: (listener) => { dataListeners.push(listener); return { dispose: () => {} } },
+        onExit: (listener) => { exitListeners.push(listener); return { dispose: () => {} } },
+        write: (data) => { calls.writes.push(data) },
+        resize: (cols, rows) => { calls.resizes.push([cols, rows]) },
+        kill: () => {
+          if (closing) return
+          closing = true
+          calls.kills++
+          onKill()
+          for (const listener of exitListeners) listener({ exitCode: 0 })
+        },
+      }
+    },
+  }
+  return {
+    lib,
+    calls,
+    naturalExit: (exitCode: number) => { for (const listener of exitListeners) listener({ exitCode }) },
+    data: (chunk: string) => { for (const listener of dataListeners) listener(chunk) },
+  }
+}
+
+function longLivedChild() {
+  const child = spawnChild(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  const gone = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+  return { child, pid: child.pid!, gone }
+}
+
+describe('bun-pty adapter (Windows backend)', () => {
+  it('passes I/O and spawn options through unchanged', () => {
+    const fake = fakeBunPty(process.pid)
+    const pty = bunPtyLibSpawner(fake.lib).spawn('cmd.exe', ['/k'], { name: 'xterm-256color', cols: 90, rows: 30, cwd: 'C:\\', env: { A: '1' } })
+    const seen: string[] = []
+    pty.onData((chunk) => seen.push(chunk))
+    fake.data('hello')
+    pty.write('dir\r')
+    pty.resize(100, 40)
+    expect(seen).toEqual(['hello'])
+    expect(fake.calls.writes).toEqual(['dir\r'])
+    expect(fake.calls.resizes).toEqual([[100, 40]])
+    expect(fake.calls.spawned).toEqual([{ file: 'cmd.exe', args: ['/k'], options: { name: 'xterm-256color', cols: 90, rows: 30, cwd: 'C:\\', env: { A: '1' } } }])
+    expect(pty.pid).toBe(process.pid)
+  })
+
+  it('reports a natural exit once, with the real exit code', () => {
+    const fake = fakeBunPty(process.pid)
+    const pty = bunPtyLibSpawner(fake.lib).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+    const exits: number[] = []
+    pty.onExit((event) => exits.push(event.exitCode))
+    fake.naturalExit(7)
+    fake.naturalExit(7)
+    expect(exits).toEqual([7])
+  })
+
+  it('holds the synthetic exit from kill() until the shell PID is actually gone', async () => {
+    const { child, pid, gone } = longLivedChild()
+    // The library "kills" without stopping the process: the exit must wait for the OS.
+    const fake = fakeBunPty(pid)
+    const pty = bunPtyLibSpawner(fake.lib, { pollMs: 10 }).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+    const exits: number[] = []
+    pty.onExit((event) => exits.push(event.exitCode))
+
+    pty.kill()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(exits).toEqual([])
+
+    child.kill('SIGKILL')
+    await gone
+    await expect.poll(() => exits, { timeout: 2000 }).toEqual([0])
+  })
+
+  it('never reports exit for a shell that outlives the deadline, so teardown fails explicitly', async () => {
+    const { child, pid, gone } = longLivedChild()
+    try {
+      const fake = fakeBunPty(pid)
+      const pty = bunPtyLibSpawner(fake.lib, { pollMs: 10, deadlineMs: 100 }).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+      const exits: number[] = []
+      pty.onExit((event) => exits.push(event.exitCode))
+      pty.kill()
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(exits).toEqual([])
+    } finally {
+      child.kill('SIGKILL')
+      await gone
+    }
+  })
+
+  it('releases the native handle once on a natural exit, and later kill() calls do nothing', () => {
+    const fake = fakeBunPty(process.pid)
+    const pty = bunPtyLibSpawner(fake.lib).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+    const exits: number[] = []
+    pty.onExit((event) => exits.push(event.exitCode))
+    fake.naturalExit(5)
+    // bun-pty frees the ConPTY/console host only in kill(): a natural exit must call it once.
+    expect(fake.calls.kills).toBe(1)
+    pty.kill()
+    pty.kill()
+    expect(fake.calls.kills).toBe(1)
+    // The synthetic exit that kill() fired is not a second exit.
+    expect(exits).toEqual([5])
+  })
+
+  it('re-checks after a missed deadline when kill() is retried, then reports exactly one exit', async () => {
+    const { child, pid, gone } = longLivedChild()
+    const fake = fakeBunPty(pid)
+    const pty = bunPtyLibSpawner(fake.lib, { pollMs: 10, deadlineMs: 80 }).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+    const exits: number[] = []
+    pty.onExit((event) => exits.push(event.exitCode))
+    pty.kill()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(exits).toEqual([])
+
+    child.kill('SIGKILL')
+    await gone
+    // The service's retry: bun-pty itself is closed, so the adapter must re-check the PID.
+    pty.kill()
+    await expect.poll(() => exits, { timeout: 2000 }).toEqual([0])
+    pty.kill()
+    expect(exits).toEqual([0])
+    expect(fake.calls.kills).toBe(1)
+  })
+
+  it('recovers a failed teardown through the service once the shell finally dies', async () => {
+    const { child, pid, gone } = longLivedChild()
+    const fake = fakeBunPty(pid)
+    const terminals = createTerminalService({
+      spawner: bunPtyLibSpawner(fake.lib, { pollMs: 10, deadlineMs: 50 }),
+      inspector: null,
+      teardown: { escalateMs: 50, killGraceMs: 100, pollMs: 10 },
+    })
+    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+    await expect(terminals.kill(info.id)).rejects.toMatchObject({ code: 'teardown-failed' })
+    expect(terminals.state(info.id)).toBe('failedTeardown')
+
+    child.kill('SIGKILL')
+    await gone
+    await terminals.kill(info.id)
+    expect(terminals.state(info.id)).toBeUndefined()
+    await terminals.disposeAll()
+  })
+
+  it('stops the dispose()d exit listener from firing', () => {
+    const fake = fakeBunPty(process.pid)
+    const pty = bunPtyLibSpawner(fake.lib).spawn('cmd.exe', [], { name: 'x', cols: 80, rows: 24, cwd: '.', env: {} })
+    const exits: number[] = []
+    const handle = pty.onExit((event) => exits.push(event.exitCode)) as { dispose(): void }
+    handle.dispose()
+    fake.naturalExit(3)
+    expect(exits).toEqual([])
+  })
+
+  it('drives the service lifecycle end to end: kill resolves only after the PID is gone', async () => {
+    const { child, pid, gone } = longLivedChild()
+    const fake = fakeBunPty(pid, () => { child.kill('SIGKILL') })
+    const terminals = createTerminalService({
+      spawner: bunPtyLibSpawner(fake.lib, { pollMs: 10 }),
+      inspector: null,
+      teardown: { escalateMs: 500, killGraceMs: 1500, pollMs: 10 },
+    })
+    const events: TerminalEvent[] = []
+    terminals.subscribe(WS, (event) => events.push(event))
+    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+    await terminals.kill(info.id)
+    await gone
+    expect(fake.calls.kills).toBe(1)
+    expect(events.filter((event) => event.kind === 'exit')).toEqual([{ kind: 'exit', terminalId: info.id, exitCode: 0, reason: 'killed' }])
+    await terminals.disposeAll()
   })
 })

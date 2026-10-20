@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, messageText, type LlmProvider, type WebServer } from 'dnt-harness'
+import { containmentCapability, createWebServer, messageText, type LlmProvider, type WebServer } from 'dnt-harness'
 
 const mcpFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 const hookFixture = fileURLToPath(new URL('../fixtures/hook-command.mjs', import.meta.url))
@@ -373,6 +373,29 @@ describe('G5 web MCP + hooks', () => {
     await post(base, `${route}/disable`)
   }, 30_000)
 
+  it('hard resource limits are refused, not claimed, on a host without a tested hard primitive; nothing starts', async () => {
+    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
+    const { base, wsId, home } = await boot(provider)
+    // This build ships no Job Object helper and puts no child in a cgroup, so
+    // every platform reports best effort.
+    expect((await containmentCapability()).level).not.toBe('hard')
+    const started = path.join(home, 'started.log')
+    const route = `/api/workspaces/${wsId}/mcp/capped`
+    expect((await post(base, route, {
+      transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { INIT_FILE: started }, enabled: false,
+      resourceLimits: { memoryMb: 256, enforcement: 'hard' },
+    })).status).toBe(201)
+    for (const action of ['enable', 'test']) {
+      const refused = await post(base, `${route}/${action}`)
+      expect(refused.ok).toBe(false)
+      expect(((await refused.json()) as { error: string }).error).toMatch(/hard (resource )?limits are refused|no tested hard-containment/)
+    }
+    const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/mcp`)).json()) as Array<{ name: string; enabled: boolean; containment: string }>
+    expect(rows.find((row) => row.name === 'capped')).toMatchObject({ enabled: false })
+    expect(rows.find((row) => row.name === 'capped')?.containment).not.toMatch(/^hard/)
+    await expect(fs.stat(started)).rejects.toMatchObject({ code: 'ENOENT' })
+  }, 20_000)
+
   it('disable and host close cancel delayed in-flight MCP initialization (no late descriptors/process)', async () => {
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     // Disable race.
@@ -585,6 +608,13 @@ describe('G5 web MCP + hooks', () => {
       name: 'scripted', models: ['scripted'],
       async *stream(request) {
         seen.push(request.messages.map((message) => messageText(message.content)))
+        // One tool step, then a final answer: a repeating step would fire
+        // PostToolUse again before the test stops the turn.
+        if (seen.length > 1) {
+          yield { type: 'delta', delta: 'done' }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
         yield { type: 'toolCalls', calls: [
           { id: 'b1', name: 'Bash', args: { command: 'echo should-not-run' } },
           { id: 'g1', name: 'Glob', args: { pattern: '*' } },

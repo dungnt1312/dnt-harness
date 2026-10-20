@@ -91,11 +91,13 @@ accept comma-separated strings or YAML lists. Omitted `tools` inherits exposed
 tools, so explicitly list tools for a narrow read-only role. `model` can inherit,
 use an available alias, or select `provider:model`. Optional `skills` lists
 skills to preload into the child's turn; use names that resolve in its project.
+`background: true` makes the role's children outlive the spawning turn (a spawn
+can still pass `background: false`).
 
 Check `Agent` with `action: "catalog"` or Settings → Agents for the resolved
 role, source path and warnings. Test a small representative task before relying
 on a new role. Fields such as `maxTurns`, `permissionMode`, `hooks`, `memory`,
-`mcpServers`, `isolation` and `background` are recognized but **not enforced**;
+`mcpServers` and `isolation` are recognized but **not enforced**;
 do not promise their behavior. See [Claude format](claude-format.md) for the
 complete supported contract.
 
@@ -143,7 +145,7 @@ neither skill text nor instructions can enable an unavailable tool.
 - [Prompt contract](prompt-contract.md): context order, trust, budget and overrides.
 - [Claude format](claude-format.md): instructions, imports, hooks and agent layers.
 - [Guides](guides.md): setup, configuration, plugin authoring and testing.
-- Run `pnpm test`, `pnpm run typecheck`, and `pnpm run build:web` as relevant.
+- Run `bun run test`, `bun run typecheck`, and `bun run build:web` as relevant.
   Start with affected tests, then run the full test suite for behavior changes.
 - Keep runtime guidance short. Full docs stay on disk; skill bodies load on demand.
   Test that new guidance reaches root/child context and does not widen permissions.

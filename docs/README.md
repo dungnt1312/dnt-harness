@@ -24,20 +24,22 @@ This documentation is organized so each layer can be read independently:
 | [sources.md](sources.md) | Workspace Sources: which folder layers skills, agents, hooks and commands load from |
 | [plugins.md](plugins.md) | Claude Code slash commands, plugins, marketplaces and enable scopes |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
+| [migration-runtime-hardening.md](migration-runtime-hardening.md) | Runtime/provider hardening: runtimes, output caps, reasoning replay, terminal teardown, outbound policy, benchmark safety |
+| [release-checklist.md](release-checklist.md) | Release gates, protected environment, manual Windows/macOS evidence |
 | [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |
 | [decisions/mcp-production-boundaries.md](decisions/mcp-production-boundaries.md) | MCP protocol pin, outcomes, receipts, deployment boundary |
 
 ## Quick reference
 
 ```sh
-pnpm install        # install dependencies
-pnpm test           # run the vitest suite
-pnpm run typecheck  # typecheck server (tsconfig.json) + web (tsconfig.web.json)
+bun install         # install dependencies
+bun run test        # run the vitest suite (not `bun test`, Bun's own runner)
+bun run typecheck   # typecheck server (tsconfig.json) + web (tsconfig.web.json)
 
-pnpm run chat       # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
+bun run chat        # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
 
-pnpm run build:web  # build the React client into web-dist/
-pnpm run web        # serve the web UI (default port 3082)
+bun run build:web   # build the React client into web-dist/
+bun run web         # serve the web UI (default port 3082)
 ```
 
 ## Where things live

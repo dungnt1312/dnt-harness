@@ -10,6 +10,13 @@ import type { SessionEvent } from '../session/events.ts'
 
 /** Bump when the digest's input rows change shape. */
 export const DIGEST_VERSION = 1
+/**
+ * Phase 05: a prefix whose assistant messages carry reasoning digests it too
+ * (v2), so a changed reasoning record invalidates snapshots and adoption
+ * proofs built on it. A prefix without any reasoning keeps the exact v1 rows,
+ * so every pre-upgrade sidecar and adoption proof stays valid (dual-read).
+ */
+export const DIGEST_VERSION_REASONING = 2
 
 /** Stable JSON: object keys sorted recursively, so equal content hashes equally. */
 export function canonicalJson(value: unknown): string {
@@ -38,7 +45,8 @@ export function compactionSeedHash(summary: string): string {
  * interleaving them cannot invalidate a snapshot.
  */
 export function sourceDigest(events: readonly SessionEvent[], cutoff: number): string {
-  const rows: unknown[] = [DIGEST_VERSION]
+  const reasoning = events.some((event) => event.seq <= cutoff && event.type === 'assistant/message' && event.reasoning !== undefined)
+  const rows: unknown[] = [reasoning ? DIGEST_VERSION_REASONING : DIGEST_VERSION]
   for (const event of events) {
     if (event.seq > cutoff) break
     switch (event.type) {
@@ -46,7 +54,9 @@ export function sourceDigest(events: readonly SessionEvent[], cutoff: number): s
         rows.push(['u', event.content, event.attachments ?? null])
         break
       case 'assistant/message':
-        rows.push(['a', event.stepId, event.content, event.toolCalls?.map((call) => call.id) ?? null])
+        rows.push(reasoning
+          ? ['a', event.stepId, event.content, event.toolCalls?.map((call) => call.id) ?? null, event.reasoning ?? null]
+          : ['a', event.stepId, event.content, event.toolCalls?.map((call) => call.id) ?? null])
         break
       case 'tool/call':
         rows.push(['c', event.stepId, event.call])

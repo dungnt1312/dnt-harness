@@ -116,6 +116,25 @@ describe('model settings: budget resolution', () => {
   }, 30_000)
 })
 
+describe('PH1-A: one store entry, same facts as the CLI (phase-04 shared resolver)', () => {
+  it('context 32768 / output 4096 drive the manifest budget and the wire cap', async () => {
+    const endpoint = await startStubEndpoint()
+    const { base } = await start()
+    const wsId = await firstWorkspace(base)
+    await post(base, '/api/providers', {
+      name: 'gateway', baseUrl: endpoint.url, apiKey: '', models: ['custom-model'],
+      modelSettings: { 'custom-model': { contextTokens: 32_768, maxOutputTokens: 4_096 } },
+    })
+    await put(base, `/api/workspaces/${wsId}/model`, { model: 'custom-model', provider: 'gateway' })
+    const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hi' })
+    await settle(base, wsId, id)
+    const manifest = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as { budget: { availableTokens: number; windowSource: string } }
+    expect(manifest.budget).toMatchObject({ availableTokens: 32_768 - 4_096 - 1_024, windowSource: 'override' })
+    expect(endpoint.bodies[0]?.['max_tokens']).toBe(4_096)
+  }, 30_000)
+})
+
 describe('workspace thinking control', () => {
   it('the override is stamped on every request and null clears it', async () => {
     const seen: { model?: string | undefined; thinkingLevel?: string | undefined }[] = []
@@ -181,6 +200,30 @@ describe('workspace thinking control', () => {
     await post(base, `/api/workspaces/${wsId}/sessions/${next.id}/messages`, { content: 'again' })
     await settle(base, wsId, next.id)
     expect(endpoint.bodies[1]?.['reasoning_effort']).toBe('max')
+  }, 30_000)
+
+  it('a level the model accepts reaches the wire explicitly instead of being dropped', async () => {
+    const endpoint = await startStubEndpoint()
+    const { base } = await start()
+    const wsId = await firstWorkspace(base)
+    await post(base, '/api/providers', {
+      name: 'deepseek-gw',
+      baseUrl: endpoint.url,
+      apiKey: '',
+      models: ['deepseek-v4.1-flash-free'],
+    })
+    await put(base, `/api/workspaces/${wsId}/model`, { model: 'deepseek-v4.1-flash-free', provider: 'deepseek-gw' })
+    // DeepSeek accepts `medium` (and maps it to `high`). Before the catalog
+    // listed it, this PUT was rejected and a session already carrying `medium`
+    // sent no reasoning_effort at all, leaving the endpoint's default in charge.
+    expect((await put(base, `/api/workspaces/${wsId}/thinking`, { level: 'medium' })).status).toBe(200)
+
+    const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hi' })
+    await settle(base, wsId, id)
+
+    expect(endpoint.bodies[0]?.['reasoning_effort']).toBe('medium')
+    expect(endpoint.bodies[0]?.['thinking']).toBeUndefined()
   }, 30_000)
 
   it('modelSettings ride the public provider projection and patch replaces the map', async () => {

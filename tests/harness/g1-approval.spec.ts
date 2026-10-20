@@ -7,7 +7,7 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ExecutionId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
 import type { ApprovalScope } from '../../src/harness/approval/policy.ts'
 import {
@@ -569,6 +569,100 @@ describe('approval lifecycle', () => {
     await new Promise((resolve) => setTimeout(resolve, 200))
     const stillOpen = await Promise.race([pending.then(() => 'closed'), new Promise((resolve) => setTimeout(() => resolve('open'), 0))])
     expect(stillOpen).toBe('open')
+    void kernel.stop()
+  })
+
+  it('an invalid live approval expiry keeps the static expiry', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    const before = Date.now()
+    let deadline: number | undefined
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 60_000,
+      expiryMsOf: () => Number.NaN,
+      askUser: (_call, lifecycle) => {
+        deadline = lifecycle.expiresAt
+        return Promise.resolve(false)
+      },
+    })
+    try {
+      await kernel.ctx.tools.execute(call('Echo'))
+      expect(deadline).toBeGreaterThanOrEqual(before + 60_000)
+    } finally {
+      await kernel.stop()
+    }
+  })
+
+  it('a changed approval expiry applies only to questions asked after it', async () => {
+    vi.useFakeTimers()
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    let ran = 0
+    kernel.ctx.tools.register({ ...echoTool, async execute() { ran += 1; return 'ran' } })
+    let expiry = 1_000
+    const deadlines: (number | undefined)[] = []
+    let created!: () => void
+    let barrier = new Promise<void>((resolve) => { created = resolve })
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 99_000,
+      expiryMsOf: () => expiry,
+      askUser: (_call, lifecycle) => {
+        deadlines.push(lifecycle.expiresAt)
+        created()
+        // Undecided: only expiry can settle these questions.
+        return new Promise<boolean>(() => {})
+      },
+    })
+    try {
+      const start = Date.now()
+      let settledA = false
+      let settledB = false
+      const resultA = kernel.ctx.tools.execute({ id: 'a', name: 'Echo', args: { message: 'a' } }).finally(() => { settledA = true })
+      await barrier
+      expiry = 5_000
+      barrier = new Promise<void>((resolve) => { created = resolve })
+      const resultB = kernel.ctx.tools.execute({ id: 'b', name: 'Echo', args: { message: 'b' } }).finally(() => { settledB = true })
+      await barrier
+      expect(deadlines).toEqual([start + 1_000, start + 5_000])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(settledA).toBe(true)
+      expect(settledB).toBe(false)
+      expect(await resultA).toMatchObject({ ok: false, output: expect.stringMatching(/expired/) })
+
+      await vi.advanceTimersByTimeAsync(4_000)
+      expect(settledB).toBe(true)
+      expect(await resultB).toMatchObject({ ok: false, output: expect.stringMatching(/expired/) })
+      expect(ran).toBe(0)
+    } finally {
+      vi.useRealTimers()
+      await kernel.stop()
+    }
+  })
+
+  it('a live approval expiry of 0 waits like the static 0', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    let asking!: () => void
+    const asked = new Promise<void>((resolve) => { asking = resolve })
+    let deadline: number | undefined = -1
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 60_000,
+      expiryMsOf: () => 0,
+      askUser: (_call, lifecycle) => {
+        deadline = lifecycle.expiresAt
+        asking()
+        return new Promise<boolean>(() => {})
+      },
+    })
+    void kernel.ctx.tools.execute(call('Echo'))
+    await asked
+    expect(deadline).toBeUndefined()
     void kernel.stop()
   })
 

@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { AttachmentRef } from '../attachments/store.ts'
-import { assertOutboundUrl, dispatcherFor } from '../mcp/outbound-policy.ts'
+import { BodyTooLargeError, defaultOutboundHttp, discardBody, OutboundTransportUnavailableError, readBoundedBytes, type OutboundHttp, type OutboundResponse } from '../mcp/outbound-http.ts'
+import { OutboundPolicyError } from '../mcp/outbound-policy.ts'
 import type { ToolDefinition, ToolExecution } from './types.ts'
 
 /**
@@ -25,35 +26,51 @@ export const GENERATE_IMAGE_TOOL = 'GenerateImage'
 export const EDIT_IMAGE_TOOL = 'EditImage'
 export const IMAGE_TOOLS: readonly string[] = [GENERATE_IMAGE_TOOL, EDIT_IMAGE_TOOL]
 
-/**
- * Whether a provider-reported media URL is on the configured endpoint's
- * origin (only then may it receive credentials). A foreign URL must be a
- * public https address; anything else throws.
- */
-export function sameOriginMedia(url: string, baseUrl: string): boolean {
-  try {
-    const target = new URL(url)
-    if (target.origin === new URL(baseUrl).origin) return true
-    assertOutboundUrl(url)
-  } catch (error) {
-    throw new Error(`refusing media url ${excerpt(url, 120)}: ${message(error)}`)
-  }
-  return false
+/** How a media download reaches the network. */
+export interface MediaTransport {
+  /** The configured provider endpoint's own fetch (operator-chosen; may be a private gateway). */
+  readonly gateway: typeof fetch
+  /** The outbound policy transport, used for every hop that is not the configured origin. */
+  readonly http: OutboundHttp
 }
 
-/** Validate and pin each foreign hop; configured provider origins retain their local access. */
-export async function fetchMedia(url: string, baseUrl: string, fetchImpl: typeof fetch, signal: AbortSignal, headers: (url: URL) => Record<string, string> = () => ({})): Promise<Response> {
+const MEDIA_REDIRECTS = new Set([301, 302, 303, 307, 308])
+const MAX_MEDIA_REDIRECTS = 5
+
+/**
+ * Download provider-reported media with bounded, per-hop validated redirects.
+ *
+ * The configured origin keeps its local access (and `headers`, i.e.
+ * credentials) only while the chain has never left it, which means the
+ * INITIAL url must be on it. From the first foreign hop on, every hop,
+ * including one back to the configured origin, goes through the public-only
+ * policy transport with no credentials. A prohibited hop is refused before
+ * it is sent; every intermediate body is cancelled.
+ */
+export async function fetchMedia(url: string, baseUrl: string, transport: MediaTransport, signal: AbortSignal, headers: (url: URL) => Record<string, string> = () => ({})): Promise<OutboundResponse> {
+  const configured = new URL(baseUrl).origin
   let target = url
+  let onConfigured = true
   for (let redirects = 0; ; redirects++) {
-    const sameOrigin = sameOriginMedia(target, baseUrl)
-    const parsed = new URL(target)
-    const response = await fetchImpl(target, {
-      signal, headers: headers(parsed), redirect: 'manual',
-      ...(fetchImpl === fetch && !sameOrigin ? { dispatcher: dispatcherFor(parsed) } : {}),
-    })
-    if (![301, 302, 303, 307, 308].includes(response.status)) return response
-    await response.body?.cancel()
-    if (redirects >= 5) throw new Error('too many media redirects')
+    let parsed: URL
+    try { parsed = new URL(target) } catch { throw new Error(`refusing media url ${excerpt(target, 120)}: not an absolute URL`) }
+    onConfigured = onConfigured && parsed.origin === configured
+    let response: OutboundResponse
+    if (onConfigured) {
+      response = await transport.gateway(parsed.href, { signal, headers: headers(parsed), redirect: 'manual' })
+    } else {
+      try {
+        response = await transport.http.request(parsed, { signal, headers: {} })
+      } catch (error) {
+        if (error instanceof OutboundPolicyError || error instanceof OutboundTransportUnavailableError) {
+          throw new Error(`refusing media url ${excerpt(target, 120)}: ${message(error)}`)
+        }
+        throw error
+      }
+    }
+    if (!MEDIA_REDIRECTS.has(response.status)) return response
+    await discardBody(response)
+    if (redirects >= MAX_MEDIA_REDIRECTS) throw new Error('too many media redirects')
     const location = response.headers.get('location')
     if (location === null) throw new Error('media redirect has no location')
     target = new URL(location, parsed).href
@@ -91,8 +108,10 @@ export interface ImageToolOptions {
   readonly timeoutMs?: number
   /** Largest image accepted, in either direction. */
   readonly maxBytes?: number
-  /** Test seam. */
+  /** Test seam: the configured provider endpoint's fetch (not used for foreign media hops). */
   readonly fetch?: typeof fetch
+  /** Test seam: the policy transport for foreign media hops (inject a low-level sender into it). */
+  readonly outboundHttp?: OutboundHttp
 }
 
 /** What both tools answer: the stored reference plus what the provider reported. */
@@ -172,11 +191,13 @@ function parseSize(args: Record<string, unknown>): string | undefined {
 /** Shared runtime: one budget, the endpoint, and the result → attachment path. */
 class ImageRuntime {
   private readonly doFetch: typeof fetch
+  private readonly media: MediaTransport
   readonly maxBytes: number
   private readonly timeoutMs: number
 
   constructor(readonly options: ImageToolOptions) {
     this.doFetch = options.fetch ?? fetch
+    this.media = { gateway: this.doFetch, http: options.outboundHttp ?? defaultOutboundHttp() }
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   }
@@ -224,17 +245,28 @@ class ImageRuntime {
     }
     const url = image.url!
     if (!/^https?:\/\//i.test(url)) throw new Error(`images response url is not http(s): ${excerpt(url, 120)}`)
-    let download: Response
+    let download: OutboundResponse
     try {
-      download = await fetchMedia(url, config.baseUrl, this.doFetch, signal)
+      download = await fetchMedia(url, config.baseUrl, this.media, signal)
     } catch (error) {
       throw new Error(`download image url failed: ${message(error)}`)
     }
-    if (!download.ok) throw new Error(`download image url HTTP ${download.status}`)
+    if (!download.ok) {
+      await discardBody(download)
+      throw new Error(`download image url HTTP ${download.status}`)
+    }
     const declared = Number(download.headers.get('content-length') ?? '')
-    if (Number.isFinite(declared) && declared > this.maxBytes) throw new Error(`downloaded image is ${declared} bytes; the limit is ${this.maxBytes}`)
-    const bytes = Buffer.from(await download.arrayBuffer())
-    if (bytes.length > this.maxBytes) throw new Error(`downloaded image is ${bytes.length} bytes; the limit is ${this.maxBytes}`)
+    if (Number.isFinite(declared) && declared > this.maxBytes) {
+      await discardBody(download)
+      throw new Error(`downloaded image is ${declared} bytes; the limit is ${this.maxBytes}`)
+    }
+    let bytes: Buffer
+    try {
+      bytes = await readBoundedBytes(download, this.maxBytes)
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) throw new Error(`downloaded image exceeds the limit of ${this.maxBytes} bytes`)
+      throw new Error(`download image url failed: ${message(error)}`)
+    }
     if (bytes.length === 0) throw new Error('download image url: empty body')
     return bytes
   }

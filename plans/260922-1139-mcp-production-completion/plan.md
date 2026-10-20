@@ -113,8 +113,8 @@ type ToolOutcome = "success" | "error" | "indeterminate" | "audit_fault";
 | 3 | [Config Compatibility and Migration Kernel](./phase-03-config-compatibility-and-migration-kernel.md) | P1 | 1, 2 | Done |
 | 4 | [Safe Tool Calls and Audit Integrity](./phase-04-safe-tool-calls-and-audit-integrity.md) | P1 | 1, 3 | Done |
 | 5 | [Protocol and Transport Hardening](./phase-05-protocol-and-transport-hardening.md) | P1 | 1, 4 | Done |
-| 6 | [Process Ownership and Resource Policy](./phase-06-process-ownership-and-resource-policy.md) | P1 | 3, 5 | In progress |
-| 7 | [Desired-State Runtime Reconciliation](./phase-07-desired-state-runtime-reconciliation.md) | P1 | 3-6 | In progress |
+| 6 | [Process Ownership and Resource Policy](./phase-06-process-ownership-and-resource-policy.md) | P1 | 3, 5 | In progress: Job Object and cgroup v2 open (refused, not claimed) |
+| 7 | [Desired-State Runtime Reconciliation](./phase-07-desired-state-runtime-reconciliation.md) | P1 | 3-6 | Criteria met; supervisor extraction open |
 | 8 | [Managed MCP OAuth Profile](./phase-08-managed-mcp-oauth-profile.md) | P1 | 2, 5, 7 | In progress |
 | 9 | [MCP Settings and Diagnostics](./phase-09-mcp-settings-and-diagnostics.md) | P1 | 2, 7, 8 | In progress |
 | 10 | [Conformance and Full-Stack Verification](./phase-10-conformance-and-full-stack-verification.md) | P1 | 2-9 | Blocked |

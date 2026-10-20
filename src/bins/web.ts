@@ -7,8 +7,8 @@
  * `<homedir>/.dnt-harness/data`) and reopen on restart.
  * Serve the built client first:
  *
- *   npm run build:web
- *   npm run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>
+ *   bun run build:web
+ *   bun run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>
  *                  --oauth-origin <https://host[,https://host2]>]
  *
  * `--oauth-origin` states the https origin the app is reached at, so MCP OAuth
@@ -26,6 +26,16 @@ import { createWebServer } from '../web/server.ts'
 import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
 import { WEB_BIN_LIMITS } from './web-limits.ts'
+
+/**
+ * Whole-host shutdown deadline. Below PM2's `kill_timeout` (15s in
+ * ecosystem.config.cjs) with margin for the process to print its report and
+ * exit. The per-step worst-case breakdown lives beside the cleanup chain in
+ * `createWebServer`'s `close()` (src/web/server.ts): bounded chain 12.5s with
+ * terminal teardown (≤ TERMINAL_SHUTDOWN_BUDGET_MS, 4s) running concurrently
+ * from the start, plus 1s slack for owner-lock release and sync steps.
+ */
+const SHUTDOWN_DEADLINE_MS = 13_500
 
 // `~/.dnt-harness`, or the pre-rename `~/.mini-dsh` while only that exists.
 const appHome = resolveAppHome()
@@ -100,7 +110,8 @@ async function main(): Promise<void> {
     // Credential folders stay off-limits to file tools in every mode.
     secretRoots: defaultSecretRoots(homedir()),
     seedDeepseekFromEnv: true,
-    limits: WEB_BIN_LIMITS,
+    // Host profile defaults: `<data-dir>/app-config.json` overrides them.
+    limitDefaults: WEB_BIN_LIMITS,
     ...(yolo ? { yolo: true, defaultMode: 'allow' as const } : { defaultMode: 'ask' as const }),
     // `--root` picks where an unbound Workbench terminal opens. It is not
     // passed as `root`: that would widen the file tools' legacy grant, which
@@ -125,6 +136,13 @@ async function main(): Promise<void> {
       return
     }
     shuttingDown = true
+    // A hung cleanup step must not run into PM2's SIGKILL: that would skip the
+    // report of what was left behind. Exit on our own deadline instead.
+    const deadline = setTimeout(() => {
+      console.error(`shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms; exiting with cleanup incomplete`)
+      process.exit(1)
+    }, SHUTDOWN_DEADLINE_MS)
+    deadline.unref()
     void server.close().then(
       () => process.exit(0),
       (error: unknown) => {

@@ -1,3 +1,7 @@
+---
+status: completed
+---
+
 # Modes as the single source of permission
 
 Status: **completed** (verified 2026-09-24; see Delivery)

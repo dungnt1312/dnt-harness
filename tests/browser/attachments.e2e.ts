@@ -85,6 +85,10 @@ async function serve(page: Page): Promise<void> {
     if (path === '/api/workspaces/w/sessions') return json(route, [{ id: 's', workspaceId: 'w', title: 'Fixture conversation', projectId: 'p', folder: null, eventCount: EVENTS.length, createdAt: 0, updatedAt: 0, status: 'idle' }])
     if (path === '/api/workspaces/w/meta') return json(route, { workspace: { id: 'w', name: 'Fixture workspace', archived: false }, provider: 'fixture-provider', model: 'fixture-model', providers: [], models: ['fixture-model'], projects: [{ id: 'p', name: 'Fixture project', path: 'C:/fixture/project' }], permissionDefaults: {}, thinkingLevel: null })
     if (path === '/api/workspaces/w/mode') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }], selected: 'chat', revision: 1 })
+    if (path === '/api/model-aliases') return json(route, [])
+    // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
+    if (path === '/api/speech-to-text') return json(route, { provider: null, model: null })
+    if (path === '/api/workspaces/w/commands') return json(route, { commands: [], errors: [] })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/workspaces/w/agents/children') return json(route, [])
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path)) return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'global' })
@@ -92,7 +96,7 @@ async function serve(page: Page): Promise<void> {
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path)) return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path)) return json(route, [])
     if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], available: false })
-    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, changes: [], truncated: false })
+    if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, branchInfo: null, head: null, changes: [], truncated: false })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/manifest$/.test(path)) return json(route, { modeId: 'chat', modeRevision: 1, budget: { availableTokens: 32000, usedTokens: 0, estimated: false }, history: { setting: 'all', includedTurns: 0, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] })
     if (path === '/api/workspaces/w/skills') return json(route, [])
     if (path.startsWith('/api/workspaces/w/attachments/')) return route.fulfill({ status: 200, contentType: 'image/png', body: image })
@@ -172,6 +176,8 @@ test('clicking a thumbnail opens a lightbox that closes with Escape, the close b
   // Open → click the backdrop, outside the image.
   await thumb.click()
   await expect(dialog).toBeVisible()
+  // The dialog takes focus once it is interactive; a click before that lands on the page behind it.
+  await expect(dialog.getByRole('button', { name: 'Close preview' })).toBeFocused()
   await page.mouse.click(10, 10)
   await expect(dialog).toBeHidden()
 

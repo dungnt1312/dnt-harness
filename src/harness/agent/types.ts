@@ -9,8 +9,8 @@ export interface InboxItem {
   readonly attachments?: readonly AttachmentRef[]
   /** Set when the input was durably accepted (`input/queued`) before claiming. */
   readonly inputId?: InputId
-  /** `hook`: an `asyncRewake` result the host queued; logged with this origin. */
-  readonly origin?: 'hook'
+  /** `hook`: an `asyncRewake` result; `child`: a background child's report. Host data, never typed. */
+  readonly origin?: 'hook' | 'child'
   /** The user-facing line of a hook rewake. */
   readonly summary?: string
 }
@@ -61,8 +61,8 @@ declare module 'dnt-harness' {
      */
     'agent/pre-step'(
       /** `signal` fires when the turn is stopped; long listeners (hooks) honor it. */
-      /** `origins[i]` is `hook` for a claimed `asyncRewake` input (no prompt hooks, no slash expansion). */
-      claim: { readonly contents: readonly string[]; readonly origins?: readonly ('hook' | undefined)[]; readonly signal?: AbortSignal },
+      /** `origins[i]` is set for host data (`asyncRewake`, background child report): no prompt hooks, no slash expansion. */
+      claim: { readonly contents: readonly string[]; readonly origins?: readonly ('hook' | 'child' | undefined)[]; readonly signal?: AbortSignal },
       next: (replacement?: { readonly contents: readonly string[]; readonly context?: readonly string[]; readonly expansions?: readonly (string | undefined)[] }) => Promise<PreStepDecision>,
     ): Promise<PreStepDecision>
 

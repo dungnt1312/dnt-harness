@@ -88,6 +88,20 @@ describe('SkillsPanel skills tab', () => {
     expect(document.body.textContent).toContain('~/.claude/skills')
   })
 
+  it('keeps the tree to tree items and groups, and marks the open skill as current rather than selected', async () => {
+    await renderPanel()
+    const tree = document.body.querySelector('[role="tree"]')!
+    const headers = [...tree.querySelectorAll('[role="group"] > button[aria-expanded]')]
+    expect(headers.length).toBeGreaterThan(0)
+    expect(headers.every((header) => header.getAttribute('role') === 'treeitem')).toBe(true)
+    expect(tree.querySelector('button[aria-selected]')).toBeNull()
+    await act(async () => button('ws-skill').click())
+    await settle()
+    expect(tree.querySelector('button[aria-current="true"]')?.textContent).toBe('ws-skill')
+    // Files of an open skill sit in their own group inside the skill's tree item.
+    expect(tree.querySelector('[role="treeitem"] > [role="group"] > [role="treeitem"]')).not.toBeNull()
+  })
+
   it('does not mark base rows shadowed just because project lists include every layer', async () => {
     await renderPanel()
     expect(document.body.querySelector('[aria-label="Shadowed in a project"]')).toBeNull()

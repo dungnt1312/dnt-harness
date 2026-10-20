@@ -5,10 +5,12 @@
  *
  * Redirects are not followed here. Callers use `redirect: 'manual'` and
  * re-check every hop with {@link assertOutboundUrl}.
+ *
+ * This module owns the IP/DNS rules only. The transport that applies them at
+ * connection time (real Undici, one pool per mode) is `outbound-http.ts`.
  */
 import { isIP } from 'node:net'
 import { lookup } from 'node:dns/promises'
-import { Agent } from 'undici'
 
 export class OutboundPolicyError extends Error {
   constructor(message: string) {
@@ -29,8 +31,12 @@ const PROHIBITED_V4 = [
   ['127.0.0.0', 8],
   ['169.254.0.0', 16],
   ['172.16.0.0', 12],
+  ['192.0.0.0', 24], // IETF protocol assignments
+  ['192.0.2.0', 24], // TEST-NET-1
   ['192.168.0.0', 16],
   ['198.18.0.0', 15],
+  ['198.51.100.0', 24], // TEST-NET-2
+  ['203.0.113.0', 24], // TEST-NET-3
   ['224.0.0.0', 4],
   ['240.0.0.0', 4],
 ] as const
@@ -57,35 +63,51 @@ export function assertOutboundUrl(raw: string, options: OutboundPolicyOptions = 
 
 export function isLoopbackUrl(url: URL): boolean { return isLoopback(url.hostname) }
 
-/** Revalidate DNS at connection time, pinning the answer used by the socket. */
-function pinnedDispatcher(allowLoopback: boolean): Agent {
-  return new Agent({ connect: {
-    lookup(hostname, options, callback) {
-      void lookup(hostname, { all: true, verbatim: true }).then((addresses) => {
-        if (addresses.length === 0 || addresses.some(({ address }) => allowLoopback ? !isLoopbackAddress(address) : isProhibitedHost(address))) {
-          callback(new OutboundPolicyError('outbound URL resolves to a prohibited address'), [])
-          return
-        }
-        if (options.all === true) callback(null, addresses)
-        else {
-          const selected = addresses[0]!
-          callback(null, selected.address, selected.family)
-        }
-      }, (error: Error) => callback(error, []))
-    },
-  } })
+/** One DNS answer, as `dns.lookup({ all: true })` reports it. */
+export interface ResolvedAddress {
+  readonly address: string
+  readonly family: number
 }
 
-export const outboundDispatcher = pinnedDispatcher(false)
-const loopbackDispatcher = pinnedDispatcher(true)
+/** Hostname → every address. Injectable so tests use a scoped fixture, never system DNS or hosts edits. */
+export type AddressResolver = (hostname: string) => Promise<readonly ResolvedAddress[]>
+
+const systemResolver: AddressResolver = (hostname) => lookup(hostname, { all: true, verbatim: true })
+
+/**
+ * Every address a policy socket may connect to for `hostname`, resolved at
+ * connection time (never cached across connections). Any prohibited answer
+ * rejects the whole set: mixed public/private answers are a rebinding tell.
+ * Because every returned address passed, a caller may fall back across them
+ * on connect errors. `allowLoopback` is the local fixture profile: every
+ * answer must be loopback. An IP literal is checked as is, without DNS.
+ * Order: families interleaved, starting with the resolver's first family.
+ */
+export async function resolvePolicyAddresses(hostname: string, allowLoopback: boolean, resolve: AddressResolver = systemResolver): Promise<readonly ResolvedAddress[]> {
+  const bare = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
+  const literal = isIP(bare)
+  const answers = literal !== 0 ? [{ address: bare, family: literal }] : await resolve(bare)
+  if (answers.length === 0 || answers.some(({ address }) => allowLoopback ? !isLoopbackAddress(address) : isProhibitedHost(address))) {
+    throw new OutboundPolicyError('outbound URL resolves to a prohibited address')
+  }
+  return interleave(answers.map(({ address, family }) => ({ address, family })))
+}
+
+function interleave(answers: readonly ResolvedAddress[]): ResolvedAddress[] {
+  const first = answers[0]!.family
+  const same = answers.filter(({ family }) => family === first)
+  const other = answers.filter(({ family }) => family !== first)
+  const out: ResolvedAddress[] = []
+  for (let i = 0; i < Math.max(same.length, other.length); i++) {
+    if (same[i] !== undefined) out.push(same[i]!)
+    if (other[i] !== undefined) out.push(other[i]!)
+  }
+  return out
+}
 
 function isLoopbackAddress(address: string): boolean {
   const host = unwrapIp(address)
   return host === '::1' || (isIP(host) === 4 && (ipv4Number(host)! >>> 24) === 127)
-}
-
-export function dispatcherFor(url: URL): Agent {
-  return isLoopbackUrl(url) ? loopbackDispatcher : outboundDispatcher
 }
 
 /** Headers the operator config must not replace. */
@@ -106,6 +128,8 @@ function isLoopback(hostname: string): boolean {
   // IPv4 literals may inherit the direct-loopback fixture exception.
   const words = isIP(bare) === 6 ? ipv6Words(bare) : undefined
   if (words?.[0] === 0x64 && words[1] === 0xff9b) return false
+  // 6to4 names a relay, not this host, whatever IPv4 it embeds.
+  if (words?.[0] === 0x2002) return false
   const host = unwrapIp(hostname)
   return host === 'localhost' || host === '127.0.0.1' || host === '::1'
 }
@@ -130,7 +154,14 @@ function unwrapIp(hostname: string): string {
   return embeddedIpv4(bare) ?? bare
 }
 
-/** IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`) or NAT64 (`64:ff9b::/96`). */
+const dotted = (a: number, b: number): string => `${a >> 8}.${a & 0xff}.${b >> 8}.${b & 0xff}`
+
+/**
+ * IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`), NAT64
+ * well-known (`64:ff9b::/96`, low 32 bits), NAT64 local-use
+ * (`64:ff9b:1::/48`, judged by its low 32 bits as RFC 6052 /96 layout), and
+ * 6to4 (`2002:V4ADDR::/48`, IPv4 in words 1–2).
+ */
 function embeddedIpv4(ip: string): string | undefined {
   const words = ipv6Words(ip)
   if (words === undefined) return undefined
@@ -139,9 +170,10 @@ function embeddedIpv4(ip: string): string | undefined {
   const mapped = zeroHigh && high[5] === 0xffff
   const compatible = zeroHigh && high[5] === 0 && !(words[6] === 0 && (words[7] ?? 0) <= 1)
   const nat64 = words[0] === 0x64 && words[1] === 0xff9b && high.slice(2).every((word) => word === 0)
-  if (!mapped && !compatible && !nat64) return undefined
-  const [a = 0, b = 0] = [words[6], words[7]]
-  return `${a >> 8}.${a & 0xff}.${b >> 8}.${b & 0xff}`
+  const nat64Local = words[0] === 0x64 && words[1] === 0xff9b && words[2] === 1
+  if (words[0] === 0x2002) return dotted(words[1] ?? 0, words[2] ?? 0)
+  if (!mapped && !compatible && !nat64 && !nat64Local) return undefined
+  return dotted(words[6] ?? 0, words[7] ?? 0)
 }
 
 /** Eight 16-bit words of a valid IPv6 literal (a dotted IPv4 tail is folded in). */
@@ -179,7 +211,10 @@ function prohibitedV6(ip: string): boolean {
   if (lower === '::' || lower === '::1') return true
   const first = ipv6Words(ip)?.[0]
   if (first === undefined) return true
-  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true
+  // fc00::/7 ULA, fe80::/10 link-local, fec0::/10 deprecated site-local.
+  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xffc0) === 0xfec0) return true
+  // 2001:db8::/32 documentation.
+  if (first === 0x2001 && ipv6Words(ip)?.[1] === 0x0db8) return true
   if (lower.startsWith('ff')) return true
   return false
 }

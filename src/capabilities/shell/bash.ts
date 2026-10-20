@@ -19,6 +19,8 @@ import { timerBudget } from '../../harness/processes/shutdown.ts'
 import { detectShell } from './detect.ts'
 import { scrubbedChildEnv } from '../../harness/child-env.ts'
 import type { ProcessRegistry } from '../../harness/processes/registry.ts'
+import type { LimitsReader } from '../../harness/config/types.ts'
+import type { HarnessLimits } from '../../harness/limits.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
 const OUTPUT_CAP = 60_000
@@ -39,6 +41,28 @@ export interface BashToolOptions {
   readonly executable?: string
   /** Background-mode owner: registers run_in_background children. */
   readonly processes?: ProcessRegistry
+  /**
+   * Live limits source. When present, the advertised schema and each
+   * execution's wait budget follow `toolTimeoutMs`/`bashMaxWaitMs` instead of
+   * the static `timeoutMs`/`maxWaitMs` above: the pipeline-stamped
+   * `ToolExecution.limitsSnapshot` first, else a fresh read. Without it the
+   * static options always govern, so fixed-option callers keep their budget
+   * and schema even inside the tool pipeline. `read()` must not throw: the
+   * tool's `schema()` calls it on every request assembly.
+   */
+  readonly limits?: LimitsReader
+}
+
+interface WaitBudget { readonly timeoutMs: number; readonly maxWaitMs: number }
+
+/** The foreground default and its ceiling, clamped like the static options. */
+function waitBudget(timeoutMs: number | undefined, maxWaitMs: number | undefined): WaitBudget {
+  const max = timerBudget(maxWaitMs, 600_000)
+  return { timeoutMs: Math.min(timerBudget(timeoutMs, 120_000), max), maxWaitMs: max }
+}
+
+function budgetOf(values: Readonly<HarnessLimits>): WaitBudget {
+  return waitBudget(values.toolTimeoutMs, values.bashMaxWaitMs)
 }
 
 /** Environment marker every process of one Bash call inherits (Windows only). */
@@ -81,7 +105,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
     // Windows has no process groups; taskkill /T takes the tree down. A
     // second pass reaps MSYS children that were mid-spawn during the first
     // tree walk (taskkill's parent walk races Git Bash's fork chain).
-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
     killer.on('error', () => {
       child.kill('SIGKILL')
     })
@@ -90,7 +114,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
     // environment: sweep MSYS processes by that tag until none remain.
     spawn(shell, ['-c', sweepByTag(treeTag)], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
     setTimeout(() => {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {})
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
       child.kill('SIGKILL')
     }, 250).unref?.()
     return
@@ -120,33 +144,41 @@ function isBareSleep(command: string): boolean {
 
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
-  const maxWaitMs = timerBudget(options.maxWaitMs, 600_000)
-  const timeoutMs = Math.min(timerBudget(options.timeoutMs, 120_000), maxWaitMs)
+  const staticBudget = waitBudget(options.timeoutMs, options.maxWaitMs)
+  const live = options.limits
   // Used only for direct compatibility calls without a granted root. Pipeline
   // executions must derive their working directory from `exec.root`.
   const configuredCwd = options.cwd
   const fallbackCwd = typeof configuredCwd === 'function' ? configuredCwd : () => configuredCwd ?? process.cwd()
   const detection = detectShell(options.executable)
+  const description = [
+    'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
+    'The command already runs in the project folder: do not start it with `cd <project> &&`; use paths relative to the project, or absolute paths.',
+    'Use Bash to run programs: builds, tests, git, package managers, and file metadata such as size or type.',
+    'IMPORTANT: do not use Bash to read, search or change file contents (`cat`, `head`, `tail`, `sed`, `awk`, `grep`, `rg`, `find`, `echo >`, heredocs) unless the user asks or you have verified that no file tool can do it. Use Read (any line range), Grep, Glob, and Edit, Write or ApplyPatch instead: they show as file links and diffs, read exactly the line range needed, and reading a file through Bash creates no observation, so it must still be Read before it can be edited.',
+    'Independent lookups can be several Read/Grep/Glob calls in one step rather than one chained shell command.',
+  ].join(' ')
+  // The advertised wait bounds must agree with the clamp execute applies.
+  const parameters = ({ timeoutMs, maxWaitMs }: WaitBudget): ToolDefinition['parameters'] => ({
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'the bash command line to run; it starts in the project folder' },
+      timeoutMs: { type: 'number', description: `foreground wait budget in milliseconds (default ${timeoutMs}, max ${maxWaitMs}; eligible commands keep running in background after this wait)` },
+      run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
+    },
+    required: ['command'],
+  })
   return {
     name: 'Bash',
-    description: [
-      'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
-      'The command already runs in the project folder: do not start it with `cd <project> &&`; use paths relative to the project, or absolute paths.',
-      'Use Bash to run programs: builds, tests, git, package managers, and file metadata such as size or type.',
-      'IMPORTANT: do not use Bash to read, search or change file contents (`cat`, `head`, `tail`, `sed`, `awk`, `grep`, `rg`, `find`, `echo >`, heredocs) unless the user asks or you have verified that no file tool can do it. Use Read (any line range), Grep, Glob, and Edit, Write or ApplyPatch instead: they show as file links and diffs, read exactly the line range needed, and reading a file through Bash creates no observation, so it must still be Read before it can be edited.',
-      'Independent lookups can be several Read/Grep/Glob calls in one step rather than one chained shell command.',
-    ].join(' '),
+    description,
     requiresRoot: true,
-    parameters: {
-      type: 'object',
-      properties: {
-        command: { type: 'string', description: 'the bash command line to run; it starts in the project folder' },
-        timeoutMs: { type: 'number', description: `foreground wait budget in milliseconds (default ${timeoutMs}, max ${maxWaitMs}; eligible commands keep running in background after this wait)` },
-        run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
-      },
-      required: ['command'],
-    },
+    parameters: parameters(staticBudget),
+    ...(live !== undefined ? { schema: () => ({ description, parameters: parameters(budgetOf(live.read().values)) }) } : {}),
     async execute(args, exec: ToolExecution) {
+      // One wait policy per execution, taken before any await: with a live
+      // reader, the trusted pipeline snapshot or else a fresh read; without
+      // one, the static options.
+      const { timeoutMs, maxWaitMs } = live !== undefined ? budgetOf((exec.limitsSnapshot ?? live.read()).values) : staticBudget
       const command = args['command']
       if (typeof command !== 'string' || command === '') {
         throw new Error("argument 'command' must be a non-empty string")
@@ -165,6 +197,9 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         const cwd = exec.root !== '' ? exec.root : fallbackCwd()
         const child = spawn(detection.executable, ['-lc', command], {
           cwd, detached: true,
+          // Without windowsHide, detached bash.exe on Windows allocates a
+          // visible console window for every command the agent runs.
+          windowsHide: true,
           env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
         })
         // Even rejected registration must observe spawn errors and reap its tree.
@@ -264,6 +299,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
             // requiresRoot tool. The fallback retains direct-call compatibility.
             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
             detached: true,
+            windowsHide: true,
             env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
           })
         } catch (error) {

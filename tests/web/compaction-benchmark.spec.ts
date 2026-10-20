@@ -83,7 +83,11 @@ async function session(limits: Partial<HarnessLimits>) {
     const deadline = Date.now() + 20_000
     for (;;) {
       const log = await fs.readFile(logPath, 'utf8').catch(() => '')
-      const ended = log.trim().split('\n').filter((line) => line !== '' && JSON.parse(line).type === 'turn/end').length
+      // The server may be mid-append: a torn last line is not an event yet.
+      const isTurnEnd = (line: string): boolean => {
+        try { return (JSON.parse(line) as { type?: string }).type === 'turn/end' } catch { return false }
+      }
+      const ended = log.trim().split('\n').filter((line) => line !== '' && isTurnEnd(line)).length
       const rows = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
       if (ended === turnsDone && rows.find((row) => row.id === id)?.status === 'idle') return
       if (Date.now() > deadline) throw new Error('turn did not settle')

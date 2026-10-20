@@ -1,4 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
+import type { AppConfigView, LimitEdit } from '../../src/harness/config/types.ts'
 import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, CommandRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, ResourceSourcesDoc, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow, WorkspaceSourcesRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
@@ -389,6 +390,32 @@ export function testProvider(id: string, model?: string): Promise<{ ok: boolean;
   }).then((r) => json<{ ok: boolean; error?: string }>(r))
 }
 
+/** Global configuration descriptor: observed file, active limits and per-field metadata. */
+export function getAppConfig(): Promise<AppConfigView> {
+  return apiFetch('/api/app-config').then((r) => json<AppConfigView>(r))
+}
+
+/**
+ * Apply field-scoped limit edits against the file revision the editor loaded.
+ * A stale `expectedHash` is refused with 409 rather than overwriting the file.
+ */
+export function patchAppConfig(edits: readonly LimitEdit[], expectedHash: string): Promise<AppConfigView> {
+  return apiFetch('/api/app-config', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedHash, edits }),
+  }).then((r) => json<AppConfigView>(r))
+}
+
+/** Activate the configuration file as it is on disk now (manual edits included). */
+export function reloadAppConfig(): Promise<AppConfigView> {
+  return apiFetch('/api/app-config/reload', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).then((r) => json<AppConfigView>(r))
+}
+
 /** Live connection state of one session's event stream. */
 export type StreamState = 'idle' | 'connecting' | 'open' | 'reconnecting'
 
@@ -414,16 +441,25 @@ export function subscribeEventsIn(
   onEnvelope: (envelope: Envelope, cursor?: number) => void,
   onState?: (state: StreamState) => void,
   cursor?: number,
+  options?: { readonly delegationsOnly?: boolean },
 ): () => void {
-  const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
   const base = `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`
+  // `view=delegations` asks the server to project only delegation facts, for a
+  // root stream the client reads nothing else from.
+  const url = (from: number | undefined): string => {
+    const query = new URLSearchParams()
+    if (options?.delegationsOnly === true) query.set('view', 'delegations')
+    if (from !== undefined && Number.isSafeInteger(from) && from >= 0) query.set('cursor', String(from))
+    const text = query.toString()
+    return text === '' ? base : `${base}?${text}`
+  }
   let last: number | undefined
   const track = (envelope: Envelope, frame?: number): void => {
     if (frame !== undefined) last = frame
     onEnvelope(envelope, frame)
   }
   return reviving(
-    () => new EventSource(last !== undefined ? `${base}?cursor=${last}` : `${base}${suffix}`),
+    () => new EventSource(url(last ?? cursor)),
     (source) => wire(source, track, onState),
     onState,
   )
@@ -1234,6 +1270,33 @@ export function setImageUnderstandingSettings(update: ImageUnderstandingSettings
   }).then((r) => json<ImageUnderstandingSettings>(r))
 }
 
+/** Settings → Providers & Models → Speech-to-text: the dictation model (OpenAI-compatible /audio/transcriptions). */
+export type SpeechToTextSettings = ImageGenerationSettings
+
+export function getSpeechToTextSettings(): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text').then((r) => json<SpeechToTextSettings>(r))
+}
+
+export function setSpeechToTextSettings(update: SpeechToTextSettings): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<SpeechToTextSettings>(r))
+}
+
+/** Dictate one audio blob to text; the server proxies the configured provider. */
+export async function transcribeSpeech(blob: Blob, language?: string): Promise<string> {
+  const query = language !== undefined && language !== '' ? `?language=${encodeURIComponent(language)}` : ''
+  const response = await apiFetch(`/api/speech-to-text/transcribe${query}`, {
+    method: 'POST',
+    headers: { 'content-type': blob.type !== '' ? blob.type : 'application/octet-stream' },
+    body: blob,
+  })
+  if (!response.ok) throw new Error(((await response.json().catch(() => ({}))) as { error?: string }).error ?? `transcription failed (${response.status})`)
+  return ((await response.json()) as { text: string }).text
+}
+
 /** Settings → Providers & Models → Videos: the provider/model the GenerateVideo tool calls. */
 export type VideoGenerationSettings = ImageGenerationSettings
 
@@ -1796,9 +1859,15 @@ export function getMcpServer(workspaceId: string, name: string): Promise<Record<
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(name)}`).then((r) => json<Record<string, unknown>>(r))
 }
 
-export function deleteMcpServer(workspaceId: string, name: string): Promise<{ readonly deleted: string }> {
+/** Managed OAuth only: the local grant is always revoked; the provider's answer is reported apart. */
+export interface McpServerDeleted {
+  readonly deleted: string
+  readonly revocation?: { readonly local: 'revoked'; readonly remote: 'succeeded' | 'failed' | 'unavailable' }
+}
+
+export function deleteMcpServer(workspaceId: string, name: string): Promise<McpServerDeleted> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) =>
-    json<{ readonly deleted: string }>(r),
+    json<McpServerDeleted>(r),
   )
 }
 
@@ -1900,9 +1969,20 @@ export function setSecret(workspaceId: string, key: string, value: string): Prom
   }).then((r) => json<{ readonly rotated: string; readonly reconnected?: readonly string[] }>(r))
 }
 
-export function deleteSecret(workspaceId: string, key: string): Promise<{ readonly deleted: string }> {
+/**
+ * `localFence`: no new MCP dispatch uses the deleted value once this answers.
+ * `remoteRevocation`: a plain secret is never revoked at its issuer from here.
+ */
+export interface SecretDeleted {
+  readonly deleted: string
+  readonly localFence: 'fenced'
+  readonly affectedServers: readonly string[]
+  readonly remoteRevocation: 'not_applicable'
+}
+
+export function deleteSecret(workspaceId: string, key: string): Promise<SecretDeleted> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/secrets/${encodeURIComponent(key)}`, { method: 'DELETE' }).then((r) =>
-    json<{ readonly deleted: string }>(r),
+    json<SecretDeleted>(r),
   )
 }
 

@@ -88,4 +88,21 @@ describe('reconcileSubagentRows', () => {
       { childSessionId: 'c1', status: 'failed', definitionName: 'explorer', startedAt: 1_000 },
     ])).toBe(rows)
   })
+
+  it('a resumed child runs again until its next result', () => {
+    const resumed = subagentRows([
+      spawn('c1'),
+      ev('agent/child-result', { childSessionId: 'c1', status: 'completed', timestamp: 2_000 }),
+      ev('agent/child-resume', { childSessionId: 'c1', timestamp: 3_000 }),
+    ])
+    expect(resumed[0]).toMatchObject({ running: true, dispatchedAt: 3_000 })
+    expect(resumed[0]?.status).toBeUndefined()
+    const settled = subagentRows([
+      spawn('c1'),
+      ev('agent/child-result', { childSessionId: 'c1', status: 'completed', timestamp: 2_000 }),
+      ev('agent/child-resume', { childSessionId: 'c1', timestamp: 3_000 }),
+      ev('agent/child-result', { childSessionId: 'c1', status: 'failed', timestamp: 4_000 }),
+    ])
+    expect(settled[0]).toMatchObject({ running: false, status: 'failed', endedAt: 4_000 })
+  })
 })

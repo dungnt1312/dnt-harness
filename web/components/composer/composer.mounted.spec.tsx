@@ -4,6 +4,7 @@
  * chips, pasted files, and ArrowUp recall. Sending, chips in the
  * control row and permissions are covered by the product-copy specs.
  */
+import '../../test-css-escape.ts'
 import { act, StrictMode, useEffect, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -132,13 +133,6 @@ describe('composer placeholder', () => {
   })
 })
 
-// jsdom ships no CSS.escape, which every browser has; the completion popover
-// uses it to find its active option by a React useId (":r1:"-style) id.
-if (typeof globalThis.CSS?.escape !== 'function') {
-  const escape = (value: string): string =>
-    value.replace(/^(\d)/, '\\3$1 ').replace(/[^a-zA-Z0-9_ -￿-]/g, (char) => `\\${char}`)
-  ;(globalThis as { CSS?: unknown }).CSS = { ...(globalThis.CSS ?? {}), escape }
-}
 // jsdom does no layout, so it has no scrollIntoView either; the popover only
 // uses it to keep the active option visible.
 if (typeof Element !== 'undefined' && typeof Element.prototype.scrollIntoView !== 'function') {

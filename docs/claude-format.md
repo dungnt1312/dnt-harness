@@ -48,8 +48,12 @@ The retired `INSTRUCTIONS.md` files are no longer read.
 Sources — all merged, all run: `~/.claude/settings.json`,
 `<ws>/settings.json`, `<project>/.claude/settings.json`,
 `<project>/.claude/settings.local.json`. `disableAllHooks: true` anywhere turns
-every hook off. Loading is lenient (bad entries are skipped and listed in
-Settings → Hooks); saving the workspace layer is strict.
+every hook off. Loading is lenient (entries dnt-harness cannot run are not run
+and are listed in Settings → Hooks). Saving the workspace layer validates
+command hooks strictly and keeps everything else exactly as written, in its
+place: events dnt-harness does not know, hooks of other types (`prompt`,
+`agent`, …) and fields it does not understand. The editor shows such hooks
+read-only as "not run · kept"; change them in the raw JSON.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Write|Edit",
@@ -186,8 +190,10 @@ Format: Claude Code subagent Markdown with YAML frontmatter.
 - `skills`: comma string or list; preloaded into the child.
 - `mcpServers`: comma string or list of server names; limits an inheriting
   role's MCP tools to those servers.
+- `background`: `true` or `false`; `true` makes the role's children outlive the
+  spawning turn and report back on their own (a spawn's `background` wins).
 - Recognized, not enforced, reported as notes: `permissionMode`, `hooks`,
-  `memory`, `color`, `effort`, `isolation`, `background`,
+  `memory`, `color`, `effort`, `isolation`,
   `maxTurns`. Unknown keys are ignored with a note.
 
 Settings → Agents lists every layer with its source and path; create/paste

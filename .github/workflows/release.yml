@@ -1,34 +1,198 @@
 name: Release
 
-# Push a version tag (npm version patch && git push --follow-tags) to publish.
+# Publish by tagging the merge commit on main by hand, after the push-to-main
+# `linux-suite` run for that commit is green (package.json already holds the
+# release version, so do not run `npm version`):
+#   git tag -a v0.3.0 <main sha> -m v0.3.0 && git push origin v0.3.0
+#
+# Publish runs only after EVERY gate job passes AND a required reviewer approves
+# the protected `release` environment. Repository admin setup (not expressible
+# in this file, must exist before relying on tag-triggered publish):
+#   1. Settings → Environments → `release`: required reviewers (≥1),
+#      deployment branches/tags limited to `v*` tags. "Prevent self-review" is
+#      off because the repository has a single maintainer, who is both tag
+#      author and reviewer; with a second maintainer, turn it on.
+#   2. Settings → Rules → tag ruleset for `v*`: restrict creation/update/
+#      deletion to maintainers (tag protection).
+#   3. npm trusted publisher bound to this repo + `release.yml` + environment
+#      `release`.
+# The Windows launcher/PM2 smoke is the `windows-smoke` gate; remaining manual
+# evidence is attached to the approval per docs/release-checklist.md. Typecheck alone is not a security gate.
+#
+# All actions are pinned to full commit SHAs (version in the trailing comment).
 on:
   push:
     tags: ['v*']
+  # Dry run: a pull request that touches this file runs every gate job and the
+  # pack job, but never `publish` (it only runs for a tag, and the `release`
+  # environment only admits `v*` tags). The tag-equals-version checks are
+  # skipped because there is no tag.
+  pull_request:
+    paths: ['.github/workflows/release.yml']
 
+# Least privilege by default; only the publish job gets the OIDC token.
 permissions:
   contents: read
-  # npm trusted publishing (OIDC): no long-lived NPM_TOKEN.
-  id-token: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  typecheck-build:
+    name: Gate · typecheck + build:web
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: 10
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run typecheck
-      # The full suite is run locally before tagging. Several process/hook tests
-      # depend on the host environment and fail on GitHub's Linux runners.
+          bun-version: 1.4.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.20.0
+      - run: bun install --frozen-lockfile
+      - run: node scripts/node-preflight.mjs
+      - run: bun run typecheck
+      - run: bun run build:web
       - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
+
+  deterministic-suites:
+    name: Gate · affected deterministic suites
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.20.0
+      - run: bun install --frozen-lockfile
+      - run: node scripts/node-preflight.mjs
+      # The runtime/provider hardening specs plus the PTY, headless, media and
+      # MCP OAuth suites proven stable on this runner by linux-suite.yml. The
+      # full suite runs on every pull request there (see docs/release-checklist.md).
+      - name: Vitest (Node 22.20)
+        run: >-
+          node node_modules/vitest/vitest.mjs run
+          tests/harness/outbound-http.spec.ts
+          tests/harness/mcp-outbound-policy.spec.ts
+          tests/scripts/repo-freeze.spec.ts
+          tests/web/terminals-lifecycle.spec.ts
+          tests/harness/effective-model.spec.ts
+          tests/harness/provider-error-classification.spec.ts
+          tests/harness/reasoning-round-trip.spec.ts
+          tests/harness/llm-openai.spec.ts
+          tests/scripts/bench-metrics.spec.ts
+          tests/harness/base-prompt-guidance.spec.ts
+          tests/web/terminals-posix.spec.ts
+          tests/web/terminals.spec.ts
+          tests/web/server-terminals.spec.ts
+          tests/web/server-models.spec.ts
+          tests/bins/headless.spec.ts
+          tests/harness/image-tools.spec.ts
+          tests/harness/image-tools-mode-exposure.spec.ts
+          tests/harness/video-tools.spec.ts
+          tests/harness/mcp-oauth.spec.ts
+          tests/harness/mcp-oauth-config.spec.ts
+          tests/harness/mcp-oauth-discovery.spec.ts
+          tests/harness/mcp-oauth-registration.spec.ts
+          tests/web/mcp-oauth-connect.spec.ts
+          tests/web/mcp-oauth-paste.spec.ts
+          tests/web/mcp-oauth-races.spec.ts
+          tests/web/mcp-oauth-redirect.spec.ts
+          tests/web/mcp-shutdown-oauth.spec.ts
+          tests/harness/mcp-client-fixes.spec.ts
+        timeout-minutes: 15
+
+  runtime-probes:
+    name: Gate · Bun runtime + PTY probes (Linux, macOS)
+    # Bun 1.4.3: real Undici dispatcher, DNS policy, and
+    # `bun scripts/pty-probes.mjs --require` (real bash PTY teardown on Linux,
+    # zsh and bash on macOS).
+    uses: ./.github/workflows/runtime-probes.yml
+    permissions:
+      contents: read
+
+  windows-smoke:
+    name: Gate · Windows launcher / PM2 smoke
+    # The packed tarball installed with Bun 1.4.3 on Windows: version, PM2
+    # launch with an absolute Bun interpreter, /api/health, workbench terminals,
+    # ConPTY smoke, reviewed bun-pty DLL hashes, pm2 restart/stop budget, and a
+    # headless chat against a local fake gateway (no provider secret).
+    uses: ./.github/workflows/windows-smoke.yml
+    permissions:
+      contents: read
+
+  # Build the tarball WITHOUT the OIDC token: `bun install` and `npm pack`
+  # (prepack runs `vite build`) execute dependency code.
+  # None of that code ever sees `id-token: write`.
+  pack:
+    name: Pack tarball (no OIDC)
+    needs: [typecheck-build, deterministic-suites, runtime-probes, windows-smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.20.0
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
+      - run: bun install --frozen-lockfile
       # prepack runs `vite build`, so web-dist/ is fresh in the tarball.
-      # Trusted publishing (OIDC, npm >= 11.5.1): npm exchanges the GitHub ID token itself.
-      - run: npm --version && npm publish --loglevel verbose
+      - name: npm pack
+        run: |
+          mkdir -p pack-out
+          npm pack --pack-destination pack-out
+          ls -l pack-out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarball
+          path: pack-out/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish (npm, OIDC)
+    needs: [pack]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    # Protected environment: required reviewers must approve before this job
+    # starts (and before any OIDC token can be minted).
+    environment: release
+    permissions:
+      contents: read
+      # npm trusted publishing (OIDC): no long-lived NPM_TOKEN.
+      id-token: write
+    # No checkout, no install, no repo code: only the prebuilt tarball is
+    # published, with lifecycle scripts disabled.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tarball
+          path: pack-out
+      # npm stays only for trusted publishing (OIDC), which bun publish lacks.
+      # Trusted publishing needs npm >= 11.5.1: Node 24.22.0 ships npm 11.19.1
+      # (verified via https://nodejs.org/dist/index.json). Bump deliberately.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          registry-url: https://registry.npmjs.org
+      - name: npm publish (prebuilt tarball, scripts disabled)
+        run: |
+          npm --version
+          shopt -s nullglob
+          tarballs=(pack-out/*.tgz)
+          test "${#tarballs[@]}" -eq 1
+          test "$(basename "${tarballs[0]}")" = "dnt-harness-${GITHUB_REF_NAME#v}.tgz"
+          npm publish "./${tarballs[0]}" --ignore-scripts --loglevel verbose

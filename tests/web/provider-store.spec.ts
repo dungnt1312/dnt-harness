@@ -2,6 +2,8 @@ import { mkdir as fsMkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/prom
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { DEEPSEEK_MODELS } from '../../src/harness/llm/deepseek.ts'
+import { CONTEXT_1M, resolveContextLimit } from '../../src/harness/llm/model-catalog.ts'
 import { loadProviderStore, loadProviders, maskKey, parseProviderStore, parseProviders, saveProviderStore, saveProviders, slugify, validateModelAliasName } from '../../src/web/provider-store.ts'
 
 let dir = ''
@@ -56,6 +58,20 @@ describe('provider store', () => {
       providers: [{ id: 'a', name: 'A', baseUrl: 'http://x/v1', apiKey: '', models: ['first', 'second'], defaultModel: 'second', enabled: true }],
     }))
     expect(store.providers[0]).toEqual({ id: 'a', name: 'A', baseUrl: 'http://x/v1', apiKey: '', models: ['first', 'second'], enabled: true })
+  })
+
+  it('keeps provider kinds: absent means chat, stt-only stays out of chat lists', () => {
+    const store = parseProviderStore(JSON.stringify({
+      version: 2,
+      defaults: { provider: null, model: null, thinkingLevel: null },
+      providers: [
+        { id: 'chat', name: 'Chat', baseUrl: 'http://x/v1', apiKey: '', models: ['m1'], enabled: true },
+        { id: 'groq-stt', name: 'Groq STT', baseUrl: 'http://y/v1', apiKey: '', models: [], enabled: true, kinds: ['stt'] },
+        { id: 'both', name: 'Both', baseUrl: 'http://z/v1', apiKey: '', models: ['m2'], enabled: true, kinds: ['chat', 'stt'] },
+        { id: 'junk', name: 'Junk', baseUrl: 'http://w/v1', apiKey: '', models: [], enabled: true, kinds: ['stt', 'nonsense'] },
+      ],
+    }))
+    expect(store.providers.map((entry) => entry.kinds ?? ['chat'])).toEqual([['chat'], ['stt'], ['chat', 'stt'], ['stt']])
   })
 
   it('round-trips a versioned envelope including explicit global defaults', async () => {
@@ -118,10 +134,13 @@ describe('provider store', () => {
       name: 'deepseek',
       baseUrl: process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com',
       apiKey: 'env-key',
-      models: ['deepseek-chat', 'deepseek-reasoner'],
+      models: [...DEEPSEEK_MODELS],
       enabled: true,
     }]))
-    expect(seeded[0]?.models[0]).toBe('deepseek-chat')
+    // The retired deepseek-chat/-reasoner names are never offered by default.
+    expect(seeded[0]?.models[0]).toBe('deepseek-flash')
+    expect(seeded[0]?.models).not.toContain('deepseek-chat')
+    expect(resolveContextLimit('deepseek-flash')).toBe(CONTEXT_1M)
   })
 
   it('parses per-model settings and drops junk fields', () => {

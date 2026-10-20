@@ -100,6 +100,10 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     // Model selection is per conversation, with a global default behind it.
     // Control-plane auth off: the shell loads without a pairing step.
     if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
+    if (path === '/api/model-aliases') return json(route, [])
+    // Dictation asks once whether a speech-to-text pair is set; unset hides the mic.
+    if (path === '/api/speech-to-text') return json(route, { provider: null, model: null })
+    if (path === '/api/workspaces/w/commands') return json(route, { commands: [], errors: [] })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path)) return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
     // No extra folder grants: file tools stay within the bound project.
@@ -117,7 +121,7 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path) && method === 'GET') return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path) && method === 'GET') return json(route, [])
     if (path === '/api/workspaces/w/terminals' && method === 'GET') return json(route, { terminals: [], shells: [], available: false })
-    if (path === '/api/workspaces/w/projects/p/git' && method === 'GET') return json(route, { branch: null, changes: [], truncated: false })
+    if (path === '/api/workspaces/w/projects/p/git' && method === 'GET') return json(route, { branch: null, branchInfo: null, head: null, changes: [], truncated: false })
     // Fail loudly instead of leaving the request hanging.
     unexpected.push(`${method} ${path}`)
     return json(route, { error: `unexpected fixture request ${method} ${path}` }, 500)
@@ -266,7 +270,7 @@ test('workbench docks beside the chat, browses project files and opens them as t
   // The tab strip only renders on the Files view, so the close happens here.
   const openedTab = workbench.getByRole('group', { name: 'Open files' }).getByRole('button', { name: 'step-8.ts', exact: true })
   await expect(openedTab).toHaveAttribute('aria-pressed', 'true')
-  await expect(workbench.getByRole('region', { name: 'Contents of src/step-8.ts' })).toContainText('"private": true')
+  await expect(workbench.getByRole('textbox', { name: 'Contents of src/step-8.ts' })).toContainText('"private": true')
   await workbench.getByRole('button', { name: 'Close src/step-8.ts' }).click()
   await expect(openedTab).toHaveCount(0)
 
@@ -286,7 +290,7 @@ test('tool rows open recorded project paths in the workbench', async ({ page }) 
   // accessible name is the file name; the title carries the full path).
   await transcript.getByRole('button', { name: 'step-8.ts' }).click()
   const workbench = page.getByRole('region', { name: 'Workbench' })
-  await expect(workbench.getByRole('region', { name: 'Contents of src/step-8.ts' })).toBeVisible()
+  await expect(workbench.getByRole('textbox', { name: 'Contents of src/step-8.ts' })).toBeVisible()
 })
 
 test('workbench remembers closed state and width, resizes by keyboard and expands to full width', async ({ page }) => {
@@ -360,7 +364,7 @@ for (const theme of ['light', 'dark'] as const) {
 
     const workbench = page.getByRole('region', { name: 'Workbench' })
     await workbench.getByRole('list', { name: 'Project files' }).getByRole('button', { name: /package\.json/ }).click()
-    await expect(workbench.getByRole('region', { name: 'Contents of package.json' })).toBeVisible()
+    await expect(workbench.getByRole('textbox', { name: 'Contents of package.json' })).toBeVisible()
     await page.screenshot({ path: `${screenshotRoot}/${theme}-workbench-file-1440.png` })
     const workbenchAxe = await new AxeBuilder({ page }).include('[aria-label="Workbench"]').withTags([...AXE_TAGS]).analyze()
     expect(workbenchAxe.violations.map((violation) => `${violation.id}: ${violation.nodes.map((node) => node.target.join(' ')).join(', ')}`)).toEqual([])

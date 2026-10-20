@@ -1,7 +1,7 @@
 /**
  * Dry-run or apply the v1 → v2 MCP migration for one workspace.
  *
- *   npx tsx src/bins/migrate-mcp.ts --data-dir <home> --workspace <id> [--apply]
+ *   bun src/bins/migrate-mcp.ts --data-dir <home> --workspace <id> [--apply]
  *
  * Without `--apply` the command only prints the plan. It does not open a
  * network connection, spawn a server, or rewrite config.

@@ -10,6 +10,7 @@ import type { McpServerConfig } from '../harness/mcp/config.ts'
 import { discoverOAuth, OAuthConnectError } from '../harness/mcp/oauth-discovery.ts'
 import { resolveClient } from '../harness/mcp/oauth-registration.ts'
 import type { ManagedOAuth } from '../harness/mcp/oauth.ts'
+import type { OutboundHttp } from '../harness/mcp/outbound-http.ts'
 import type { OAuthServerRecord, OAuthStore } from '../harness/mcp/oauth-store.ts'
 
 export const OAUTH_CALLBACK_PATH = '/api/mcp/oauth/callback'
@@ -101,7 +102,8 @@ export async function beginConnect(input: {
   /** Validated `--oauth-origin` values. */
   readonly oauthOrigins: readonly string[]
   readonly extraScopes: readonly string[]
-  readonly fetchImpl?: typeof fetch
+  /** Test seam: a policy transport with an injected low-level sender. */
+  readonly http?: OutboundHttp
 }): Promise<BeginConnectResult> {
   const auth = managedAuthOf(input.config)
   const url = input.config.url
@@ -110,7 +112,7 @@ export async function beginConnect(input: {
   }
   const { mode: redirectMode, redirectUri } = resolveRedirect(input.hostHeader, input.boundPort, input.oauthOrigins)
   const discovered = await discoverOAuth(url, {
-    ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {}),
+    ...(input.http !== undefined ? { http: input.http } : {}),
     ...(auth.scopes !== undefined && auth.scopes.length > 0 ? { scopes: auth.scopes } : {}),
   })
   const stored = await input.store.readServerRecord(input.workspaceId, input.server)
@@ -121,7 +123,7 @@ export async function beginConnect(input: {
     discovered,
     redirectUri,
     previous,
-    ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {}),
+    ...(input.http !== undefined ? { http: input.http } : {}),
   })
   const reconnecting = input.extraScopes.length > 0 || tokens?.missingScope !== undefined
   const scopes = unique([

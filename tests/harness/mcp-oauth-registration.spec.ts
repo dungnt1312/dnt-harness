@@ -3,6 +3,7 @@ import { discoverOAuth, OAuthConnectError } from '../../src/harness/mcp/oauth-di
 import { resolveClient } from '../../src/harness/mcp/oauth-registration.ts'
 import type { OAuthServerRecord } from '../../src/harness/mcp/oauth-store.ts'
 import { startOAuthFixture, type OAuthFixture, type OAuthFixtureOptions } from '../support/oauth-fixture.ts'
+import { senderHttp } from '../support/outbound-sender.ts'
 
 let fixture: OAuthFixture | undefined
 afterEach(async () => { await fixture?.close(); fixture = undefined })
@@ -24,7 +25,7 @@ describe('resolveClient', () => {
   it('rejects an untrusted loopback registration endpoint for a public resource', async () => {
     const { found } = await discovered()
     let called = false
-    await expect(resolveClient({ discovered: { ...found, resource: 'https://public.example/mcp', registrationEndpoint: 'http://127.0.0.1:1234/register' }, redirectUri, fetchImpl: (async () => { called = true; return Response.json({}) }) as typeof fetch })).rejects.toThrow(/plain HTTP/)
+    await expect(resolveClient({ discovered: { ...found, resource: 'https://public.example/mcp', registrationEndpoint: 'http://127.0.0.1:1234/register' }, redirectUri, http: senderHttp(async () => { called = true; return Response.json({}) }) })).rejects.toThrow(/plain HTTP/)
     expect(called).toBe(false)
   })
 
