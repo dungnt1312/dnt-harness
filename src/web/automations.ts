@@ -305,6 +305,7 @@ export class AutomationStore {
   private readonly cache = new Map<string, Automation[]>()
   private readonly runs = new Map<string, RunRecord[]>()
   private writes = new Map<string, Promise<void>>()
+  private readonly loads = new Map<string, Promise<readonly Automation[]>>()
 
   constructor(private readonly dir: ((workspaceId: string) => string) | undefined, private readonly now: () => number = Date.now) {}
 
@@ -315,6 +316,18 @@ export class AutomationStore {
   async list(workspaceId: string): Promise<readonly Automation[]> {
     const cached = this.cache.get(workspaceId)
     if (cached !== undefined) return cached
+    // One read per cold workspace: a second reader resolving later must not
+    // put back rows a writer has already replaced (a stale `lastDueAt` would
+    // fire the same due time again).
+    let loading = this.loads.get(workspaceId)
+    if (loading === undefined) {
+      loading = this.load(workspaceId).finally(() => this.loads.delete(workspaceId))
+      this.loads.set(workspaceId, loading)
+    }
+    return loading
+  }
+
+  private async load(workspaceId: string): Promise<readonly Automation[]> {
     let rows: Automation[] = []
     const file = this.file(workspaceId, 'automations.json')
     if (file !== undefined) {
@@ -325,6 +338,8 @@ export class AutomationStore {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.error(`automations: ${file} unreadable: ${String(error)}`)
       }
     }
+    const current = this.cache.get(workspaceId)
+    if (current !== undefined) return current
     this.cache.set(workspaceId, rows)
     return rows
   }

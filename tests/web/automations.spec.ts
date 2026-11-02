@@ -239,6 +239,21 @@ describe('AutomationStore persistence', () => {
     const history = await second.history(WS, created.id)
     expect(history).toEqual([expect.objectContaining({ runId: 'r1', status: 'done', sessionId: 's1', summary: 'ok' })])
   })
+
+  it('a cold read that resolves after a write never restores the older rows', async () => {
+    const dir = (ws: string): string => path.join(home, ws)
+    const first = new AutomationStore(dir)
+    const created = await first.create(WS, base())
+    await first.flush()
+
+    const cold = new AutomationStore(dir)
+    // Two readers miss the cold cache together; one then writes.
+    const [a, b] = [cold.list(WS), cold.list(WS)]
+    await a
+    await cold.update(WS, created.id, { title: 'Renamed' })
+    await b
+    expect((await cold.list(WS)).map((row) => row.title)).toEqual(['Renamed'])
+  })
 })
 
 describe('text helpers', () => {
