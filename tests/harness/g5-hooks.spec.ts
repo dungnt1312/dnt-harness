@@ -20,6 +20,7 @@ import {
   writeWorkspaceHooks,
   type ClaudeHookEvent,
 } from 'dnt-harness'
+import { isHookConfigPath } from '../../src/harness/hooks/settings.ts'
 
 const fixture = fileURLToPath(new URL('../fixtures/hook-command.mjs', import.meta.url))
 const cmd = (mode: string): string => `"${process.execPath}" "${fixture}" ${mode}`
@@ -147,6 +148,19 @@ describe('settings.json hooks section', () => {
     expect(migrated.hooks.PreToolUse?.[0]).toEqual({ matcher: 'Bash', hooks: [{ type: 'command', command: "/usr/bin/node 'a b.js' x", timeout: 3 }] })
     expect(migrated.hooks.PostToolUse?.[0]?.matcher).toBe('mcp__.*')
     await expect(fs.stat(path.join(legacy, 'hooks.json.migrated'))).resolves.toBeTruthy()
+  })
+})
+
+describe('hook configuration paths', () => {
+  it('matches dot segments, backslashes and case the way the write resolves them', () => {
+    for (const target of ['.claude/./settings.json', 'repo/.claude/x/../settings.local.json', '.claude/./hooks/a.sh', 'repo\\.claude\\.\\hooks\\b.sh', 'repo/.CLAUDE/Settings.json']) {
+      expect(isHookConfigPath(target), target).toBe(true)
+    }
+    expect(isHookConfigPath('C:/Users/me/.claude/./hooks/x.sh', ['C:\\Users\\me\\.claude'])).toBe(true)
+    expect(isHookConfigPath('c:/users/me/claude-home/settings.json', ['C:/Users/me/claude-home'])).toBe(true)
+    for (const target of ['.claude/settings.json/../notes.md', '.claude/skills/x/SKILL.md', 'settings.json']) {
+      expect(isHookConfigPath(target), target).toBe(false)
+    }
   })
 })
 
