@@ -404,7 +404,10 @@ describe('G5 web MCP + hooks', () => {
       const initFile = path.join(home, 'slow-disable.txt')
       await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { INIT_FILE: initFile, INIT_DELAY_MS: '700' }, enabled: true })
       const enabling = post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      // Disable only once initialization is provably in flight (the fixture
+      // records `initialize` before its delay). A fixed sleep let a slow
+      // runner deliver Disable first, and a later Enable then rightly won.
+      await expect.poll(() => fs.stat(initFile).then(() => true, () => false), { timeout: 5_000, interval: 20 }).toBe(true)
       const disabled = await post(base, `/api/workspaces/${wsId}/mcp/fixture/disable`)
       expect(disabled.status).toBe(200)
       await enabling.catch(() => undefined)
