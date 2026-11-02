@@ -102,21 +102,30 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
     return
   }
   if (process.platform === 'win32') {
-    // Windows has no process groups; taskkill /T takes the tree down. A
-    // second pass reaps MSYS children that were mid-spawn during the first
-    // tree walk (taskkill's parent walk races Git Bash's fork chain).
-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-    killer.on('error', () => {
-      child.kill('SIGKILL')
-    })
+    // Windows has no process groups; taskkill /T takes the tree down. Once the
+    // root has exited its PID may belong to an unrelated process, so a PID
+    // kill is only issued while the root is provably still running; orphans
+    // are reached through the tree-tag sweep below.
+    const rootAlive = (): boolean => child.exitCode === null && child.signalCode === null
+    if (rootAlive()) {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      killer.on('error', () => {
+        if (rootAlive()) child.kill('SIGKILL')
+      })
+    }
     // A process forked while the walk killed its parent is orphaned, so no
     // later tree walk reaches it. It still carries the tree tag in its
     // environment: sweep MSYS processes by that tag until none remain.
     spawn(shell, ['-c', sweepByTag(treeTag)], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
-    setTimeout(() => {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
-      child.kill('SIGKILL')
-    }, 250).unref?.()
+    if (rootAlive()) {
+      // A second pass reaps MSYS children that were mid-spawn during the first
+      // tree walk (taskkill's parent walk races Git Bash's fork chain).
+      setTimeout(() => {
+        if (!rootAlive()) return
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
+        child.kill('SIGKILL')
+      }, 250).unref?.()
+    }
     return
   }
   try {
