@@ -251,6 +251,38 @@ describe('control-plane authentication', () => {
     expect(stale.status).toBe(401)
   })
 
+  it('lets only the paired browser change hooks or modes; a sessions bearer may still read them', async () => {
+    const live = await start()
+    const paired = await raw(live.url, 'POST', '/api/auth/pair', {
+      'content-type': 'application/json',
+      origin: live.auth.canonicalOrigin,
+    }, JSON.stringify({ code: live.auth.issuePairingCode().code }))
+    const browser = {
+      cookie: String(paired.headers['set-cookie']).split(';')[0] ?? '',
+      origin: live.auth.canonicalOrigin,
+      'x-dnt-harness-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
+      'content-type': 'application/json',
+    }
+    const bearer = { authorization: `Bearer ${live.auth.issueBearer(['sessions']).token}`, 'content-type': 'application/json' }
+    const wsId = (JSON.parse((await raw(live.url, 'GET', '/api/workspaces', bearer)).body) as { id: string }[])[0]!.id
+    const session = JSON.parse((await raw(live.url, 'POST', `/api/workspaces/${wsId}/sessions`, bearer, '{}')).body) as { id: string }
+    const base = `/api/workspaces/${wsId}`
+
+    const refused = [
+      await raw(live.url, 'PUT', `${base}/hooks`, bearer, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo pwned' }] }] } })),
+      await raw(live.url, 'PUT', `${base}/hooks/0123456789abcdef`, bearer, JSON.stringify({ active: false })),
+      await raw(live.url, 'PUT', `${base}/mode`, bearer, JSON.stringify({ modeId: 'full-access' })),
+      await raw(live.url, 'POST', `${base}/modes/full-access/duplicate`, bearer, JSON.stringify({ newId: 'mine' })),
+      await raw(live.url, 'PUT', `${base}/modes/full-access/enabled`, bearer, JSON.stringify({ enabled: false })),
+      await raw(live.url, 'PUT', `${base}/sessions/${session.id}/mode`, bearer, JSON.stringify({ modeId: 'full-access' })),
+    ]
+    expect(refused.map((response) => response.status)).toEqual([401, 401, 401, 401, 401, 401])
+    expect((await raw(live.url, 'GET', `${base}/mode`, bearer)).status).toBe(200)
+    expect((await raw(live.url, 'GET', `${base}/hooks`, bearer)).status).toBe(200)
+
+    expect((await raw(live.url, 'PUT', `${base}/sessions/${session.id}/mode`, browser, JSON.stringify({ modeId: 'full-access' }))).status).toBe(200)
+  })
+
   it('ships no test bootstrap: no runtime switch in src/ can mint a session or skip auth', async () => {
     // Tests mint codes through the in-process handle; operators through stdout
     // or the operator channel. An env/test flag would be a production bypass.

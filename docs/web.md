@@ -742,7 +742,10 @@ network bind. To reach the app from another machine, keep the server on
 loopback and put an authenticated reverse proxy in front (add the proxy's name
 to `allowedHosts`); terminals stay `403` on any non-loopback bind either way.
 With control-plane auth on, every terminal route is browser principal only:
-a bearer token of any scope gets `401`.
+a bearer token of any scope gets `401`. So are writes to workspace hooks
+(`…/hooks`, `…/hooks/:id`), mode authoring (`…/modes/**`) and mode selection
+(`…/mode`, `…/sessions/:id/mode`): each is a standing grant, like an
+approval. Reading them stays open to a `sessions` bearer.
 
 ## The `Host` allowlist
 

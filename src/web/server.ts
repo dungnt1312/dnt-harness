@@ -5615,6 +5615,14 @@ async function handleApi(
   }
 
   try {
+    // Hooks run commands at later events and a mode decides what runs without
+    // a question, so changing either is a standing grant: like approvals, only
+    // the paired browser may do it. Reads stay open to every principal.
+    if (req.method !== 'GET' && req.method !== 'HEAD' && BROWSER_ONLY_WRITES.some((pattern) => pattern.test(pathname)) && !browserPrincipal(req, deps, req.method ?? 'POST')) {
+      send(401, { error: 'hook and mode changes require the browser session that owns the workspace' })
+      return
+    }
+
     // ── workspaces ───────────────────────────────────────────
     if (pathname === '/api/workspaces') {
       if (req.method === 'GET') {
@@ -8876,6 +8884,14 @@ async function handleApi(
     fail(error)
   }
 }
+
+/** Workspace routes whose writes only the browser principal may make. */
+const BROWSER_ONLY_WRITES: readonly RegExp[] = [
+  /^\/api\/workspaces\/[^/]+\/hooks(?:\/[^/]+)?$/,
+  /^\/api\/workspaces\/[^/]+\/mode$/,
+  /^\/api\/workspaces\/[^/]+\/modes(?:\/.*)?$/,
+  /^\/api\/workspaces\/[^/]+\/sessions\/[^/]+\/mode$/,
+]
 
 /** A session-grant edit based on an out-of-date revision. */
 class StaleGrantsError extends Error {
