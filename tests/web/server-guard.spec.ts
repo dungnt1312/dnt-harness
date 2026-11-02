@@ -416,6 +416,18 @@ describe('live guard authority on a real host (fake Bash)', () => {
     expect(host.executed).toEqual([DANGEROUS_ASK])
   }, 20_000)
 
+  it('switching a pending call\'s conversation to Full access drops its preset ask too', async () => {
+    const host = await bootGuardHost()
+    const root = await openSession(host, host.wsId, 'ask-before-changes')
+    await root.run(DANGEROUS_ASK)
+    const question = await root.stream.wait(isApproval, 'approval')
+    expect(question.guardWarning).toMatch(/Git Destructive/)
+    // Re-evaluated from the HTTP handler, which has no agent scope of its own.
+    expect((await send('PUT', `${host.url}/api/workspaces/${host.wsId}/sessions/${root.id}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(host.executed).toEqual([DANGEROUS_ASK])
+  }, 20_000)
+
   it('workspace Full access / root Ask: saving an UNCHANGED guard config leaves an innocuous Bash ask pending', async () => {
     const host = await bootGuardHost()
     await setWorkspaceMode(host, host.wsId, 'full-access')

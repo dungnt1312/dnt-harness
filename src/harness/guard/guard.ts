@@ -12,9 +12,14 @@ export interface GuardConfigSnapshot {
   readonly hash?: string
 }
 
+/**
+ * Where the config comes from. A source that takes arguments receives the
+ * workspace and the evaluated call's own execution scope (absent for a bare
+ * evaluation), so a per-session choice follows the call, not ambient state.
+ */
 export type GuardConfigSource =
   | (() => DangerousCommandsConfig | GuardConfigSnapshot | Promise<DangerousCommandsConfig | GuardConfigSnapshot>)
-  | ((workspaceId: string) => DangerousCommandsConfig | GuardConfigSnapshot | Promise<DangerousCommandsConfig | GuardConfigSnapshot>)
+  | ((workspaceId: string, exec?: ToolExecution) => DangerousCommandsConfig | GuardConfigSnapshot | Promise<DangerousCommandsConfig | GuardConfigSnapshot>)
 
 export interface GuardOptions {
   readonly configSource: GuardConfigSource
@@ -84,9 +89,9 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
     }
   }
 
-  async function resolveConfig(workspaceId?: string): Promise<GuardConfigSnapshot> {
-    const fn = options.configSource as (...args: string[]) => DangerousCommandsConfig | GuardConfigSnapshot | Promise<DangerousCommandsConfig | GuardConfigSnapshot>
-    const loaded = workspaceId !== undefined && fn.length >= 1 ? await fn(workspaceId) : await fn()
+  async function resolveConfig(workspaceId?: string, exec?: ToolExecution): Promise<GuardConfigSnapshot> {
+    const fn = options.configSource as (workspaceId?: string, exec?: ToolExecution) => DangerousCommandsConfig | GuardConfigSnapshot | Promise<DangerousCommandsConfig | GuardConfigSnapshot>
+    const loaded = workspaceId !== undefined && fn.length >= 1 ? await fn(workspaceId, exec) : await fn()
     if (isSnapshot(loaded)) {
       const hash = loaded.hash ?? configHash(loaded.config)
       return { config: loaded.config, hash, revision: loaded.revision ?? hash }
@@ -123,7 +128,7 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
       retire(executionId)
       let snapshot: GuardConfigSnapshot
       try {
-        snapshot = await resolveConfig(workspaceId)
+        snapshot = await resolveConfig(workspaceId, exec)
       } catch (error) {
         throw new Error(`guard error — config unavailable (${String(error instanceof Error ? error.message : error)}) (fail-closed)`)
       }

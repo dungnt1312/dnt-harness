@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { BUNDLED_MODES, DEFAULT_MODE_ID, ModesService, ModeError, parseModeFile, serializeModeFile } from 'dnt-harness'
+import { modeGuardConfig } from '../../src/harness/modes/bash-policy.ts'
 
 let home = ''
 
@@ -255,5 +256,32 @@ describe('custom modes', () => {
     await modes.save(WS, 'temp-mode', '---\nname: "Temp"\n---\n\nbody')
     await modes.delete(WS, 'temp-mode')
     await expect(modes.resolve(WS, 'temp-mode')).rejects.toBeInstanceOf(ModeError)
+  })
+})
+
+describe('mode guard config', () => {
+  const config = {
+    v: 1 as const,
+    presets: { fsDestructive: 'deny', gitDestructive: 'ask', systemPriv: 'ask', networkExfil: 'deny', dbDestructive: 'ask', resourceExhaust: 'deny' } as const,
+    customRules: [{ id: 'no-deploy', pattern: 'npm run deploy', isRegex: false, action: 'deny' as const }],
+  }
+
+  it('bundled Full access switches every built-in preset off and keeps custom rules', () => {
+    const full = BUNDLED_MODES.find((mode) => mode.id === 'full-access')!
+    const narrowed = modeGuardConfig(full, config, 'h')
+    expect(Object.values(narrowed.config.presets).every((action) => action === 'off')).toBe(true)
+    expect(narrowed.config.customRules).toEqual(config.customRules)
+    expect(narrowed.hash).not.toBe('h')
+  })
+
+  it('other bundled modes keep the config and its hash', () => {
+    for (const mode of BUNDLED_MODES.filter((entry) => entry.id !== 'full-access')) {
+      expect(modeGuardConfig(mode, config, 'h')).toEqual({ config, hash: 'h', revision: 'h' })
+    }
+  })
+
+  it('round-trips dangerousPresets through the mode file', () => {
+    const full = BUNDLED_MODES.find((mode) => mode.id === 'full-access')!
+    expect(parseModeFile('copy', serializeModeFile(full)).dangerousPresets).toBe('off')
   })
 })

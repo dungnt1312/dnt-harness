@@ -39,7 +39,7 @@ import { AutomationError, AutomationScheduler, AutomationStore, automationContex
 import { PushError, PushService, type PushSender } from './push.ts'
 import { ChannelError, NotifyChannels, type ChannelFetch } from './notify-channels.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
-import type { GrantedRoot } from '../harness/tools/types.ts'
+import type { GrantedRoot, ToolExecution } from '../harness/tools/types.ts'
 import { classifyGrantedRoots, classifyTarget, resolveInGrants, targetPaths, within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
@@ -48,7 +48,7 @@ import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry,
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
-import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
+import { liftsReadOnlyBash, modeGuardConfig, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
 import type { HarnessLimits } from '../harness/limits.ts'
 import { APP_CONFIG_FILE, AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
@@ -4163,20 +4163,18 @@ ${entry.description}`.toLowerCase().includes(query))
 
   const dangerousStore = new DangerousCommandsStore(resourceHome)
   const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
-    configSource: async (workspaceId?: string) => {
+    configSource: async (workspaceId?: string, exec?: ToolExecution) => {
       const wid = workspaceId
         ?? (agentScope.getStore()?.workspaceId as string | undefined)
         ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
       const { config, hash } = await dangerousStore.load(wid)
-      // A mode with `dangerousPresets: off` (bundled Full access) runs with the
-      // built-in presets switched off; custom rules keep applying.
-      const scope = agentScope.getStore()
-      const owner = (scope?.rootSessionId ?? scope?.sessionId) as SessionId | undefined
-      if (owner !== undefined && rootModeOf({ sessionId: owner, rootSessionId: owner }, wid as WorkspaceId).mode.definition.dangerousPresets === 'off') {
-        const presets = Object.fromEntries(Object.keys(config.presets).map((id) => [id, 'off'])) as typeof config.presets
-        return { config: { ...config, presets }, hash: `${hash}:presets-off`, revision: `${hash}:presets-off` }
-      }
-      return { config, hash, revision: hash }
+      // The governing mode is the evaluated call's own root, never whatever is
+      // ambient: a re-evaluation from an HTTP handler has no agent scope.
+      const ambient = agentScope.getStore()
+      const owner = (exec?.rootSessionId ?? exec?.sessionId ?? ambient?.rootSessionId ?? ambient?.sessionId) as SessionId | undefined
+      // No session at all keeps the full config: there is no mode to narrow it.
+      if (owner === undefined) return { config, hash, revision: hash }
+      return modeGuardConfig(rootModeOf({ sessionId: owner, rootSessionId: owner }, wid as WorkspaceId).mode.definition, config, hash)
     },
   })
 
