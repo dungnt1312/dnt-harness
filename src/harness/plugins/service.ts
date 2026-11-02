@@ -10,7 +10,7 @@ import type { PluginAgentLayer } from '../agents/definition-service.ts'
 import type { SkillLayer } from '../skills/layers.ts'
 import { describePlugin, type PluginDetails } from './details.ts'
 import { PluginError, readManifest, resolveComponents } from './manifest.ts'
-import { addMarketplace, assertGitUrl, fetchPlugin, findEntry, inspectPlugin, parseMarketplaceInput, readMarketplace, sourceKind, removeMarketplace, updateMarketplace, type MarketplaceDeps, type MarketplaceDocument } from './marketplace.ts'
+import { OFFICIAL_MARKETPLACE, addMarketplace, assertGitUrl, fetchPlugin, findEntry, inspectPlugin, parseMarketplaceInput, readMarketplace, sourceKind, removeMarketplace, updateMarketplace, type MarketplaceDeps, type MarketplaceDocument } from './marketplace.ts'
 import { pluginServers, type PluginServerDraft } from './mcp.ts'
 import {
   PluginStore, parsePluginId, readEnabledPlugins, readSuggestedMarketplaces, scopeSettingsFile, strictlyInside, writeEnabledPlugin,
@@ -281,8 +281,7 @@ export class PluginService {
       if ((await this.store.marketplaces())[parsed.marketplace] === undefined) {
         const source = await this.knownSource(parsed.marketplace, context)
         if (source === undefined) throw new PluginError('not-found', `marketplace '${parsed.marketplace}' is not added; add it in Settings → Plugins first`)
-        const added = await addMarketplace(this.marketplaceDeps, source)
-        if (added.name !== parsed.marketplace) throw new PluginError('invalid', `marketplace source for '${parsed.marketplace}' declares the name '${added.name}'`)
+        await addMarketplace(this.marketplaceDeps, source, parsed.marketplace)
       }
       const found = await findEntry(this.marketplaceDeps, parsed.marketplace, parsed.name)
       if (found === undefined) throw new PluginError('not-found', `no plugin '${parsed.name}' in marketplace '${parsed.marketplace}'`)
@@ -402,11 +401,7 @@ export class PluginService {
   }
 }
 
-/** Anthropic's official marketplace, which Claude Code knows without being told. */
-export const OFFICIAL_MARKETPLACE = {
-  name: 'claude-plugins-official',
-  source: { source: 'github', repo: 'anthropics/claude-plugins-official' },
-} as const satisfies { readonly name: string; readonly source: MarketplaceSource }
+export { OFFICIAL_MARKETPLACE }
 
 /** A marketplace entry source as one readable line. */
 function sourceLocation(source: unknown): string {
