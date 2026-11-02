@@ -68,6 +68,16 @@ function flagSet(args: Words): { letters: Set<string>; long: Set<string>; operan
   return { letters, long, operands }
 }
 
+/**
+ * True when a long flag is `full` or an abbreviation of it. GNU getopt_long
+ * and git accept any unambiguous prefix (`rm --rec`, `git reset --har`), so
+ * a prefix of at least `min` characters counts; over-matching only asks.
+ */
+function hasLong(long: ReadonlySet<string>, full: string, min = 4): boolean {
+  for (const flag of long) if (flag.length >= min && full.startsWith(flag)) return true
+  return false
+}
+
 /** Options that take a value, per wrapper; unknown options stop unwrapping. */
 const WRAPPER_VALUES: Readonly<Record<string, readonly string[]>> = {
   env: ['-u', '--unset', '-C', '--chdir', '-S', '--split-string'],
@@ -115,14 +125,14 @@ function gitMatch(args: Words): string | undefined {
   }
   const sub = args[i]?.value
   const { letters, long, operands } = flagSet(args.slice(i + 1))
-  const has = (short: string, ...names: string[]): boolean => (short !== '' && letters.has(short)) || names.some((name) => long.has(name))
+  const has = (short: string, ...names: string[]): boolean => (short !== '' && letters.has(short)) || names.some((name) => hasLong(long, name))
   const help = has('h', '--help')
   if (help) return undefined
   const dryRun = has('n', '--dry-run')
   const tree = operands.some((word) => !word.expands && ['.', './', ':/', '*'].includes(word.value))
   switch (sub) {
     case 'reset':
-      return long.has('--hard') ? 'git-reset-hard' : undefined
+      return hasLong(long, '--hard') ? 'git-reset-hard' : undefined
     case 'clean':
       return !dryRun && has('f', '--force') ? 'git-clean-force' : undefined
     case 'push':
@@ -161,14 +171,14 @@ function invocationMatch(input: Words, depth: number): string | undefined {
   switch (name) {
     case 'rm':
       // xargs supplies operands at run time: always a bulk delete.
-      return unwrapped.viaXargs || letters.has('r') || letters.has('R') || long.has('--recursive')
+      return unwrapped.viaXargs || letters.has('r') || letters.has('R') || hasLong(long, '--recursive', 3)
         || operands.length >= 2 || operands.some((word) => word.glob || word.expands)
         ? 'remove-bulk' : undefined
     case 'dd': case 'mount': case 'umount': case 'diskutil': case 'shred': case 'wipefs': case 'fdisk': case 'parted':
       if (args.length === 1 && ['--help', '--version'].includes(args[0]!.value)) return undefined
       return name === 'mount' && args.length === 0 ? undefined : 'system-storage'
     case 'rsync':
-      return !letters.has('n') && !long.has('--dry-run') && [...long].some((flag) => flag.startsWith('--del')) ? 'rsync-delete' : undefined
+      return !letters.has('n') && !hasLong(long, '--dry-run') && [...long].some((flag) => flag.startsWith('--del')) ? 'rsync-delete' : undefined
     case 'find': {
       if (args.some((word) => word.value === '-delete')) return 'find-delete'
       const exec = args.findIndex((word) => ['-exec', '-execdir', '-ok', '-okdir'].includes(word.value))

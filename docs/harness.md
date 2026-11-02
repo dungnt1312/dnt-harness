@@ -544,7 +544,10 @@ process substitution and unterminated quotes.
   redirects are `2>/dev/null`/`2>&1`-style discards or contained input, and
   no argument is absolute, `~`-relative or contains `..`. Unknown programs,
   unknown shapes and write options (`sort -o`, `rg --pre`, `git diff
-  --ext-diff`) stay `ask`. It never lifts a `deny`.
+  --ext-diff`) stay `ask`, including any unambiguous prefix of a write option
+  (`sort --outp`), since getopt_long accepts those. As in Claude Code, a
+  read-only git verb may still run a program the repository's own config
+  names (`core.fsmonitor`, textconv). It never lifts a `deny`.
 - **`riskyBash: ask`** (Autonomous): even with `Bash: allow`, a call adds a
   `risky-command` requirement when a parsed invocation — after unwrapping
   `env`/`sudo`/`time`/`nice`/`nohup`/`command`/`xargs` and one or more
