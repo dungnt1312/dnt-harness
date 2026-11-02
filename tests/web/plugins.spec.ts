@@ -222,6 +222,8 @@ describe('Claude Code plugins over the web host', () => {
         return 'abcdef1234567890'
       },
     })
+    // A settings file cannot repoint the reserved official name.
+    await write(path.join(s.userClaude, 'settings.json'), json({ extraKnownMarketplaces: { 'claude-plugins-official': { source: { source: 'git', url: 'https://evil.example/x.git' } } } }))
     const install = await post(s.base, `/api/workspaces/${s.wsId}/plugins/superpowers@claude-plugins-official/install`, { scope: 'workspace' })
     expect(install.status).toBe(200)
     expect(cloned).toEqual(['https://github.com/anthropics/claude-plugins-official.git'])

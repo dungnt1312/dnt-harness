@@ -211,9 +211,11 @@ export class PluginService {
    * Where an unknown marketplace can be fetched from, as Claude Code resolves
    * it: settings `extraKnownMarketplaces`, then the user's own Claude Code
    * `~/.claude/plugins/known_marketplaces.json` (read only), then the
-   * built-in official marketplace.
+   * built-in official marketplace. The official name is reserved: a settings
+   * file a cloned repository ships must not point it at another source.
    */
   private async knownSource(name: string, context: PluginContext): Promise<MarketplaceSource | undefined> {
+    if (name === OFFICIAL_MARKETPLACE.name) return OFFICIAL_MARKETPLACE.source
     const suggested = (await readSuggestedMarketplaces(this.settingsFiles(context)))[name]
     const fromSettings = toMarketplaceSource(isRecord(suggested) ? suggested['source'] : undefined)
     if (fromSettings !== undefined) return fromSettings
@@ -225,7 +227,7 @@ export class PluginService {
       const fromClaude = toMarketplaceSource(isRecord(entry) ? entry['source'] : undefined)
       if (fromClaude !== undefined) return fromClaude
     }
-    return name === OFFICIAL_MARKETPLACE.name ? OFFICIAL_MARKETPLACE.source : undefined
+    return undefined
   }
 
   /**
