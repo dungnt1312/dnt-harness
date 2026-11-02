@@ -267,7 +267,11 @@ export class SessionsService extends Service {
       // registered, so a retry reloads the canonical disk state.
       await this.recover(session)
       if (this.deleting.has(id)) throw new Error(`sessions: session '${id}' was deleted`)
-      await this.scheduleSummary(session, session.events.length)
+      // The summary is a rebuildable projection: a failed write (a locked
+      // summary.json on Windows) must not make a healthy log unopenable.
+      await this.scheduleSummary(session, session.events.length).catch((error: unknown) => {
+        console.warn(`sessions: summary for '${id}' not written on load: ${String(error)}`)
+      })
       if (this.deleting.has(id)) throw new Error(`sessions: session '${id}' was deleted`)
       this.loaded.set(id, session)
       return session
@@ -396,7 +400,9 @@ export class SessionsService extends Service {
     // projection writers before removing the session directory. The append
     // must finish first: FileSessionStore.append() can create its directory.
     await loading?.catch(() => {})
-    await session?.drain()
+    // A poisoned writer stays rejected forever; it can append nothing more,
+    // so removal must not depend on its health.
+    await session?.drain().catch(() => {})
     await this.summaryWriters.get(id)?.catch(() => {})
     this.summaryWriters.delete(id)
     this.summaryTargets.delete(id)

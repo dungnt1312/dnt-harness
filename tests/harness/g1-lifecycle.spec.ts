@@ -544,6 +544,54 @@ describe('storage failure', () => {
     expect(session.events.some((e) => e.type === 'turn/end')).toBe(false)
     void kernel.stop()
   })
+
+  it('a failed summary write does not make a healthy log unopenable', async () => {
+    const kernel = new Kernel()
+    const id = 'summary-locked' as never
+    const store = {
+      append: () => Promise.resolve(),
+      flush: () => Promise.resolve(),
+      read: () => Promise.resolve({ events: [{ v: 1, seq: 1, timestamp: 1, type: 'session/created' }] as unknown as SessionEvent[], truncatedTail: false }),
+      replace: () => Promise.resolve(),
+      writeSummary: () => Promise.reject(Object.assign(new Error('EPERM: rename summary.json'), { code: 'EPERM' })),
+      readSummary: () => Promise.resolve(undefined),
+      list: () => Promise.resolve([]),
+      remove: () => Promise.resolve(),
+    }
+    kernel.ctx.plugin((ctx) => {
+      new SessionsService(ctx, 'sessions', { store: store as never })
+    })
+    const session = await kernel.ctx.sessions.load(id)
+    expect(session.id).toBe(id)
+    expect(await kernel.ctx.sessions.load(id)).toBe(session)
+    void kernel.stop()
+  })
+
+  it('a session poisoned by a failed write can still be deleted', async () => {
+    const kernel = new Kernel()
+    const removed: unknown[] = []
+    const store = {
+      append: (): Promise<void> => Promise.reject(new Error('ENOSPC')),
+      flush: () => Promise.resolve(),
+      read: () => Promise.resolve({ events: [] as SessionEvent[], truncatedTail: false }),
+      replace: () => Promise.resolve(),
+      writeSummary: () => Promise.resolve(),
+      readSummary: () => Promise.resolve(undefined),
+      list: () => Promise.resolve([]),
+      remove: (id: unknown) => { removed.push(id); return Promise.resolve() },
+    }
+    kernel.ctx.plugin((ctx) => {
+      new SessionsService(ctx, 'sessions', { store: store as never })
+    })
+    const session = kernel.ctx.sessions.create()
+    session.append({ type: 'user/message', text: 'hello' } as never)
+    await session.durable().catch(() => {})
+    expect(session.poisoned).toBe(true)
+    await kernel.ctx.sessions.delete(session.id)
+    expect(removed).toEqual([session.id])
+    expect(kernel.ctx.sessions.has(session.id)).toBe(false)
+    void kernel.stop()
+  })
 })
 
 describe('turn settlement', () => {
