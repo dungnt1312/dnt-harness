@@ -59,6 +59,19 @@ describe('matchCommand', () => {
   it('asks on git reset --hard', () => {
     expect(matchCommand('git reset --hard HEAD~1', DEFAULT_CONFIG)?.presetId).toBe('gitDestructive')
   })
+  it.each([
+    ['rm --rec -f build', 'fsDestructive'],
+    ['rm --r build', 'fsDestructive'],
+    ['git reset --har HEAD', 'gitDestructive'],
+    ['git clean --forc', 'gitDestructive'],
+    ['git push --forc', 'gitDestructive'],
+    ['git push origin --force-with-l main', 'gitDestructive'],
+  ])('matches abbreviated long flag: %s', (command, presetId) => {
+    expect(matchCommand(command, DEFAULT_CONFIG)?.presetId).toBe(presetId)
+  })
+  it.each(['rm --force build', 'git push --follow-tags', 'git reset --soft HEAD~1'])('leaves %s alone', (command) => {
+    expect(matchCommand(command, DEFAULT_CONFIG)).toBeNull()
+  })
   it('matches git stash clear', () => {
     expect(matchCommand('git stash clear', DEFAULT_CONFIG)?.presetId).toBe('gitDestructive')
   })

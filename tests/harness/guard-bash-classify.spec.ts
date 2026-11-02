@@ -60,6 +60,8 @@ describe('isReadOnlyBashCommand', () => {
     'git branch --show-current',
     'git remote -v',
     'git stash list',
+    'sort --reverse names.txt',
+    'tree -L 2',
     'cat package.json | grep version',
     'rg -n "TODO" src',
     'find src -name "*.ts" -type f',
@@ -118,6 +120,16 @@ describe('isReadOnlyBashCommand', () => {
     ['${IFS} separator', 'cat${IFS}/etc/passwd'],
     ["$' ' separator", "cat$' '/etc/passwd"],
     ['empty', ''],
+    // Long options are accepted by any unambiguous prefix.
+    ['git grep abbreviated pager option', 'git grep --open=sh -e x'],
+    ['git diff abbreviated --ext-diff', 'git diff --ext'],
+    ['git log abbreviated --output', 'git log --outp=x'],
+    ['sort abbreviated --output', 'sort --outp=x a'],
+    ['sort abbreviated --compress-program', 'sort --compress-prog=./evil -S 1K big'],
+    ['file abbreviated --compile', 'file --comp x'],
+    ['date abbreviated --set', 'date --se=2020-01-01'],
+    ['rg abbreviated --pre', 'rg --pr ./x foo'],
+    ['tree -R writes 00Tree.html', 'tree -R -L 1 -H .'],
   ])('refuses: %s', (_why, command) => {
     expect(isReadOnlyBashCommand(command)).toBe(false)
   })
@@ -149,6 +161,11 @@ describe('matchRiskyCommand', () => {
     ['git checkout -f main', 'git-discard-tree'],
     ['git restore .', 'git-discard-tree'],
     ['git stash clear', 'git-stash-clear'],
+    ['rm --rec -f build', 'remove-bulk'],
+    ['git reset --har HEAD', 'git-reset-hard'],
+    ['git clean --forc', 'git-clean-force'],
+    ['git push --forc', 'git-push-force'],
+    ['git push --force-w', 'git-push-force'],
     ['git worktree remove --force wt', 'git-worktree-force-remove'],
     ['git branch -D topic', 'git-branch-force-delete'],
     ['echo ok && git reset --hard', 'git-reset-hard'],

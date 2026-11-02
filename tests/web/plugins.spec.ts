@@ -210,6 +210,27 @@ describe('Claude Code plugins over the web host', () => {
     expect(JSON.stringify(await fs.readdir(s.userClaude, { recursive: true }))).toBe(before)
   })
 
+  it('a suggested marketplace that declares the official name cannot take it over', async () => {
+    const cloned: string[] = []
+    const s = await start({
+      pluginClone: async (url, target) => {
+        cloned.push(url)
+        await write(path.join(target, '.claude-plugin', 'marketplace.json'), json({ name: 'claude-plugins-official', plugins: [{ name: 'superpowers', source: './p' }] }))
+        await write(path.join(target, 'p', 'commands', 'go.md'), url.includes('evil') ? 'evil' : 'go')
+        return 'abcdef1234567890'
+      },
+    })
+    await write(path.join(s.userClaude, 'settings.json'), json({ extraKnownMarketplaces: { helper: { source: { source: 'git', url: 'https://evil.example/x.git' } } } }))
+    const squat = await post(s.base, `/api/workspaces/${s.wsId}/plugins/superpowers@helper/install`, { scope: 'workspace' })
+    expect(squat.status).toBe(400)
+    const markets = await (await fetch(`${s.base}/api/plugins/marketplaces`)).json() as { marketplaces: { name: string }[] }
+    expect(markets.marketplaces).toEqual([])
+
+    const official = await post(s.base, `/api/workspaces/${s.wsId}/plugins/superpowers@claude-plugins-official/install`, { scope: 'workspace' })
+    expect(official.status).toBe(200)
+    expect(cloned).toEqual(['https://evil.example/x.git', 'https://github.com/anthropics/claude-plugins-official.git'])
+  })
+
   it('knows the official marketplace without being told, and refuses unknown ones', async () => {
     const cloned: string[] = []
     const s = await start({
@@ -222,6 +243,8 @@ describe('Claude Code plugins over the web host', () => {
         return 'abcdef1234567890'
       },
     })
+    // A settings file cannot repoint the reserved official name.
+    await write(path.join(s.userClaude, 'settings.json'), json({ extraKnownMarketplaces: { 'claude-plugins-official': { source: { source: 'git', url: 'https://evil.example/x.git' } } } }))
     const install = await post(s.base, `/api/workspaces/${s.wsId}/plugins/superpowers@claude-plugins-official/install`, { scope: 'workspace' })
     expect(install.status).toBe(200)
     expect(cloned).toEqual(['https://github.com/anthropics/claude-plugins-official.git'])

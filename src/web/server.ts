@@ -39,7 +39,7 @@ import { AutomationError, AutomationScheduler, AutomationStore, automationContex
 import { PushError, PushService, type PushSender } from './push.ts'
 import { ChannelError, NotifyChannels, type ChannelFetch } from './notify-channels.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
-import type { GrantedRoot } from '../harness/tools/types.ts'
+import type { GrantedRoot, ToolExecution } from '../harness/tools/types.ts'
 import { classifyGrantedRoots, classifyTarget, resolveInGrants, targetPaths, within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
@@ -48,7 +48,7 @@ import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry,
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
-import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
+import { liftsReadOnlyBash, modeGuardConfig, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
 import type { HarnessLimits } from '../harness/limits.ts'
 import { APP_CONFIG_FILE, AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
@@ -4163,12 +4163,18 @@ ${entry.description}`.toLowerCase().includes(query))
 
   const dangerousStore = new DangerousCommandsStore(resourceHome)
   const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
-    configSource: async (workspaceId?: string) => {
+    configSource: async (workspaceId?: string, exec?: ToolExecution) => {
       const wid = workspaceId
         ?? (agentScope.getStore()?.workspaceId as string | undefined)
         ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
       const { config, hash } = await dangerousStore.load(wid)
-      return { config, hash, revision: hash }
+      // The governing mode is the evaluated call's own root, never whatever is
+      // ambient: a re-evaluation from an HTTP handler has no agent scope.
+      const ambient = agentScope.getStore()
+      const owner = (exec?.rootSessionId ?? exec?.sessionId ?? ambient?.rootSessionId ?? ambient?.sessionId) as SessionId | undefined
+      // No session at all keeps the full config: there is no mode to narrow it.
+      if (owner === undefined) return { config, hash, revision: hash }
+      return modeGuardConfig(rootModeOf({ sessionId: owner, rootSessionId: owner }, wid as WorkspaceId).mode.definition, config, hash)
     },
   })
 
@@ -4891,9 +4897,10 @@ ${entry.description}`.toLowerCase().includes(query))
     if (shuttingDown) { res.writeHead(503); res.end('host shutting down'); return }
     handle(req, res, deps).catch((error: unknown) => {
       if (!res.headersSent) {
-        res.writeHead(error instanceof ScopeError ? 404 : 500, { 'content-type': 'application/json' })
+        const status = error instanceof ScopeError ? 404 : error instanceof RequestBodyError ? error.status : 500
+        res.writeHead(status, { 'content-type': 'application/json' })
       }
-      res.end(JSON.stringify({ error: String(error) }))
+      res.end(JSON.stringify({ error: error instanceof RequestBodyError ? error.message : String(error) }))
     })
   })
 
@@ -4907,7 +4914,8 @@ ${entry.description}`.toLowerCase().includes(query))
   if (address === null || typeof address === 'string') throw new Error('web: unexpected listen address')
 
   const publicHost = options.host ?? '127.0.0.1'
-  deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
+  const originFor = (name: string): string => `http://${name.includes(':') ? `[${name}]` : name}:${address.port}`
+  deps.auth.bindOrigin(originFor(publicHost), [...deps.allowedHosts].map(originFor))
   const retireOperatorChannel = deps.auth.enabled && options.home !== undefined
     ? await publishOperatorChannel(options.home, { url: `http://${publicHost}:${address.port}`, key: deps.auth.armOperatorKey() })
     : undefined
@@ -5599,10 +5607,22 @@ async function handleApi(
       send(status, { error: error.message, code: error.code })
       return
     }
+    if (error instanceof RequestBodyError) {
+      send(error.status, { error: error.message })
+      return
+    }
     send(500, { error: String(error instanceof Error ? error.message : error) })
   }
 
   try {
+    // Hooks run commands at later events and a mode decides what runs without
+    // a question, so changing either is a standing grant: like approvals, only
+    // the paired browser may do it. Reads stay open to every principal.
+    if (req.method !== 'GET' && req.method !== 'HEAD' && BROWSER_ONLY_WRITES.some((pattern) => pattern.test(pathname)) && !browserPrincipal(req, deps, req.method ?? 'POST')) {
+      send(401, { error: 'hook and mode changes require the browser session that owns the workspace' })
+      return
+    }
+
     // ── workspaces ───────────────────────────────────────────
     if (pathname === '/api/workspaces') {
       if (req.method === 'GET') {
@@ -8076,6 +8096,12 @@ async function handleApi(
         })
         return
       }
+      // A terminal runs anything the host user can with no approval step, so
+      // like approvals and Git actions only the paired browser may drive it.
+      if (!browserPrincipal(req, deps, req.method ?? 'GET')) {
+        send(401, { error: 'terminals require the browser session that owns the workspace' })
+        return
+      }
       const rest = wsTerminalsMatch[2]
       try {
         // `events` is checked before the id routes: otherwise it reads as a
@@ -8209,6 +8235,12 @@ async function handleApi(
       requireWorkspace(deps, wsId, writing)
       const project = deps.workspaces.getProject(decodeURIComponent(wsProjectFilesMatch[2] ?? '') as ProjectId, wsId)
       if (writing) {
+        // Explorer writes change the host filesystem without an approval step,
+        // so only the paired browser may perform them.
+        if (!browserPrincipal(req, deps, req.method ?? 'POST')) {
+          send(401, { error: 'file changes require the browser session that owns the workspace' })
+          return
+        }
         if (kind === 'file') await handleProjectFileSave(req, project.path, deps.deniedRoots, send)
         else await handleProjectFileWrite(req, query, project.path, deps.deniedRoots, send)
         return
@@ -8852,6 +8884,14 @@ async function handleApi(
     fail(error)
   }
 }
+
+/** Workspace routes whose writes only the browser principal may make. */
+const BROWSER_ONLY_WRITES: readonly RegExp[] = [
+  /^\/api\/workspaces\/[^/]+\/hooks(?:\/[^/]+)?$/,
+  /^\/api\/workspaces\/[^/]+\/mode$/,
+  /^\/api\/workspaces\/[^/]+\/modes(?:\/.*)?$/,
+  /^\/api\/workspaces\/[^/]+\/sessions\/[^/]+\/mode$/,
+]
 
 /** A session-grant edit based on an out-of-date revision. */
 class StaleGrantsError extends Error {
@@ -10725,6 +10765,13 @@ export function extractModelIds(parsed: unknown): string[] {
 
 const MAX_BODY_BYTES = 1_000_000
 
+/** A request body the client got wrong: answered with its status, not a 500. */
+class RequestBodyError extends Error {
+  constructor(readonly status: 400 | 413, message: string) {
+    super(message)
+  }
+}
+
 async function readJson(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
@@ -10732,15 +10779,20 @@ async function readJson(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<R
     total += (chunk as Buffer).length
     if (total > limit) {
       req.destroy()
-      throw new Error('request body too large')
+      throw new RequestBodyError(413, 'request body too large')
     }
     chunks.push(chunk as Buffer)
   }
   const body = Buffer.concat(chunks).toString('utf8')
   if (body === '') return {}
-  const parsed: unknown = JSON.parse(body)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    throw new RequestBodyError(400, 'request body is not valid JSON')
+  }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('request body must be a JSON object')
+    throw new RequestBodyError(400, 'request body must be a JSON object')
   }
   return parsed as Record<string, unknown>
 }

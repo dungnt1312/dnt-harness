@@ -822,7 +822,11 @@ export class McpServerClient {
 
   /** Recent server stderr, with configured and issued bearer secrets masked. */
   recentStderr(): string {
-    let text = this.stderrTail
+    return this.redact(this.stderrTail)
+  }
+
+  private redact(input: string): string {
+    let text = input
     const secrets = [
       ...Object.values(this.resolved.env ?? {}),
       ...Object.values(this.resolved.headers ?? {}),
@@ -834,7 +838,9 @@ export class McpServerClient {
   }
 
   private appendStderr(text: string): void {
-    this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_CHARS)
+    // Redact before trimming: a cut through the middle of a secret would leave
+    // a fragment that no longer matches it.
+    this.stderrTail = this.redact(this.stderrTail + text).slice(-STDERR_TAIL_CHARS)
   }
 
   /**

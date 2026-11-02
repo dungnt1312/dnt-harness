@@ -344,7 +344,7 @@ async function bootGuardHost(): Promise<GuardHost> {
 async function openSession(host: GuardHost, workspaceId: string, modeId?: string): Promise<Live> {
   const created = (await (await send('POST', `${host.url}/api/workspaces/${workspaceId}/sessions`, {})).json()) as { id: string }
   if (modeId !== undefined) {
-    expect((await send('PUT', `${host.url}/api/workspaces/${workspaceId}/sessions/${created.id}/mode`, { modeId })).status).toBe(200)
+    expect((await send('PUT', `${host.url}/api/workspaces/${workspaceId}/sessions/${created.id}/mode`, { modeId: await guardedMode(host, workspaceId, modeId) })).status).toBe(200)
   }
   const stream = new Stream(await fetch(`${host.url}/api/workspaces/${workspaceId}/sessions/${created.id}/events`))
   liveStreams.push(stream)
@@ -361,7 +361,23 @@ async function openSession(host: GuardHost, workspaceId: string, modeId?: string
 }
 
 async function setWorkspaceMode(host: GuardHost, workspaceId: string, modeId: string): Promise<void> {
-  expect((await send('PUT', `${host.url}/api/workspaces/${workspaceId}/mode`, { modeId })).status).toBe(200)
+  expect((await send('PUT', `${host.url}/api/workspaces/${workspaceId}/mode`, { modeId: await guardedMode(host, workspaceId, modeId) })).status).toBe(200)
+}
+
+/**
+ * Bundled Full access turns the built-in presets off. These tests exercise
+ * preset mechanics under "Bash allowed", so they run a copy that keeps them.
+ */
+async function guardedMode(host: GuardHost, workspaceId: string, modeId: string): Promise<string> {
+  if (modeId !== 'full-access') return modeId
+  const id = 'full-access-guarded'
+  const base = `${host.url}/api/workspaces/${workspaceId}/modes`
+  if ((await fetch(`${base}/${id}`)).status !== 200) {
+    expect((await send('POST', `${base}/full-access/duplicate`, { newId: id })).status).toBe(200)
+    const record = (await (await fetch(`${base}/${id}`)).json()) as { raw: string; hash: string }
+    expect((await send('PUT', `${base}/${id}`, { content: record.raw.replace('\ndangerousPresets: off', ''), expectedHash: record.hash })).status).toBe(200)
+  }
+  return id
 }
 
 /** Read-modify-write the workspace guard config; resolves after reevaluation. */
@@ -384,6 +400,34 @@ const requests = (live: Live): Frame[] => live.stream.frames.filter((frame) => f
 const DANGEROUS_ASK = 'git reset --hard HEAD~1'
 
 describe('live guard authority on a real host (fake Bash)', () => {
+  it('bundled Full access skips built-in presets but keeps custom rules', async () => {
+    const host = await bootGuardHost()
+    expect(await saveGuard(host, host.wsId, (config) => ({ ...setPreset('gitDestructive', 'deny')(config), customRules: [{ id: 'no-deploy', pattern: 'npm run deploy', isRegex: false, action: 'deny' }] }))).toBe(200)
+    expect((await send('PUT', `${host.url}/api/workspaces/${host.wsId}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    const root = await openSession(host, host.wsId)
+    await root.run(DANGEROUS_ASK)
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(host.executed).toEqual([DANGEROUS_ASK])
+    const second = await openSession(host, host.wsId)
+    await second.run('npm run deploy')
+    const refused = await second.toolResult(0)
+    expect(refused.event?.ok).toBe(false)
+    expect(refused.event?.output).toMatch(/blocked by Dangerous Commands: matched no-deploy/)
+    expect(host.executed).toEqual([DANGEROUS_ASK])
+  }, 20_000)
+
+  it('switching a pending call\'s conversation to Full access drops its preset ask too', async () => {
+    const host = await bootGuardHost()
+    const root = await openSession(host, host.wsId, 'ask-before-changes')
+    await root.run(DANGEROUS_ASK)
+    const question = await root.stream.wait(isApproval, 'approval')
+    expect(question.guardWarning).toMatch(/Git Destructive/)
+    // Re-evaluated from the HTTP handler, which has no agent scope of its own.
+    expect((await send('PUT', `${host.url}/api/workspaces/${host.wsId}/sessions/${root.id}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(host.executed).toEqual([DANGEROUS_ASK])
+  }, 20_000)
+
   it('workspace Full access / root Ask: saving an UNCHANGED guard config leaves an innocuous Bash ask pending', async () => {
     const host = await bootGuardHost()
     await setWorkspaceMode(host, host.wsId, 'full-access')

@@ -1,10 +1,11 @@
 /**
- * The two Bash-specific mode properties, shared by the web host and the
+ * The Bash-specific mode properties, shared by the web host and the
  * headless bin so both gates read them the same way.
  */
 import { isReadOnlyBashCommand } from '../guard/bash-readonly.ts'
 import { matchRiskyCommand, type RiskyMatch } from '../guard/bash-risky.ts'
 import type { ToolCall } from '../llm/types.ts'
+import type { DangerousCommandsConfig } from '../guard/types.ts'
 import type { ModeDefinition } from './types.ts'
 
 type BashModeFields = Pick<Partial<ModeDefinition>, 'readOnlyBash' | 'riskyBash'>
@@ -32,4 +33,21 @@ export function riskyBashMatch(mode: BashModeFields, call: ToolCall): RiskyMatch
 /** Approval-card text for a risky match. */
 export function riskyBashWarning(match: RiskyMatch): string {
   return `Risky command: ${match.label} — this mode asks before each one`
+}
+
+/**
+ * The Dangerous Commands config one call runs under: a mode with
+ * `dangerousPresets: off` switches every built-in preset off and keeps the
+ * user's custom rules. The hash changes with it, so an approval bound to the
+ * full config is never reused under the narrowed one or the reverse.
+ */
+export function modeGuardConfig(
+  mode: Pick<Partial<ModeDefinition>, 'dangerousPresets'>,
+  config: DangerousCommandsConfig,
+  hash: string,
+): { readonly config: DangerousCommandsConfig; readonly hash: string; readonly revision: string } {
+  if (mode.dangerousPresets !== 'off') return { config, hash, revision: hash }
+  const presets = Object.fromEntries(Object.keys(config.presets).map((id) => [id, 'off'])) as DangerousCommandsConfig['presets']
+  const narrowed = `${hash}:presets-off`
+  return { config: { ...config, presets }, hash: narrowed, revision: narrowed }
 }

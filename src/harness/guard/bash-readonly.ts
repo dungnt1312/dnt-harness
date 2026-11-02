@@ -30,14 +30,19 @@ const ANY_ARGS = new Set([
  */
 const RESTRICTED: Readonly<Record<string, { readonly exact: readonly string[]; readonly letters?: string }>> = {
   sort: { exact: ['--output', '--compress-program'], letters: 'o' },
-  tree: { exact: ['--fromfile'], letters: 'o' },
+  // `tree -R` (with -H) writes 00Tree.html files into the directories it walks.
+  tree: { exact: ['--fromfile', '--fromtabfile', '--output'], letters: 'oR' },
   file: { exact: ['--compile'], letters: 'C' },
   date: { exact: ['--set'], letters: 's' },
   rg: { exact: ['--pre', '--pre-glob', '--hostname-bin'] },
   find: { exact: ['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls'] },
 }
 
-/** Read-only git subcommands (global options are refused separately). */
+/**
+ * Read-only git subcommands (global options are refused separately). Like
+ * Claude Code, these run without a question even though git may still run a
+ * program the repository's own config names (core.fsmonitor, textconv).
+ */
 const GIT_READ = new Set([
   'status', 'log', 'diff', 'show', 'rev-parse', 'ls-files', 'ls-tree', 'blame', 'describe', 'shortlog',
   'grep', 'cat-file', 'count-objects', 'merge-base', 'name-rev', 'rev-list', 'whatchanged', 'reflog',
@@ -70,7 +75,11 @@ function optionName(value: string): string {
 function hasForbidden(args: readonly ShellWord[], exact: readonly string[], letters = ''): boolean {
   return args.some((word) => {
     const value = word.value
-    if (exact.includes(optionName(value))) return true
+    const name = optionName(value)
+    if (exact.includes(name)) return true
+    // getopt_long and friends accept any unambiguous prefix (`--outp` is
+    // `--output`), so a long option that prefixes a forbidden one is refused.
+    if (name.length > 2 && name.startsWith('--') && exact.some((full) => full.startsWith(name))) return true
     // A combined short flag (`-uo`, `-ofile`) carries every letter after `-`.
     return letters !== '' && /^-[^-]/.test(value) && [...value.slice(1)].some((letter) => letters.includes(letter))
   })

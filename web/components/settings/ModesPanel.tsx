@@ -411,6 +411,7 @@ function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit
           <span>Paths outside granted folders <Badge tone={draft.outOfGrant === 'allow' ? 'green' : 'gray'}>{draft.outOfGrant === 'allow' ? 'Allowed' : 'Ask'}</Badge></span>
           <span>Read-only shell commands <Badge tone={draft.readOnlyBash === 'allow' ? 'green' : 'gray'}>{draft.readOnlyBash === 'allow' ? 'Run without asking' : 'Follow Bash'}</Badge></span>
           <span>Risky shell commands <Badge tone={draft.riskyBash === 'ask' ? 'amber' : 'gray'}>{draft.riskyBash === 'ask' ? 'Ask each time' : 'Follow Bash'}</Badge></span>
+          <span>Built-in dangerous command presets <Badge tone={draft.dangerousPresets === 'off' ? 'amber' : 'gray'}>{draft.dangerousPresets === 'off' ? 'Off' : 'On'}</Badge></span>
           <span>MCP tools <Badge tone="gray">{MCP_EXPOSURE_LABELS[draft.mcpExposure ?? 'default']}</Badge></span>
         </div>
       </div>
@@ -558,6 +559,10 @@ function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
         <Switch label="Ask before risky shell commands" hint="Even when Bash is allowed, recursive deletes, git reset --hard, forced pushes, and disk tools ask each time. Dangerous Commands still apply on top." checked={draft.riskyBash === 'ask'} disabled={disabled} onChange={(next) => {
           const { riskyBash: _omit, ...rest } = draft
           onDraft(next ? { ...rest, riskyBash: 'ask' } : rest)
+        }} />
+        <Switch label="Skip built-in dangerous command presets" hint="rm -rf, forced pushes, curl | sh and the other built-in Dangerous Commands presets neither ask nor block in this mode. Your own custom rules and denies still apply." checked={draft.dangerousPresets === 'off'} disabled={disabled} onChange={(next) => {
+          const { dangerousPresets: _omit, ...rest } = draft
+          onDraft(next ? { ...rest, dangerousPresets: 'off' } : rest)
         }} />
       </div>
 

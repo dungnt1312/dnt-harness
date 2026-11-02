@@ -49,6 +49,12 @@ export interface ModeDefinition {
    */
   readonly riskyBash?: 'ask'
   /**
+   * `off`: the built-in Dangerous Commands presets (`rm -rf`, forced push,
+   * `curl | sh`, …) do not apply while this mode runs; the user's own custom
+   * rules and explicit denies still do. Absent: presets apply as configured.
+   */
+  readonly dangerousPresets?: 'off'
+  /**
    * Which MCP tools this mode may expose (a ceiling, never a permission):
    * `none`; `read-safe` — only tools named by an explicit server allowlist
    * entry AND carrying a read-safe name prefix; `all` — every enabled,
@@ -89,6 +95,7 @@ export interface ModeFrontmatter {
   readonly outOfGrant?: string
   readonly readOnlyBash?: string
   readonly riskyBash?: string
+  readonly dangerousPresets?: string
   readonly mcpExposure?: string
 }
 

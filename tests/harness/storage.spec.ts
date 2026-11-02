@@ -86,6 +86,42 @@ describe('file session store', () => {
     await store.checkpoint(id)
   })
 
+  it('a relaxed append written while a checkpoint syncs is synced by the next checkpoint', async () => {
+    const store = new FileSessionStore({ dir: dataDir })
+    await store.init()
+    const id = 'session-relaxed-race' as SessionId
+    await store.replace(id, [])
+    const event = (seq: number): SessionEvent =>
+      ({ v: 1, seq, timestamp: 1_700_000_000_000 + seq, type: 'assistant/chunk', stepId: 's1', delta: `d${seq}` }) as unknown as SessionEvent
+    let syncs = 0
+    let releaseSync: (() => void) | undefined
+    const internals = store as unknown as { openAppend: (id: SessionId) => Promise<{ sync: () => Promise<void> }> }
+    const open = internals.openAppend.bind(store)
+    const patched = new WeakSet<object>()
+    internals.openAppend = async (sessionId) => {
+      const handle = await open(sessionId)
+      if (!patched.has(handle)) {
+        patched.add(handle)
+        const sync = handle.sync.bind(handle)
+        handle.sync = async () => {
+          syncs += 1
+          if (syncs === 1) await new Promise<void>((resolve) => { releaseSync = resolve })
+          return sync()
+        }
+      }
+      return handle
+    }
+    await store.append(id, event(1), { relaxed: true })
+    const first = store.checkpoint(id)
+    await vi.waitFor(() => expect(releaseSync).toBeDefined())
+    // Written during the in-flight sync, after that sync's prefix was taken.
+    await store.append(id, event(2), { relaxed: true })
+    releaseSync?.()
+    await first
+    await store.checkpoint(id)
+    expect(syncs).toBe(2)
+  })
+
   it('a strict append after relaxed ones keeps flush covering the whole prefix', async () => {
     const store = new FileSessionStore({ dir: dataDir })
     await store.init()

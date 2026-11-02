@@ -190,11 +190,27 @@ export interface MarketplaceDeps {
   readonly clone?: typeof cloneRepo
 }
 
+/** Anthropic's official marketplace, which Claude Code knows without being told. */
+export const OFFICIAL_MARKETPLACE = {
+  name: 'claude-plugins-official',
+  source: { source: 'github', repo: 'anthropics/claude-plugins-official' },
+} as const satisfies { readonly name: string; readonly source: MarketplaceSource }
+
+function isOfficialSource(source: MarketplaceSource): boolean {
+  const repo = OFFICIAL_MARKETPLACE.source.repo
+  if (source.source === 'github') return source.repo.toLowerCase() === repo
+  if (source.source === 'git') return source.url.toLowerCase().replace(/\.git$/, '').replace(/\/+$/, '') === `https://github.com/${repo}`
+  return false
+}
+
 /**
  * Fetch (clone or refresh) a marketplace and register it under the name its
- * manifest declares. A local folder is read in place, never copied.
+ * manifest declares. A local folder is read in place, never copied. The name
+ * is checked before anything is replaced: only the official source may take
+ * the official name, and `expectedName` (an install or update of a known
+ * marketplace) refuses a manifest that declares another one.
  */
-export async function addMarketplace(deps: MarketplaceDeps, source: MarketplaceSource): Promise<{ readonly name: string; readonly document: MarketplaceDocument }> {
+export async function addMarketplace(deps: MarketplaceDeps, source: MarketplaceSource, expectedName?: string): Promise<{ readonly name: string; readonly document: MarketplaceDocument }> {
   const clone = deps.clone ?? cloneRepo
   let location: string
   let staging: string | undefined
@@ -212,6 +228,15 @@ export async function addMarketplace(deps: MarketplaceDeps, source: MarketplaceS
     if (staging !== undefined) await fs.rm(staging, { recursive: true, force: true })
     throw error
   }
+  const refusal = document.name === OFFICIAL_MARKETPLACE.name && !isOfficialSource(source)
+    ? `only ${OFFICIAL_MARKETPLACE.source.repo} may register the marketplace name '${OFFICIAL_MARKETPLACE.name}'`
+    : expectedName !== undefined && document.name !== expectedName
+      ? `marketplace source for '${expectedName}' declares the name '${document.name}'`
+      : undefined
+  if (refusal !== undefined) {
+    if (staging !== undefined) await fs.rm(staging, { recursive: true, force: true })
+    throw new PluginError('invalid', refusal)
+  }
   if (staging !== undefined) {
     const target = path.join(deps.store.marketplacesDir, document.name)
     await fs.rm(target, { recursive: true, force: true })
@@ -228,7 +253,7 @@ export async function addMarketplace(deps: MarketplaceDeps, source: MarketplaceS
 export async function updateMarketplace(deps: MarketplaceDeps, name: string): Promise<MarketplaceDocument> {
   const known = (await deps.store.marketplaces())[name]
   if (known === undefined) throw new PluginError('not-found', `no marketplace '${name}'`)
-  const { document } = await addMarketplace(deps, known.source)
+  const { document } = await addMarketplace(deps, known.source, name)
   return document
 }
 

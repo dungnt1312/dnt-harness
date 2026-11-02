@@ -24,9 +24,10 @@ export type OriginVerdict =
 /**
  * Cookie mutations require exactly one canonical Origin. Missing, empty,
  * `null`, repeated, and foreign origins are refused. Bearer requests do not
- * use this check — they never fall back to a cookie.
+ * use this check — they never fall back to a cookie. `canonicalOrigin` may
+ * list every name the host answers to on its bound port.
  */
-export function checkCanonicalOrigin(headers: { readonly origin?: string | string[] }, canonicalOrigin: string): OriginVerdict {
+export function checkCanonicalOrigin(headers: { readonly origin?: string | string[] }, canonicalOrigin: string | readonly string[]): OriginVerdict {
   const raw = headers.origin
   if (raw === undefined || raw === '') {
     return { ok: false, status: 403, reason: 'cookie mutation requires the canonical Origin' }
@@ -41,7 +42,8 @@ export function checkCanonicalOrigin(headers: { readonly origin?: string | strin
   } catch {
     return { ok: false, status: 403, reason: 'Origin is not a URL' }
   }
-  if (presented !== canonicalOrigin) {
+  const accepted = typeof canonicalOrigin === 'string' ? [canonicalOrigin] : canonicalOrigin
+  if (!accepted.includes(presented)) {
     return { ok: false, status: 403, reason: 'Origin does not match this server' }
   }
   return { ok: true }

@@ -7,6 +7,13 @@ import type { PresetId } from './types.ts'
  * with `-`, which keeps the repetition unambiguous (no backtracking blow-up).
  */
 const GIT = String.raw`\b[Gg][Ii][Tt](?:\s+-[Cc]\s+[^\s-]\S*|\s+--(?:git-dir|work-tree|namespace)\s+[^\s-]\S*|\s+--?[a-zA-Z][\w-]*(?:=\S+)?)*\s+`
+/**
+ * Alternation of a long flag and its abbreviations down to `min` characters
+ * (`--recursive`, `--recursiv`, ... `--rec`): getopt_long and git accept any
+ * unambiguous prefix. Longest first; callers follow it with a word boundary.
+ */
+const longFlag = (full: string, min: number): string =>
+  Array.from({ length: full.length - min + 1 }, (_, i) => full.slice(0, full.length - i)).join('|')
 const git = (rest: string, flags = 'i'): RegExp => new RegExp(GIT + rest, flags)
 
 export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
@@ -14,7 +21,7 @@ export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
     /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b/i,
     // Recursive rm in any flag position or spelling: `rm -f -r`, `rm x -rf`,
     // `rm --recursive`. Stops at a command separator.
-    /\brm\b[^|;&]*\s-(?:[a-z]*r[a-z]*|-recursive)\b/i,
+    new RegExp(String.raw`\brm\b[^|;&]*\s(?:-[a-z]*r[a-z]*|--(?:${longFlag('recursive', 1)}))\b`, 'i'),
     // Mass deletion via find.
     /\bfind\b[^|;&]*\s-delete\b/i,
     /\bfind\b[^|;&]*\s-exec(?:dir)?\s+rm\b/i,
@@ -26,12 +33,14 @@ export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
     /\bmv\s+.*\/\*/i,
   ],
   gitDestructive: [
-    git(String.raw`reset\s+--hard\b`),
+    git(String.raw`reset\s+--(?:${longFlag('hard', 2)})\b`),
+    git(String.raw`push\b[^|;&]*\s--(?:${longFlag('force', 2)})\b`),
     git(String.raw`push\s+.*--force`),
     // Short force flag (alone or combined, e.g. `-uf`) and `+ref` force refspecs.
     git(String.raw`push\b[^|;&]*\s-[a-z]*f[a-z]*\b`),
     git(String.raw`push\b[^|;&]*\s(?:\S+:)?\+\S`),
     git(String.raw`clean\s+.*-f`),
+    git(String.raw`clean\b[^|;&]*\s--(?:${longFlag('force', 2)})\b`),
     // `git rm` without --cached deletes working-tree files (the matcher
     // rewrites its verb to `gitrm`; `--cached` only untracks and is not matched).
     /\bgitrm\b/i,

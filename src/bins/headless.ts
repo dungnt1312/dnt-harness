@@ -75,7 +75,7 @@ import { loadCredentialHasher } from '../harness/llm/credential-secret.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
-import { liftsReadOnlyBash, riskyBashMatch } from '../harness/modes/bash-policy.ts'
+import { liftsReadOnlyBash, modeGuardConfig, riskyBashMatch } from '../harness/modes/bash-policy.ts'
 import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { homedir } from 'node:os'
 import { loadProviderStore, maxOutputTokenOverrides, repairDefaults } from '../web/provider-store.ts'
@@ -361,7 +361,8 @@ async function main(): Promise<void> {
     const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
       configSource: async (requested?: string) => {
         const { config, hash } = await dangerousStore.load(requested ?? workspaceId)
-        return { config, hash, revision: hash }
+        // One mode governs the whole run, so `dangerousPresets: off` applies as on the web host.
+        return modeGuardConfig(mode.definition, config, hash)
       },
     })
     const policy: Record<string, 'allow' | 'ask' | 'deny'> = Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission]))

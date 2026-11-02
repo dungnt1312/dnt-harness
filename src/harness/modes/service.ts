@@ -329,7 +329,7 @@ export class ModesService {
 /** The exact frontmatter keys a mode file may carry. */
 const KNOWN_FRONTMATTER_KEYS = new Set([
   'name', 'description', 'history', 'workspaceInstructions', 'skills',
-  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant', 'readOnlyBash', 'riskyBash', 'mcpExposure',
+  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant', 'readOnlyBash', 'riskyBash', 'dangerousPresets', 'mcpExposure',
 ])
 
 /**
@@ -455,6 +455,11 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     if (frontmatter.riskyBash === 'ask') riskyBash = 'ask'
     else invalid.push(`'riskyBash' must be ask (or omitted), got ${JSON.stringify(frontmatter.riskyBash)}`)
   }
+  let dangerousPresets: 'off' | undefined
+  if (frontmatter.dangerousPresets !== undefined) {
+    if (frontmatter.dangerousPresets === 'off') dangerousPresets = 'off'
+    else invalid.push(`'dangerousPresets' must be off (or omitted), got ${JSON.stringify(frontmatter.dangerousPresets)}`)
+  }
 
   let mcpExposure: McpExposure | undefined
   if (frontmatter.mcpExposure !== undefined) {
@@ -476,6 +481,7 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     ...(outOfGrant !== undefined ? { outOfGrant } : {}),
     ...(readOnlyBash !== undefined ? { readOnlyBash } : {}),
     ...(riskyBash !== undefined ? { riskyBash } : {}),
+    ...(dangerousPresets !== undefined ? { dangerousPresets } : {}),
     ...(mcpExposure !== undefined ? { mcpExposure } : {}),
   }
 }
@@ -512,6 +518,7 @@ export function serializeModeFile(definition: ModeDefinition): string {
     ...(definition.outOfGrant !== undefined ? [`outOfGrant: ${definition.outOfGrant}`] : []),
     ...(definition.readOnlyBash !== undefined ? [`readOnlyBash: ${definition.readOnlyBash}`] : []),
     ...(definition.riskyBash !== undefined ? [`riskyBash: ${definition.riskyBash}`] : []),
+    ...(definition.dangerousPresets !== undefined ? [`dangerousPresets: ${definition.dangerousPresets}`] : []),
     ...(definition.mcpExposure !== undefined ? [`mcpExposure: ${definition.mcpExposure}`] : [])]
   return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
 }

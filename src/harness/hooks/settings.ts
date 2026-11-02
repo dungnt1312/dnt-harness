@@ -432,15 +432,22 @@ export function selectHooks(resolved: ResolvedHooks, event: ClaudeHookEvent, val
  * own settings files).
  */
 export function isHookConfigPath(filePath: string, extraRoots: readonly string[] = []): boolean {
-  const normalized = filePath.replace(/\\/g, '/').replace(/\/+/g, '/')
+  // Collapse `.` and `x/..` segments first: the write lands on the resolved
+  // path, so `.claude/./settings.json` must match like `.claude/settings.json`.
+  const normalized = slashPath(filePath)
   if (/(^|\/)\.claude\/settings(\.local)?\.json$/i.test(normalized)) return true
   if (/(^|\/)\.claude\/hooks(\/|$)/i.test(normalized)) return true
   if (/(^|\/)hooks-state\.json$/i.test(normalized)) return true
+  const lower = normalized.toLowerCase()
   for (const root of extraRoots) {
-    const base = root.replace(/\\/g, '/').replace(/\/+$/, '')
-    if (normalized === `${base}/settings.json` || normalized === `${base}/settings.local.json` || normalized.startsWith(`${base}/hooks/`)) return true
+    const base = slashPath(root).replace(/\/+$/, '').toLowerCase()
+    if (lower === `${base}/settings.json` || lower === `${base}/settings.local.json` || lower.startsWith(`${base}/hooks/`)) return true
   }
   return false
+}
+
+function slashPath(value: string): string {
+  return path.posix.normalize(value.replace(/\\/g, '/'))
 }
 
 // ── workspace layer: read/write from the app ─────────────────────────────

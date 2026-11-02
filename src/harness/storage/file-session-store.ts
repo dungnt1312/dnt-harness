@@ -228,11 +228,14 @@ export class FileSessionStore implements SessionStore {
     // new when every record already synced itself.
     await this.writers.get(id)
     if (this.dirty.has(id)) {
-      const handle = await this.openAppend(id)
+      // Clear the mark before syncing: a relaxed append written while the
+      // sync runs marks the session again, so the next checkpoint covers it.
+      this.dirty.delete(id)
       try {
+        const handle = await this.openAppend(id)
         await handle.sync()
-        this.dirty.delete(id)
       } catch (error) {
+        this.dirty.add(id)
         throw error
       }
     }

@@ -124,6 +124,15 @@ describe('stdio framing and diagnostics', () => {
     expect(client.recentStderr()).toContain('boot failed')
     expect(client.recentStderr()).not.toContain('SECRET-VALUE-123')
   }, 15_000)
+
+  it('keeps no fragment of a secret the tail trim would have cut through', async () => {
+    // 8,192 chars of tail: the padding puts the cut inside the secret.
+    const script = `process.stderr.write('token=SECRET-VALUE-123'); process.stderr.write('x'.repeat(8_185)); setTimeout(() => process.exit(3), 50)`
+    const client = new McpServerClient('fx', { name: 'fx', transport: 'stdio', command: process.execPath, args: ['-e', script], env: { TOKEN: 'SECRET-VALUE-123' }, enabled: true } as never, { env: { TOKEN: 'SECRET-VALUE-123' } }, () => {})
+    clients.push(client)
+    await expect(client.listTools()).rejects.toThrow()
+    expect(client.recentStderr()).not.toMatch(/VALUE-123|LUE-123/)
+  }, 15_000)
 })
 
 interface Rpc { readonly id?: number; readonly method: string; readonly params?: { readonly name?: string } }
