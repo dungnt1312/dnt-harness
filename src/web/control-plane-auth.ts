@@ -75,6 +75,7 @@ export class ControlPlaneAuthService {
   private readonly hmacKey = randomBytes(32)
 
   private origin: string
+  private alternateOrigins: readonly string[] = []
 
   constructor(private readonly options: ControlPlaneAuthOptions) {
     this.origin = options.canonicalOrigin
@@ -88,9 +89,14 @@ export class ControlPlaneAuthService {
     return this.origin
   }
 
-  /** Set once the server knows the address it actually bound. */
-  bindOrigin(origin: string): void {
+  /**
+   * Set once the server knows the address it actually bound. `alternates` are
+   * the same port under every other name the host answers to (`localhost`,
+   * `allowedHosts`), so a browser paired there can also make changes.
+   */
+  bindOrigin(origin: string, alternates: readonly string[] = []): void {
     this.origin = origin
+    this.alternateOrigins = alternates.filter((value) => value !== origin)
   }
 
   /** Current session generation. Logout and revocation increment it. */
@@ -245,7 +251,7 @@ export class ControlPlaneAuthService {
       const originHeader = headers.origin
       const origin = checkCanonicalOrigin(
         originHeader === undefined ? {} : { origin: originHeader },
-        this.origin,
+        [this.origin, ...this.alternateOrigins],
       )
       if (!origin.ok) return origin
       const presented = headerOne(headers[CSRF_HEADER])

@@ -103,6 +103,25 @@ describe('control-plane authentication', () => {
     }, JSON.stringify({ name: 'x' }))
     expect(foreign.status).toBe(403)
 
+    // The same port under `localhost` is this server too; another port is not.
+    const port = new URL(live.url).port
+    const viaLocalhost = await raw(live.url, 'POST', '/api/workspaces', {
+      cookie: sessionCookie,
+      host: `localhost:${port}`,
+      origin: `http://localhost:${port}`,
+      'content-type': 'application/json',
+      'x-dnt-harness-csrf': csrf,
+    }, JSON.stringify({ name: 'Local' }))
+    expect(viaLocalhost.status).toBe(201)
+    const otherPort = await raw(live.url, 'POST', '/api/workspaces', {
+      cookie: sessionCookie,
+      host: `localhost:${port}`,
+      origin: `http://localhost:${Number(port) + 1}`,
+      'content-type': 'application/json',
+      'x-dnt-harness-csrf': csrf,
+    }, JSON.stringify({ name: 'x' }))
+    expect(otherPort.status).toBe(403)
+
     const created = await raw(live.url, 'POST', '/api/workspaces', {
       cookie: sessionCookie,
       origin: live.auth.canonicalOrigin,

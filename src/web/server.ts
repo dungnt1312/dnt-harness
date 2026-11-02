@@ -4907,7 +4907,8 @@ ${entry.description}`.toLowerCase().includes(query))
   if (address === null || typeof address === 'string') throw new Error('web: unexpected listen address')
 
   const publicHost = options.host ?? '127.0.0.1'
-  deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
+  const originFor = (name: string): string => `http://${name.includes(':') ? `[${name}]` : name}:${address.port}`
+  deps.auth.bindOrigin(originFor(publicHost), [...deps.allowedHosts].map(originFor))
   const retireOperatorChannel = deps.auth.enabled && options.home !== undefined
     ? await publishOperatorChannel(options.home, { url: `http://${publicHost}:${address.port}`, key: deps.auth.armOperatorKey() })
     : undefined

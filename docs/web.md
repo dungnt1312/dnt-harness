@@ -716,7 +716,9 @@ that executes tools, so the port is the boundary: keep it on loopback.
 
 With `controlPlaneAuth` on (`--auth`), privileged REST and SSE answer `401`
 until a browser redeems the single-use pairing code, or a CLI presents a scoped
-bearer. Cookie mutations also need the CSRF header and the canonical Origin.
+bearer. Cookie mutations also need the CSRF header and the canonical Origin:
+the bound port under the bind address or any name the host answers to
+(`localhost`, `::1`, `allowedHosts`).
 That still does not protect against same-user malware or same-origin XSS, and
 it is not an authenticated TLS profile.
 
