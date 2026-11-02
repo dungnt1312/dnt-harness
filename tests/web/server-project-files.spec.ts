@@ -429,3 +429,47 @@ describe('saving a file from the viewer', () => {
     expect((await fetch(fileUrl('note.md'), { method: 'DELETE' })).status).toBe(405)
   })
 })
+
+describe('project file changes under control-plane auth', () => {
+  it('lets only the paired browser create, save and delete', async () => {
+    const authHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-auth-home-'))
+    const authRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-auth-root-'))
+    const live = await createWebServer({ home: authHome, providers: [idle], configFile: path.join(authHome, 'providers.json'), controlPlaneAuth: true })
+    try {
+      await fs.writeFile(path.join(authRoot, 'note.md'), 'one\n', 'utf8')
+      const paired = await fetch(`${live.url}/api/auth/pair`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: live.auth.canonicalOrigin },
+        body: JSON.stringify({ code: live.auth.issuePairingCode().code }),
+      })
+      const browser = {
+        cookie: (paired.headers.get('set-cookie') ?? '').split(';')[0] ?? '',
+        origin: live.auth.canonicalOrigin,
+        'x-dnt-harness-csrf': ((await paired.json()) as { csrf: string }).csrf,
+      }
+      const bearer = { authorization: `Bearer ${live.auth.issueBearer(['sessions']).token}` }
+      const call = (method: string, url: string, headers: Record<string, string>, body?: unknown) =>
+        fetch(`${live.url}${url}`, {
+          method,
+          headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...headers },
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        })
+      const ws = ((await (await call('GET', '/api/workspaces', browser)).json()) as { id: string }[])[0]!.id
+      const registered = await call('POST', `/api/workspaces/${ws}/projects`, browser, { name: 'Auth', path: authRoot })
+      const base = `/api/workspaces/${ws}/projects/${((await registered.json()) as { id: string }).id}`
+
+      expect((await call('POST', `${base}/files`, bearer, { path: 'evil.txt', kind: 'file' })).status).toBe(401)
+      expect((await call('PUT', `${base}/file?path=note.md`, bearer, { content: 'x', baseHash: 'h' })).status).toBe(401)
+      expect((await call('DELETE', `${base}/files?path=note.md`, bearer)).status).toBe(401)
+      expect(await fs.readFile(path.join(authRoot, 'note.md'), 'utf8')).toBe('one\n')
+      expect(await fs.stat(path.join(authRoot, 'evil.txt')).then(() => true, () => false)).toBe(false)
+
+      expect((await call('POST', `${base}/files`, browser, { path: 'ok.txt', kind: 'file' })).status).toBe(201)
+      expect((await call('DELETE', `${base}/files?path=ok.txt`, browser)).status).toBe(200)
+    } finally {
+      await live.close().catch(() => {})
+      await fs.rm(authHome, { recursive: true, force: true })
+      await fs.rm(authRoot, { recursive: true, force: true })
+    }
+  })
+})

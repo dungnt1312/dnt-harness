@@ -8076,6 +8076,12 @@ async function handleApi(
         })
         return
       }
+      // A terminal runs anything the host user can with no approval step, so
+      // like approvals and Git actions only the paired browser may drive it.
+      if (!browserPrincipal(req, deps, req.method ?? 'GET')) {
+        send(401, { error: 'terminals require the browser session that owns the workspace' })
+        return
+      }
       const rest = wsTerminalsMatch[2]
       try {
         // `events` is checked before the id routes: otherwise it reads as a
@@ -8209,6 +8215,12 @@ async function handleApi(
       requireWorkspace(deps, wsId, writing)
       const project = deps.workspaces.getProject(decodeURIComponent(wsProjectFilesMatch[2] ?? '') as ProjectId, wsId)
       if (writing) {
+        // Explorer writes change the host filesystem without an approval step,
+        // so only the paired browser may perform them.
+        if (!browserPrincipal(req, deps, req.method ?? 'POST')) {
+          send(401, { error: 'file changes require the browser session that owns the workspace' })
+          return
+        }
         if (kind === 'file') await handleProjectFileSave(req, project.path, deps.deniedRoots, send)
         else await handleProjectFileWrite(req, query, project.path, deps.deniedRoots, send)
         return
