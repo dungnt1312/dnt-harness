@@ -4899,9 +4899,10 @@ ${entry.description}`.toLowerCase().includes(query))
     if (shuttingDown) { res.writeHead(503); res.end('host shutting down'); return }
     handle(req, res, deps).catch((error: unknown) => {
       if (!res.headersSent) {
-        res.writeHead(error instanceof ScopeError ? 404 : 500, { 'content-type': 'application/json' })
+        const status = error instanceof ScopeError ? 404 : error instanceof RequestBodyError ? error.status : 500
+        res.writeHead(status, { 'content-type': 'application/json' })
       }
-      res.end(JSON.stringify({ error: String(error) }))
+      res.end(JSON.stringify({ error: error instanceof RequestBodyError ? error.message : String(error) }))
     })
   })
 
@@ -5606,6 +5607,10 @@ async function handleApi(
         : error.code === 'root-invalid' ? 400
           : 404
       send(status, { error: error.message, code: error.code })
+      return
+    }
+    if (error instanceof RequestBodyError) {
+      send(error.status, { error: error.message })
       return
     }
     send(500, { error: String(error instanceof Error ? error.message : error) })
@@ -10746,6 +10751,13 @@ export function extractModelIds(parsed: unknown): string[] {
 
 const MAX_BODY_BYTES = 1_000_000
 
+/** A request body the client got wrong: answered with its status, not a 500. */
+class RequestBodyError extends Error {
+  constructor(readonly status: 400 | 413, message: string) {
+    super(message)
+  }
+}
+
 async function readJson(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
@@ -10753,15 +10765,20 @@ async function readJson(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<R
     total += (chunk as Buffer).length
     if (total > limit) {
       req.destroy()
-      throw new Error('request body too large')
+      throw new RequestBodyError(413, 'request body too large')
     }
     chunks.push(chunk as Buffer)
   }
   const body = Buffer.concat(chunks).toString('utf8')
   if (body === '') return {}
-  const parsed: unknown = JSON.parse(body)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    throw new RequestBodyError(400, 'request body is not valid JSON')
+  }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('request body must be a JSON object')
+    throw new RequestBodyError(400, 'request body must be a JSON object')
   }
   return parsed as Record<string, unknown>
 }

@@ -119,6 +119,15 @@ function slowProvider(): LlmProvider {
 }
 
 describe('web server', () => {
+  it('answers a malformed JSON body as a client error, not a 500', async () => {
+    await start(['x'])
+    const post = (body: string) => fetch(`${baseUrl}/api/workspaces`, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+    const malformed = await post('{')
+    expect(malformed.status).toBe(400)
+    expect(await malformed.json()).toEqual({ error: 'request body is not valid JSON' })
+    expect((await post('[1]')).status).toBe(400)
+  })
+
   it('reports provider, model, folder, and offered models through /api/meta', async () => {
     await start(['x'])
     const meta = (await (await fetch(`${baseUrl}/api/meta`)).json()) as {
