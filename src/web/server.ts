@@ -4168,6 +4168,14 @@ ${entry.description}`.toLowerCase().includes(query))
         ?? (agentScope.getStore()?.workspaceId as string | undefined)
         ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
       const { config, hash } = await dangerousStore.load(wid)
+      // A mode with `dangerousPresets: off` (bundled Full access) runs with the
+      // built-in presets switched off; custom rules keep applying.
+      const scope = agentScope.getStore()
+      const owner = (scope?.rootSessionId ?? scope?.sessionId) as SessionId | undefined
+      if (owner !== undefined && rootModeOf({ sessionId: owner, rootSessionId: owner }, wid as WorkspaceId).mode.definition.dangerousPresets === 'off') {
+        const presets = Object.fromEntries(Object.keys(config.presets).map((id) => [id, 'off'])) as typeof config.presets
+        return { config: { ...config, presets }, hash: `${hash}:presets-off`, revision: `${hash}:presets-off` }
+      }
       return { config, hash, revision: hash }
     },
   })

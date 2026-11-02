@@ -31,6 +31,8 @@ export interface ModeForm {
   readonly readOnlyBash?: 'allow'
   /** `ask`: bulk-destructive Bash commands ask even when Bash is allowed. */
   readonly riskyBash?: 'ask'
+  /** `off`: built-in Dangerous Commands presets do not apply in this mode. */
+  readonly dangerousPresets?: 'off'
   /** MCP ceiling; absent means derived by the server (read-only modes → read-safe). */
   readonly mcpExposure?: McpExposureChoice
 }
@@ -62,6 +64,7 @@ type LooseFrontmatter = {
   outOfGrant?: unknown
   readOnlyBash?: unknown
   riskyBash?: unknown
+  dangerousPresets?: unknown
 }
 
 /**
@@ -93,6 +96,7 @@ export function parseModeForm(raw: string): ModeForm {
   if (frontmatter.outOfGrant === 'allow' || frontmatter.outOfGrant === 'ask') form.outOfGrant = frontmatter.outOfGrant
   if (frontmatter.readOnlyBash === 'allow') form.readOnlyBash = 'allow'
   if (frontmatter.riskyBash === 'ask') form.riskyBash = 'ask'
+  if (frontmatter.dangerousPresets === 'off') form.dangerousPresets = 'off'
   if (typeof frontmatter.description === 'string' && frontmatter.description.trim() !== '') form.description = frontmatter.description.trim()
   if (frontmatter.mcpExposure === 'none' || frontmatter.mcpExposure === 'read-safe' || frontmatter.mcpExposure === 'all') form.mcpExposure = frontmatter.mcpExposure
   return form
@@ -130,6 +134,7 @@ export function serializeModeForm(form: ModeForm): string {
     ...(form.outOfGrant !== undefined ? [`outOfGrant: ${form.outOfGrant}`] : []),
     ...(form.readOnlyBash !== undefined ? [`readOnlyBash: ${form.readOnlyBash}`] : []),
     ...(form.riskyBash !== undefined ? [`riskyBash: ${form.riskyBash}`] : []),
+    ...(form.dangerousPresets !== undefined ? [`dangerousPresets: ${form.dangerousPresets}`] : []),
     ...(form.mcpExposure !== undefined ? [`mcpExposure: ${form.mcpExposure}`] : []),
   ]
   return `---\n${fm.join('\n')}\n---\n\n${form.instructions.trim()}\n`

@@ -438,8 +438,11 @@ changes** (writes, Bash and delegation ask; read-only Bash runs),
 new workspace's picker, see `DEFAULT_HIDDEN_MODE_IDS`; a workspace that
 already selected it keeps it), **Autonomous** (everything runs except risky
 Bash, paid media generation, and paths outside the granted folders), and
-**Full access** (everything runs, including out-of-grant paths). Every mode
-still passes Dangerous Commands, host `blockedTools` and interactive MCP.
+**Full access** (everything runs, including out-of-grant paths, and the
+built-in Dangerous Commands presets are off: `dangerousPresets: off`, like
+Claude Code's bypass mode). Every mode still passes the user's custom
+Dangerous Commands rules, explicit denies, host `blockedTools` and interactive
+MCP; the other modes also pass the built-in presets.
 
 On re-evaluation (a mode switch while a call waits), the exposure check
 matches the host gate: built-ins must be listed by name, while `mcp__*` calls

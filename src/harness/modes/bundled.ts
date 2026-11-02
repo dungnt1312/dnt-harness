@@ -18,7 +18,8 @@ const WORKSPACE_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'Write', 'Ed
  *   project folder (`readOnlyBash: allow`) runs without a question.
  * - Autonomous: everything runs, except a bulk-destructive Bash call
  *   (`riskyBash: ask`) and a path outside the granted folders, which ask.
- * - Full access: nothing asks beyond Dangerous Commands and interactive tools.
+ * - Full access: nothing asks or blocks beyond the user's own Dangerous
+ *   Commands rules and interactive tools; the built-in presets are off.
  *
  * History reads `compact`: identical to `recent` until a compaction
  * checkpoint exists (nothing is dropped without a summary covering it),
@@ -141,6 +142,9 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     // Paths outside the granted folders run without an extra approval here;
     // unsafe paths are still refused by the host.
     outOfGrant: 'allow',
+    // Like Claude Code's bypass mode: the built-in Dangerous Commands presets
+    // do not block here. The user's custom rules and explicit denies still do.
+    dangerousPresets: 'off',
   },
 ]
 
